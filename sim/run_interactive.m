@@ -362,9 +362,7 @@ function drone = makeDrone(ax, root)
 arm = 1.2;                                          % nominal half-span (m)
 
 % --- Body STL ---
-body_stl = stlread(fullfile(root, 'QuadCopter_Body.stl'));
-bV = body_stl.vertices;
-bF = body_stl.faces;
+[bV, bF] = readStlAny(fullfile(root, 'QuadCopter_Body.stl'));
 bV = bV - mean(bV, 1);
 
 % Detect rotor mount centroids by quadrant of the four outermost clusters.
@@ -407,9 +405,7 @@ drone.body_h = patch('Parent', drone.body_xform, ...
                      'FaceLighting', 'gouraud', 'AmbientStrength', 0.4);
 
 % --- Propeller STL (shared by all 4 props) ---
-prop_stl = stlread(fullfile(root, 'QuadCopter_Propeller.stl'));
-pV = prop_stl.vertices;
-pF = prop_stl.faces;
+[pV, pF] = readStlAny(fullfile(root, 'QuadCopter_Propeller.stl'));
 pV = pV - mean(pV, 1);
 pV = swapToFRD(pV);
 prop_horiz = max(max(abs(pV(:, 1:2)), [], 1));
@@ -472,4 +468,19 @@ function V = swapToFRD(V)
 % STL frame -> FRD body frame. Empirically for these meshes, STL Y
 % behaves like FRD Z (down), so we map (X, Y, Z) -> (X, Z, Y).
 V = [V(:, 1), V(:, 3), V(:, 2)];
+end
+
+
+function [V, F] = readStlAny(path)
+% Cross-version STL loader. MATLAB's built-in stlread (R2018b+) returns a
+% triangulation object with Points / ConnectivityList; older toolboxes
+% (and the File Exchange version) return a struct with vertices / faces.
+s = stlread(path);
+if isa(s, 'triangulation')
+    V = s.Points;
+    F = s.ConnectivityList;
+else
+    V = s.vertices;
+    F = s.faces;
+end
 end
