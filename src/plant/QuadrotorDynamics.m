@@ -28,6 +28,11 @@ classdef QuadrotorDynamics < handle
         rotor_thrust_max % scalar, per-rotor max thrust (N)
         rotor_km        % scalar, momentConstant (Iris: 0.06)
         rotor_spin      % 4x1, +1 CW / -1 CCW
+        % Linear aerodynamic drag in NED. Set to 0 to recover the
+        % drag-free model. With drag > 0 the controller must hold a
+        % sustained tilt to maintain a non-zero horizontal velocity,
+        % which is the visually-realistic behaviour.
+        drag_coef = 0.5  % N*s/m (per axis)
 
         % --- mutable state ---
         pos_ned         % 3x1
@@ -93,7 +98,7 @@ classdef QuadrotorDynamics < handle
             obj.unpack(x1);
 
             % Recompute current acceleration so state() exposes a fresh value.
-            [~, ~, ~, ~, obj.acc_ned] = obj.forces(obj.q, motor_cmd);
+            [~, ~, ~, ~, obj.acc_ned] = obj.forces(obj.q, obj.vel_ned, motor_cmd);
 
             % Renormalize quaternion to combat integration drift.
             obj.q = quat_normalize(obj.q);
@@ -127,7 +132,7 @@ classdef QuadrotorDynamics < handle
             omega  = x(11:13);
 
             % Forces / torques in their natural frames.
-            [F_ned, tau_b, ~, ~, acc_ned] = obj.forces(qx, motor_cmd);
+            [F_ned, tau_b, ~, ~, acc_ned] = obj.forces(qx, vel, motor_cmd);
             obj.acc_ned = acc_ned;  %#ok<NASGU> kept for state() consistency
 
             % Position derivative: world velocity.
@@ -144,7 +149,7 @@ classdef QuadrotorDynamics < handle
             dx = [dpos; dvel; dq; domega];
         end
 
-        function [F_ned, tau_b, F_body, T_total, acc_ned] = forces(obj, qx, motor_cmd)
+        function [F_ned, tau_b, F_body, T_total, acc_ned] = forces(obj, qx, vel_ned, motor_cmd)
         % Compute net force in NED, net torque in body, body-frame thrust
         % vector and total thrust magnitude.
             % Per-rotor thrust magnitude (N).
@@ -161,7 +166,10 @@ classdef QuadrotorDynamics < handle
             % Gravity in NED (z-down).
             F_grav_ned = [0; 0; obj.mass * obj.g];
 
-            F_ned = F_thrust_ned + F_grav_ned;
+            % Linear aerodynamic drag opposing inertial velocity (per axis).
+            F_drag_ned = -obj.drag_coef * vel_ned;
+
+            F_ned = F_thrust_ned + F_grav_ned + F_drag_ned;
 
             % Torques about CG in body frame:
             %   tau_arm_i = r_i x F_i, with F_i = (0,0,-T_i)
