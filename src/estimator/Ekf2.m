@@ -351,6 +351,16 @@ classdef Ekf2 < handle
             out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
             if isempty(imu), return; end
 
+            % Skip when GNSS is actively constraining horizontal state.
+            % With a biased accel, gravity fusion pulls the attitude to
+            % "absorb" the bias signal, locking in a tilt error that
+            % the bias estimate then has to chase forever. PX4's
+            % gravity_fusion.cpp disables itself under the same
+            % "no horizontal aiding" condition.
+            if obj.gnss_origin_set && bitand(obj.params.gps_ctrl, 1) ~= 0
+                return;
+            end
+
             R_b2n = quat_to_dcm(obj.quat);
             R_n2b = R_b2n';
 
