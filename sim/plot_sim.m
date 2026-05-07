@@ -80,6 +80,105 @@ xlabel('time (s)'); ylabel('motor command [0..1]');
 title('Per-rotor allocator output');
 legend({'m1', 'm2', 'm3', 'm4'}, 'Location', 'best');
 
+% --- IMU (voted vehicle_imu) ---------------------------------------------
+if isfield(log, 'imu_gyro')
+    figure('Name', 'IMU (voted)', 'NumberTitle', 'off', 'Color', 'w');
+    labels_g = {'p (deg/s)', 'q (deg/s)', 'r (deg/s)'};
+    for i = 1:3
+        subplot(3, 2, 2*i - 1); hold on; grid on; box on;
+        plot(log.t, rad2deg(log.imu_gyro(:, i)), 'LineWidth', 1.0);
+        plot(log.t, rad2deg(log.omega(:, i)), '--', 'LineWidth', 1.0);
+        ylabel(labels_g{i});
+        if i == 1, title('Gyro: voted IMU vs ground truth'); end
+        if i == 3, xlabel('time (s)'); legend({'imu', 'truth'}, 'Location', 'best'); end
+    end
+    labels_a = {'a_x (m/s^2)', 'a_y (m/s^2)', 'a_z (m/s^2)'};
+    for i = 1:3
+        subplot(3, 2, 2*i); hold on; grid on; box on;
+        plot(log.t, log.imu_accel(:, i), 'LineWidth', 1.0);
+        ylabel(labels_a{i});
+        if i == 1, title('Accel (specific force, body frame)'); end
+        if i == 3, xlabel('time (s)'); end
+    end
+end
+
+% --- Barometer -----------------------------------------------------------
+if isfield(log, 'baro_alt')
+    figure('Name', 'Barometer (voted)', 'NumberTitle', 'off', 'Color', 'w');
+    hold on; grid on; box on;
+    truth_alt = -log.pos(:, 3);              % NED z negated -> altitude AGL
+    plot(log.t, log.baro_alt - log.baro_alt(find(~isnan(log.baro_alt), 1)), ...
+         'LineWidth', 1.2);
+    plot(log.t, truth_alt, '--', 'LineWidth', 1.0);
+    xlabel('time (s)'); ylabel('altitude (m)');
+    title('Voted baro altitude (zeroed at start) vs ground-truth altitude');
+    legend({'baro - baro(0)', 'truth (-z)'}, 'Location', 'best');
+end
+
+% --- Magnetometer --------------------------------------------------------
+if isfield(log, 'mag_b')
+    figure('Name', 'Magnetometer (voted)', 'NumberTitle', 'off', 'Color', 'w');
+    labels_m = {'mag_x (G)', 'mag_y (G)', 'mag_z (G)'};
+    for i = 1:3
+        subplot(3, 1, i); hold on; grid on; box on;
+        plot(log.t, log.mag_b(:, i), 'LineWidth', 1.0);
+        ylabel(labels_m{i});
+        if i == 1, title('Voted magnetometer body-frame field'); end
+        if i == 3, xlabel('time (s)'); end
+    end
+end
+
+% --- GNSS ----------------------------------------------------------------
+if isfield(log, 'gps_pos')
+    figure('Name', 'GNSS (voted)', 'NumberTitle', 'off', 'Color', 'w');
+    labels_p = {'pN (m)', 'pE (m)', 'pD (m)'};
+    for i = 1:3
+        subplot(3, 2, 2*i - 1); hold on; grid on; box on;
+        plot(log.t, log.gps_pos(:, i), 'LineWidth', 1.0);
+        plot(log.t, log.pos(:, i), '--', 'LineWidth', 1.0);
+        ylabel(labels_p{i});
+        if i == 1, title('GPS position (NED) vs truth'); end
+        if i == 3, xlabel('time (s)'); legend({'gps', 'truth'}, 'Location', 'best'); end
+    end
+    labels_v = {'vN (m/s)', 'vE (m/s)', 'vD (m/s)'};
+    for i = 1:3
+        subplot(3, 2, 2*i); hold on; grid on; box on;
+        plot(log.t, log.gps_vel(:, i), 'LineWidth', 1.0);
+        plot(log.t, log.vel(:, i), '--', 'LineWidth', 1.0);
+        ylabel(labels_v{i});
+        if i == 1, title('GPS velocity (NED) vs truth'); end
+        if i == 3, xlabel('time (s)'); end
+    end
+end
+
+% --- Estimator vs ground truth -------------------------------------------
+if isfield(log, 'est_pos')
+    figure('Name', 'Estimator vs truth', 'NumberTitle', 'off', 'Color', 'w');
+    labels = {'pN (m)', 'pE (m)', 'pD (m)'};
+    for i = 1:3
+        subplot(3, 3, i); hold on; grid on; box on;
+        plot(log.t, log.est_pos(:, i), 'LineWidth', 1.2);
+        plot(log.t, log.pos(:, i), '--', 'LineWidth', 1.0);
+        ylabel(labels{i});
+        if i == 2, title('EKF state (solid) vs ground truth (dashed)'); end
+    end
+    labels = {'vN (m/s)', 'vE (m/s)', 'vD (m/s)'};
+    for i = 1:3
+        subplot(3, 3, 3 + i); hold on; grid on; box on;
+        plot(log.t, log.est_vel(:, i), 'LineWidth', 1.2);
+        plot(log.t, log.vel(:, i), '--', 'LineWidth', 1.0);
+        ylabel(labels{i});
+    end
+    labels = {'roll (deg)', 'pitch (deg)', 'yaw (deg)'};
+    for i = 1:3
+        subplot(3, 3, 6 + i); hold on; grid on; box on;
+        plot(log.t, rad2deg(log.est_rpy(:, i)), 'LineWidth', 1.2);
+        plot(log.t, rad2deg(log.rpy(:, i)), '--', 'LineWidth', 1.0);
+        ylabel(labels{i});
+        if i == 2, xlabel('time (s)'); end
+    end
+end
+
 try, format_all_figures(); catch, end
 try, vertical_line();      catch, end
 end

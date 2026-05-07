@@ -269,16 +269,28 @@ cmd           = struct('kind', 'position', 'pos_sp', [0;0;0], ...
 % =====================================================================
 max_log = 60000;
 log.t        = nan(max_log, 1);
-log.pos      = nan(max_log, 3);
+log.pos      = nan(max_log, 3);     % ground-truth position
 log.pos_sp   = nan(max_log, 3);
-log.vel      = nan(max_log, 3);
+log.vel      = nan(max_log, 3);     % ground-truth velocity
 log.vel_sp   = nan(max_log, 3);
-log.rpy      = nan(max_log, 3);
+log.rpy      = nan(max_log, 3);     % ground-truth roll/pitch/yaw
 log.rpy_sp   = nan(max_log, 3);
 log.omega    = nan(max_log, 3);
 log.rate_sp  = nan(max_log, 3);
 log.motor    = nan(max_log, 4);
-log.mode_idx = nan(max_log, 1);                 % index into mode_strings
+log.mode_idx = nan(max_log, 1);
+% Sensor + estimator logs — populated every frame regardless of toggle.
+log.imu_gyro  = nan(max_log, 3);    % voted vehicle_imu gyro_b (rad/s)
+log.imu_accel = nan(max_log, 3);    % voted vehicle_imu accel_b (m/s^2)
+log.baro_alt  = nan(max_log, 1);    % voted vehicle_air_data altitude (m)
+log.mag_b     = nan(max_log, 3);    % voted vehicle_magnetometer mag_b (G)
+log.gps_pos   = nan(max_log, 3);    % vehicle_gps_position pos_ned (m)
+log.gps_vel   = nan(max_log, 3);    % vehicle_gps_position vel_ned (m/s)
+log.gps_eph   = nan(max_log, 1);
+log.est_pos   = nan(max_log, 3);    % EKF/output-predictor position
+log.est_vel   = nan(max_log, 3);
+log.est_rpy   = nan(max_log, 3);
+log.use_est   = false(max_log, 1);  % logical: was the controller fed EKF state?
 log_idx      = 0;
 
 setappdata(fig, 'running', true);
@@ -530,6 +542,32 @@ while ishandle(fig) && getappdata(fig, 'running')
         idx_mode = find(strcmp(mode_strings, prev_mode), 1);
         if isempty(idx_mode), idx_mode = NaN; end
         log.mode_idx(log_idx)   = idx_mode;
+
+        % Sensor + estimator snapshot (always logged, regardless of toggle).
+        imu_pub = est_bus.sensors.vehicleImu();
+        if ~isempty(imu_pub)
+            log.imu_gyro(log_idx, :)  = imu_pub.gyro_b';
+            log.imu_accel(log_idx, :) = imu_pub.accel_b';
+        end
+        air_pub = est_bus.sensors.vehicleAirData();
+        if ~isempty(air_pub)
+            log.baro_alt(log_idx) = air_pub.altitude_m;
+        end
+        mag_pub = est_bus.sensors.vehicleMagnetometer();
+        if ~isempty(mag_pub)
+            log.mag_b(log_idx, :) = mag_pub.mag_b';
+        end
+        gps_pub = est_bus.sensors.vehicleGpsPosition();
+        if ~isempty(gps_pub)
+            log.gps_pos(log_idx, :) = gps_pub.pos_ned';
+            log.gps_vel(log_idx, :) = gps_pub.vel_ned';
+            log.gps_eph(log_idx)    = gps_pub.eph;
+        end
+        est_state = est_bus.stateOut();
+        log.est_pos(log_idx, :) = est_state.position_ned';
+        log.est_vel(log_idx, :) = est_state.velocity_ned';
+        log.est_rpy(log_idx, :) = quat_to_euler(est_state.attitude_q)';
+        log.use_est(log_idx)    = use_est;
     end
 
     set(state_lbl, 'String', sprintf( ...
@@ -561,7 +599,10 @@ end
 % =====================================================================
 if log_idx > 1
     fields = {'t', 'pos', 'pos_sp', 'vel', 'vel_sp', 'rpy', 'rpy_sp', ...
-              'omega', 'rate_sp', 'motor', 'mode_idx'};
+              'omega', 'rate_sp', 'motor', 'mode_idx', ...
+              'imu_gyro', 'imu_accel', 'baro_alt', 'mag_b', ...
+              'gps_pos', 'gps_vel', 'gps_eph', ...
+              'est_pos', 'est_vel', 'est_rpy', 'use_est'};
     for f = fields
         log.(f{1}) = log.(f{1})(1:log_idx, :);
     end

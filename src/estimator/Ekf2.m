@@ -217,12 +217,13 @@ classdef Ekf2 < handle
             out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
             if isempty(gps), return; end
 
+            % First-fix initialisation: seed EKF position from the GPS
+            % report in the existing shared earth frame. Do NOT mutate
+            % the EarthModel — sensor models depend on its origin being
+            % stable for the lifetime of the sim.
             if ~obj.gnss_origin_set
-                obj.earth.lat0_deg = gps.lat_deg;
-                obj.earth.lon0_deg = gps.lon_deg;
-                obj.earth.alt0_m   = gps.alt_m;
+                obj.pos = obj.earth.llaToNed(gps.lat_deg, gps.lon_deg, gps.alt_m);
                 obj.gnss_origin_set = true;
-                obj.pos = zeros(3, 1);
                 return;
             end
 
