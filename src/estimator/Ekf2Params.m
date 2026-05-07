@@ -52,8 +52,15 @@ function p = Ekf2Params()
     p.init_att_var     = (deg2rad(10))^2;        % rad^2
     p.init_vel_var     = 1.0^2;                  % (m/s)^2
     p.init_pos_var     = 1.0^2;                  % m^2
-    p.init_gyro_b_var  = (deg2rad(0.5))^2;       % (rad/s)^2
-    p.init_accel_b_var = 0.05^2;                 % (m/s^2)^2
+    p.init_gyro_b_var  = (deg2rad(2))^2;         % (rad/s)^2 — wide enough
+                                                  % for ~0.035 rad/s bias.
+    p.init_accel_b_var = 0.5^2;                  % (m/s^2)^2 — accel bias
+                                                  % is poorly observable in
+                                                  % hover; leave the prior
+                                                  % wide so GNSS-vel can
+                                                  % pull the estimate to
+                                                  % truth via P_vel_abi
+                                                  % cross-covariance.
     p.init_mag_I_var   = 0.05^2;                 % G^2
     p.init_mag_B_var   = 0.02^2;                 % G^2
     p.init_wind_var    = 1.0^2;                  % (m/s)^2

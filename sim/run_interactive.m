@@ -237,7 +237,7 @@ est_bus = EstimatorBus(earth);
 % behaviour. Realistic bias magnitudes are on the order of a few
 % hundredths of a rad/s for gyros and a few tenths of m/s² for accels.
 true_gyro_bias  = [ 0.020; -0.015;  0.008];   % rad/s
-true_accel_bias = [ 0.10;  -0.05;   0.07 ];   % m/s²
+true_accel_bias = [ 0.40;  -0.40;   0.40 ];   % m/s²
 est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
 
 % Wind disturbance: steady NED component + first-order turbulence.
