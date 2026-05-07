@@ -290,12 +290,15 @@ classdef Ekf2 < handle
                 innov = mag_sample.mag_b(axis) - pred;
 
                 H = zeros(1, obj.N_ERR);
-                % d(meas)/d(att err): d/dδθ [R_n2b * mag_I]_axis
-                %   For small attitude error δθ in body, R_n2b' = R_n2b*(I + skew(δθ))
-                %   So d(R_n2b * mag_I)/dδθ = -skew(R_n2b * mag_I) projected onto axis.
+                % d(pred)/d(δθ) for body-frame attitude error δθ:
+                %   q_pert = q ⊗ exp(δθ/2)  =>  R_b2n_pert = R_b2n*(I+skew(δθ))
+                %   R_n2b_pert = (I - skew(δθ))*R_n2b
+                %   pred_pert = R_n2b_pert * mag_I = Rm - skew(δθ)*Rm
+                %             = Rm + skew(Rm)*δθ      (cross identity)
+                %   so d(pred)/dδθ = +skew(Rm).
                 Rm = R_n2b * obj.mag_I;
                 S_skew = skew(Rm);
-                H(obj.IDX_ATT) = -S_skew(axis, :);
+                H(obj.IDX_ATT) = S_skew(axis, :);
                 H(obj.IDX_MI)  = R_n2b(axis, :);
                 H(obj.IDX_MB(axis)) = 1.0;
 
@@ -360,13 +363,14 @@ classdef Ekf2 < handle
             measurement = sf / max(norm(sf), 1e-3);
             predicted   = R_n2b * [0; 0; -1];     % expected -z body, since gravity is +z NED
 
-            innov = predicted - measurement;
+            % Standard innovation convention: z - h(x). All other
+            % fusions in this class use the same convention.
+            innov = measurement - predicted;
 
             for axis = 1:3
                 H = zeros(1, obj.N_ERR);
-                e_axis = zeros(3, 1); e_axis(axis) = 1;
                 S_skew = skew(R_n2b * [0; 0; -1]);
-                H(obj.IDX_ATT) = -S_skew(axis, :);
+                H(obj.IDX_ATT) = S_skew(axis, :);
 
                 Rg_var = (0.1 * obj.earth.g_mps2)^2;
                 S = H * obj.P * H' + Rg_var;
