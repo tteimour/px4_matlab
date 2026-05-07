@@ -232,6 +232,14 @@ att_lead = LeadCompensator(p.lead.att.Ts, p.lead.att.Tp);
 earth   = EarthModel(47.39773, 8.54559, 488.0);   % Zurich-ish
 est_bus = EstimatorBus(earth);
 
+% Known body-frame bias injected into every IMU so the EKF has a
+% concrete truth to estimate. Edit these to test the convergence
+% behaviour. Realistic bias magnitudes are on the order of a few
+% hundredths of a rad/s for gyros and a few tenths of m/s² for accels.
+true_gyro_bias  = [ 0.020; -0.015;  0.008];   % rad/s
+true_accel_bias = [ 0.10;  -0.05;   0.07 ];   % m/s²
+est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
+
 % Wind disturbance: steady NED component + first-order turbulence.
 wind = WindModel(p);
 set(wind_n_edit,     'String', num2str(p.wind.steady(1)));
@@ -291,6 +299,11 @@ log.est_pos   = nan(max_log, 3);    % EKF/output-predictor position
 log.est_vel   = nan(max_log, 3);
 log.est_rpy   = nan(max_log, 3);
 log.use_est   = false(max_log, 1);  % logical: was the controller fed EKF state?
+% IMU bias estimation logs.
+log.true_gyro_bias  = nan(max_log, 3);   % live body-frame bias of primary IMU
+log.true_accel_bias = nan(max_log, 3);
+log.est_gyro_bias   = nan(max_log, 3);   % EKF state.gyro_b
+log.est_accel_bias  = nan(max_log, 3);   % EKF state.accel_b
 log_idx      = 0;
 
 setappdata(fig, 'running', true);
@@ -317,6 +330,9 @@ while ishandle(fig) && getappdata(fig, 'running')
         wind.reset();
         est_bus.ekf.reset();
         est_bus.output_pred.reset();
+        % Re-inject the known bias after EKF reset so post-Reset runs
+        % have the same truth bias to estimate.
+        est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
         clearpoints(trail);
         t_sim   = 0;
         log_idx = 0;
@@ -573,6 +589,15 @@ while ishandle(fig) && getappdata(fig, 'running')
         log.est_vel(log_idx, :) = est_state.velocity_ned';
         log.est_rpy(log_idx, :) = quat_to_euler(est_state.attitude_q)';
         log.use_est(log_idx)    = use_est;
+
+        % IMU bias estimation: truth comes from the currently-voted
+        % primary IMU (so it tracks bias-random-walk drift), estimate
+        % comes straight from the EKF state.
+        [tg, ta] = est_bus.sensors.primaryImuTrueBias();
+        log.true_gyro_bias(log_idx, :)  = tg';
+        log.true_accel_bias(log_idx, :) = ta';
+        log.est_gyro_bias(log_idx, :)   = est_bus.ekf.gyro_b';
+        log.est_accel_bias(log_idx, :)  = est_bus.ekf.accel_b';
     end
 
     set(state_lbl, 'String', sprintf( ...
@@ -607,7 +632,9 @@ if log_idx > 1
               'omega', 'rate_sp', 'motor', 'mode_idx', ...
               'imu_gyro', 'imu_accel', 'baro_alt', 'mag_b', ...
               'gps_pos', 'gps_vel', 'gps_eph', ...
-              'est_pos', 'est_vel', 'est_rpy', 'use_est'};
+              'est_pos', 'est_vel', 'est_rpy', 'use_est', ...
+              'true_gyro_bias', 'true_accel_bias', ...
+              'est_gyro_bias', 'est_accel_bias'};
     for f = fields
         log.(f{1}) = log.(f{1})(1:log_idx, :);
     end

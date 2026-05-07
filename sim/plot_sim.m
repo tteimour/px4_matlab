@@ -151,6 +151,28 @@ if isfield(log, 'gps_pos')
     end
 end
 
+% --- IMU bias estimation -------------------------------------------------
+if isfield(log, 'est_gyro_bias')
+    figure('Name', 'IMU bias estimation', 'NumberTitle', 'off', 'Color', 'w');
+    labels_g = {'gyro b_x (rad/s)', 'gyro b_y (rad/s)', 'gyro b_z (rad/s)'};
+    for i = 1:3
+        subplot(2, 3, i); hold on; grid on; box on;
+        plot(log.t, log.est_gyro_bias(:, i), 'LineWidth', 1.4);
+        plot(log.t, log.true_gyro_bias(:, i), '--', 'LineWidth', 1.0);
+        ylabel(labels_g{i});
+        if i == 2, title('EKF bias estimate (solid) vs primary IMU true bias (dashed)'); end
+        if i == 3, legend({'EKF', 'truth'}, 'Location', 'best'); end
+    end
+    labels_a = {'accel b_x (m/s^2)', 'accel b_y (m/s^2)', 'accel b_z (m/s^2)'};
+    for i = 1:3
+        subplot(2, 3, 3 + i); hold on; grid on; box on;
+        plot(log.t, log.est_accel_bias(:, i), 'LineWidth', 1.4);
+        plot(log.t, log.true_accel_bias(:, i), '--', 'LineWidth', 1.0);
+        ylabel(labels_a{i});
+        if i == 2, xlabel('time (s)'); end
+    end
+end
+
 % --- Estimator vs ground truth -------------------------------------------
 if isfield(log, 'est_pos')
     figure('Name', 'Estimator vs truth', 'NumberTitle', 'off', 'Color', 'w');

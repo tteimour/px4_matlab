@@ -85,6 +85,24 @@ classdef ImuSensor < Sensor
             obj.last_t_ = 0.0;
             obj.initBias();
         end
+
+        function setBias(obj, gyro_b, accel_b)
+            % Override the randomly-sampled turn-on bias with a known
+            % body-frame value. Useful for EKF bias-estimation tests
+            % (so the sim has a "true" bias to compare est_gyro_b /
+            % est_accel_b against). Pass [] to leave one untouched.
+            if nargin >= 2 && ~isempty(gyro_b),  obj.gyro_bias_  = gyro_b(:);  end
+            if nargin >= 3 && ~isempty(accel_b), obj.accel_bias_ = accel_b(:); end
+        end
+
+        function b = trueGyroBias(obj)
+            % Live body-frame gyro bias including bias-random-walk drift.
+            b = obj.gyro_bias_;
+        end
+
+        function b = trueAccelBias(obj)
+            b = obj.accel_bias_;
+        end
     end
 
     methods (Access = protected)

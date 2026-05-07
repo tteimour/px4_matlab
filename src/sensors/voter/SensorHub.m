@@ -80,5 +80,27 @@ classdef SensorHub < handle
         function s = vehicleAirData(obj),     s = obj.baro.primary(); end
         function s = vehicleMagnetometer(obj),s = obj.mag.primary();  end
         function s = vehicleGpsPosition(obj), s = obj.gnss.primary(); end
+
+        function applyImuBias(obj, gyro_b, accel_b)
+            % Set the same body-frame bias on every IMU instance — used
+            % for EKF bias-estimation tests where the sim needs a known
+            % "truth" bias to plot against.
+            for i = 1:numel(obj.imu.sensors)
+                obj.imu.sensors{i}.setBias(gyro_b, accel_b);
+            end
+        end
+
+        function [g, a] = primaryImuTrueBias(obj)
+            % Live body-frame bias of the currently-voted primary IMU
+            % (includes any bias-random-walk drift accumulated since
+            % construction).
+            idx = obj.imu.selected_idx;
+            if idx > 0
+                g = obj.imu.sensors{idx}.trueGyroBias();
+                a = obj.imu.sensors{idx}.trueAccelBias();
+            else
+                g = zeros(3, 1); a = zeros(3, 1);
+            end
+        end
     end
 end
