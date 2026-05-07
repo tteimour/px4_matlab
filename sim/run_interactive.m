@@ -32,6 +32,13 @@ addpath(fullfile(root, 'src', 'plant'));
 addpath(fullfile(root, 'src', 'controllers'));
 addpath(fullfile(root, 'src', 'navigator'));
 addpath(fullfile(root, 'src', 'flight_modes'));
+addpath(fullfile(root, 'src', 'sensors'));
+addpath(fullfile(root, 'src', 'sensors', 'imu'));
+addpath(fullfile(root, 'src', 'sensors', 'baro'));
+addpath(fullfile(root, 'src', 'sensors', 'mag'));
+addpath(fullfile(root, 'src', 'sensors', 'gnss'));
+addpath(fullfile(root, 'src', 'sensors', 'voter'));
+addpath(fullfile(root, 'src', 'estimator'));
 
 p = px4_params();
 
@@ -196,6 +203,11 @@ turb_sigma_edit = uicontrol(wind_panel, 'Style', 'edit', 'Units', 'normalized', 
     'Position', [0.68 0.10 0.18 0.30], 'String', '1.0', ...
     'BackgroundColor', [0.99 0.99 0.97]);
 
+% Estimator toggle: ground-truth state vs EKF2 sensor-driven state.
+est_cb = uicontrol(action_panel, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.04 0.50 0.92 0.13], 'String', 'Use EKF2 estimator (sensor-driven)', ...
+    'BackgroundColor', 'w', 'Value', 0, 'FontWeight', 'bold');
+
 % =====================================================================
 % Sim modules
 % =====================================================================
@@ -213,6 +225,12 @@ fmm      = FlightModeManager(p);
 pos_lead = LeadCompensator(p.lead.pos.Ts, p.lead.pos.Tp);
 vel_lead = LeadCompensator(p.lead.vel.Ts, p.lead.vel.Tp);
 att_lead = LeadCompensator(p.lead.att.Ts, p.lead.att.Tp);
+
+% Sensor + estimator stack (V6X_6 hardware, M9N GNSS).
+% Earth origin chosen arbitrarily for the sim — a real flight would
+% take this from the first GNSS fix (handled by Ekf2.fuseGnssPos).
+earth   = EarthModel(47.39773, 8.54559, 488.0);   % Zurich-ish
+est_bus = EstimatorBus(earth);
 
 % Wind disturbance: steady NED component + first-order turbulence.
 wind = WindModel(p);
@@ -285,6 +303,8 @@ while ishandle(fig) && getappdata(fig, 'running')
         vel_lead.reset();
         att_lead.reset();
         wind.reset();
+        est_bus.ekf.reset();
+        est_bus.output_pred.reset();
         clearpoints(trail);
         t_sim   = 0;
         log_idx = 0;
@@ -367,8 +387,20 @@ while ishandle(fig) && getappdata(fig, 'running')
 
     % --- Advance physics by dt_frame in dt_rate substeps ---
     n_steps = max(1, round(dt_frame / dt_rate));
+    use_est = logical(get(est_cb, 'Value'));
     for i = 1:n_steps
-        s = plant.state();
+        s_truth = plant.state();
+
+        % Always step the estimator so it has fresh sensor samples
+        % regardless of the toggle. The toggle controls whose state
+        % the controllers consume.
+        est_bus.step(t_sim + (i-1)*dt_rate, s_truth);
+
+        if use_est
+            s = est_bus.stateOut();
+        else
+            s = s_truth;
+        end
 
         if mod(k, n_pos) == 0
             cmd = fmm.update(s, sticks, dt_pos);
@@ -423,8 +455,9 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
 
         % Landed: ground + slow + commanded altitude target near ground.
-        landed = (s.position_ned(3) > -0.05) && ...
-                 (norm(s.velocity_ned) < 0.3) && ...
+        % Use ground truth so estimator noise doesn't cause hover flapping.
+        landed = (s_truth.position_ned(3) > -0.05) && ...
+                 (norm(s_truth.velocity_ned) < 0.3) && ...
                  (cmd.pos_sp(3) > -0.10);
         torque = rate_ctl.update(s.angular_vel_b, rate_sp, [0;0;0], dt_rate, landed);
         T_mag  = max(0, -thrust_body_z);

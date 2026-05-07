@@ -176,11 +176,12 @@ sim step.
 - [x] Position controller
 - [x] Mission/navigator
 - [x] End-to-end mission sim
-- [ ] Sensor models (IMU x3, baro x2, mag x2, GNSS)
-- [ ] Sensor voter / selection
-- [ ] EKF2 24-state subset (predict + baro + GNSS + mag + gravity)
-- [ ] Output predictor
-- [ ] Estimator-feed toggle in run_interactive
+- [x] Sensor models (IMU x3, baro x2, mag x2, GNSS)
+- [x] Sensor voter / selection
+- [x] EKF2 24-state subset (predict + baro + GNSS + mag + gravity)
+- [x] Output predictor
+- [x] Estimator-feed toggle in run_interactive
+- [ ] Estimator validation (unit + bench tests)
 
 ## Mission Plan
 - Create a mission for multicopter in a 3d world like around 500 meter squared mission and visualize it using matlab tools.
