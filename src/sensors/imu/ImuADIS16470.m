@@ -44,6 +44,13 @@ classdef ImuADIS16470 < ImuSensor
             obj.gyro_turn_on   = 3.5e-3;
             obj.accel_turn_on  = 0.029;
 
+            % ADIS series ships with internal vibration isolation and
+            % is mounted on a soft-isolator on V6X_6 — vibration coupling
+            % is markedly lower than the Invensense parts. Still nonzero
+            % in flight: real PX4 logs show ~0.1 rad/s gyro RMS.
+            obj.gyro_vib_gain  = 0.12;
+            obj.accel_vib_gain = 2.5;
+
             obj.R_chip_to_body = px4_rotation(0);   % -R 0
             obj.initBias();
         end

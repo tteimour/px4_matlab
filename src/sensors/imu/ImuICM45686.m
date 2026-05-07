@@ -45,6 +45,11 @@ classdef ImuICM45686 < ImuSensor
             obj.gyro_turn_on   = 8.7e-3;      % rad/s
             obj.accel_turn_on  = 0.196;       % m/s²
 
+            % Motor vibration coupling — typical "well-mounted but not
+            % isolated" IMU in a multicopter (cf. PX4 sensor_combined logs).
+            obj.gyro_vib_gain  = 0.20;        % rad/s   per unit vib_level
+            obj.accel_vib_gain = 4.5;         % m/s^2   per unit vib_level
+
             obj.R_chip_to_body = px4_rotation(10);  % -R 10
             obj.initBias();
         end

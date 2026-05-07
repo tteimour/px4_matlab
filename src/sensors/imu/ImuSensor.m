@@ -14,7 +14,16 @@ classdef ImuSensor < Sensor
 %   * accel_brw       — accel bias random walk (m/s^2/sqrt(s))
 %   * gyro_turn_on    — turn-on bias 1-sigma (rad/s)
 %   * accel_turn_on   — turn-on bias 1-sigma (m/s^2)
+%   * gyro_vib_gain   — gyro vibration std at unit motor activity (rad/s)
+%   * accel_vib_gain  — accel vibration std at unit motor activity (m/s^2)
 %   * R_chip_to_body  — 3x3 rotation matrix (chip frame to FRD body)
+%
+% Real PX4 logs are dominated by motor / prop vibration that is one or
+% two orders of magnitude larger than the chip's own thermal noise.
+% gt.vib_level (set by the sim from norm(m_last), 0 when motors idle,
+% ~1 at hover, ~1.8 at full thrust) scales the per-axis vibration
+% noise so the simulated IMU stream looks like sensor_combined from a
+% running airframe rather than a stationary chip on a bench.
 %
 % measure() outputs sample struct with fields:
 %   t           sample timestamp (s)
@@ -41,6 +50,8 @@ classdef ImuSensor < Sensor
         accel_brw
         gyro_turn_on
         accel_turn_on
+        gyro_vib_gain  = 0.0  % rad/s std per unit gt.vib_level
+        accel_vib_gain = 0.0  % m/s^2 std per unit gt.vib_level
         R_chip_to_body
         earth                % EarthModel handle (for gravity)
     end
@@ -89,11 +100,17 @@ classdef ImuSensor < Sensor
             obj.gyro_bias_  = obj.gyro_bias_  + obj.gyro_brw  * sqrt(dt) * randn(obj.rng, 3, 1);
             obj.accel_bias_ = obj.accel_bias_ + obj.accel_brw * sqrt(dt) * randn(obj.rng, 3, 1);
 
+            % Motor / prop vibration component, applied in chip frame.
+            % gt.vib_level is roughly norm(m_last) so it spans 0..~1.8.
+            vib = 0.0;
+            if isfield(gt, 'vib_level'), vib = max(gt.vib_level, 0); end
+
             % --- Gyro: body angular rate in chip frame, biased + noisy + quantised.
             omega_body  = gt.angular_vel_b;
             omega_chip  = obj.R_chip_to_body' * omega_body;
             gyro_noise  = obj.gyro_nd / sqrt(dt) * randn(obj.rng, 3, 1);
-            gyro_chip   = omega_chip + obj.R_chip_to_body' * obj.gyro_bias_ + gyro_noise;
+            gyro_vib    = obj.gyro_vib_gain * vib * randn(obj.rng, 3, 1);
+            gyro_chip   = omega_chip + obj.R_chip_to_body' * obj.gyro_bias_ + gyro_noise + gyro_vib;
             gyro_chip   = obj.quantise(gyro_chip, deg2rad(obj.gyro_quant_dps));
             gyro_chip   = obj.clipFs(gyro_chip, deg2rad(obj.gyro_fs_dps));
             gyro_b      = obj.R_chip_to_body * gyro_chip;
@@ -105,10 +122,11 @@ classdef ImuSensor < Sensor
             sf_body = R_n2b * (gt.acceleration_ned - g_ned);
             sf_chip = obj.R_chip_to_body' * sf_body;
             sf_noise = obj.accel_nd / sqrt(dt) * randn(obj.rng, 3, 1);
-            sf_chip = sf_chip + obj.R_chip_to_body' * obj.accel_bias_ + sf_noise;
-            sf_chip = obj.quantise(sf_chip, obj.accel_quant_g * obj.earth.g_mps2);
-            sf_chip = obj.clipFs(sf_chip, obj.accel_fs_g * obj.earth.g_mps2);
-            accel_b = obj.R_chip_to_body * sf_chip;
+            sf_vib   = obj.accel_vib_gain * vib * randn(obj.rng, 3, 1);
+            sf_chip  = sf_chip + obj.R_chip_to_body' * obj.accel_bias_ + sf_noise + sf_vib;
+            sf_chip  = obj.quantise(sf_chip, obj.accel_quant_g * obj.earth.g_mps2);
+            sf_chip  = obj.clipFs(sf_chip, obj.accel_fs_g * obj.earth.g_mps2);
+            accel_b  = obj.R_chip_to_body * sf_chip;
 
             % Delta-angle / delta-velocity match PX4 imu_sample.
             s.gyro_b       = gyro_b;

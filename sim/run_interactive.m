@@ -403,6 +403,11 @@ while ishandle(fig) && getappdata(fig, 'running')
     for i = 1:n_steps
         s_truth = plant.state();
 
+        % vib_level scales motor / prop vibration into the IMU model.
+        % norm(m_last) is ~0 idle, ~1 hover (4 motors at ~0.5), ~1.8 full
+        % thrust. Sensors look it up in their measure() override.
+        s_truth.vib_level = norm(m_last);
+
         % Always step the estimator so it has fresh sensor samples
         % regardless of the toggle. The toggle controls whose state
         % the controllers consume.
