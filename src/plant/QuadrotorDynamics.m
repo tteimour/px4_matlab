@@ -81,24 +81,30 @@ classdef QuadrotorDynamics < handle
             obj.acc_ned = [0;0;0];
         end
 
-        function step(obj, motor_cmd, dt)
+        function step(obj, motor_cmd, dt, wind_ned)
         % Advance the state by dt using fourth-order Runge-Kutta.
         % motor_cmd is clamped to [0,1] before use (the allocator is
         % expected to do this, but we double-check to keep the plant
         % robust to misuse).
+        %
+        % wind_ned (optional, 3x1 m/s) is the local air velocity in NED;
+        % it enters the linear drag term as F_d = -c*(vel_ned-wind_ned).
+        % Held constant across the RK4 substeps within a single call.
             motor_cmd = max(min(motor_cmd(:), 1), 0);
+            if nargin < 4 || isempty(wind_ned), wind_ned = [0;0;0]; end
+            wind_ned = wind_ned(:);
             x0 = obj.pack();
 
-            k1 = obj.deriv(x0,                    motor_cmd);
-            k2 = obj.deriv(obj.add_(x0, dt/2*k1), motor_cmd);
-            k3 = obj.deriv(obj.add_(x0, dt/2*k2), motor_cmd);
-            k4 = obj.deriv(obj.add_(x0, dt  *k3), motor_cmd);
+            k1 = obj.deriv(x0,                    motor_cmd, wind_ned);
+            k2 = obj.deriv(obj.add_(x0, dt/2*k1), motor_cmd, wind_ned);
+            k3 = obj.deriv(obj.add_(x0, dt/2*k2), motor_cmd, wind_ned);
+            k4 = obj.deriv(obj.add_(x0, dt  *k3), motor_cmd, wind_ned);
 
             x1 = obj.add_(x0, (dt/6) * (k1 + 2*k2 + 2*k3 + k4));
             obj.unpack(x1);
 
             % Recompute current acceleration so state() exposes a fresh value.
-            [~, ~, ~, ~, obj.acc_ned] = obj.forces(obj.q, obj.vel_ned, motor_cmd);
+            [~, ~, ~, ~, obj.acc_ned] = obj.forces(obj.q, obj.vel_ned, motor_cmd, wind_ned);
 
             % Renormalize quaternion to combat integration drift.
             obj.q = quat_normalize(obj.q);
@@ -125,14 +131,15 @@ classdef QuadrotorDynamics < handle
             y = a + b;
         end
 
-        function dx = deriv(obj, x, motor_cmd)
+        function dx = deriv(obj, x, motor_cmd, wind_ned)
         % d/dt of [pos; vel; q; omega] under thrust + gravity + body torque.
+            if nargin < 4, wind_ned = [0;0;0]; end
             vel    = x(4:6);
             qx     = x(7:10);
             omega  = x(11:13);
 
             % Forces / torques in their natural frames.
-            [F_ned, tau_b, ~, ~, acc_ned] = obj.forces(qx, vel, motor_cmd);
+            [F_ned, tau_b, ~, ~, acc_ned] = obj.forces(qx, vel, motor_cmd, wind_ned);
             obj.acc_ned = acc_ned;  %#ok<NASGU> kept for state() consistency
 
             % Position derivative: world velocity.
@@ -149,9 +156,10 @@ classdef QuadrotorDynamics < handle
             dx = [dpos; dvel; dq; domega];
         end
 
-        function [F_ned, tau_b, F_body, T_total, acc_ned] = forces(obj, qx, vel_ned, motor_cmd)
+        function [F_ned, tau_b, F_body, T_total, acc_ned] = forces(obj, qx, vel_ned, motor_cmd, wind_ned)
         % Compute net force in NED, net torque in body, body-frame thrust
         % vector and total thrust magnitude.
+            if nargin < 5, wind_ned = [0;0;0]; end
             % Per-rotor thrust magnitude (N).
             T = motor_cmd .* obj.rotor_thrust_max;          % 4x1
             T_total = sum(T);
@@ -166,8 +174,10 @@ classdef QuadrotorDynamics < handle
             % Gravity in NED (z-down).
             F_grav_ned = [0; 0; obj.mass * obj.g];
 
-            % Linear aerodynamic drag opposing inertial velocity (per axis).
-            F_drag_ned = -obj.drag_coef * vel_ned;
+            % Linear aerodynamic drag opposing the air-relative velocity
+            % (per axis). With wind_ned = 0 this reduces to the inertial-
+            % drag model that was here before.
+            F_drag_ned = -obj.drag_coef * (vel_ned - wind_ned);
 
             F_ned = F_thrust_ned + F_grav_ned + F_drag_ned;
 

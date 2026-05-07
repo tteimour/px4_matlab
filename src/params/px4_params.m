@@ -106,6 +106,83 @@ p.nav.acc_rad = 10.0;        % NAV_ACC_RAD (m), horizontal acceptance radius
 p.nav.alt_acc_rad = 1.0;     % NAV_MC_ALT_RAD (m) typical default
 
 % =====================================================================
+% Manual flight modes (Stabilized, Altitude, Position).
+% Source:
+%   src/modules/flight_mode_manager/tasks/Sticks/Sticks.cpp
+%   src/modules/flight_mode_manager/tasks/Manual*/FlightTaskManual*.cpp
+%   src/modules/mc_pos_control/multicopter_position_control_params.c
+% =====================================================================
+p.man.tilt_max     = deg2rad(35);   % MPC_MAN_TILT_MAX (rad)
+p.man.yaw_rate_max = deg2rad(150);  % MPC_MAN_Y_MAX  (rad/s)
+p.man.vel_xy_max   = 10.0;          % MPC_VEL_MANUAL (m/s)
+p.man.deadzone     = 0.05;          % MPC_HOLD_DZ
+p.man.expo         = 0.6;           % MPC_*_MAN_EXPO  (single value reused)
+p.man.hold_max_xy  = 0.8;           % MPC_HOLD_MAX_XY: lock pos when |v_xy|<this
+p.man.hold_max_z   = 0.6;           % MPC_HOLD_MAX_Z
+
+% =====================================================================
+% Auto modes (Mission, RTL, Loiter/Hold, Land, Takeoff).
+% Source:
+%   src/modules/navigator/{rtl_direct,land,takeoff,loiter}.cpp
+%   src/modules/mc_pos_control/multicopter_position_control_params.c
+% =====================================================================
+p.auto.cruise_speed  = 5.0;         % MPC_XY_CRUISE
+p.auto.land_speed    = 0.7;         % MPC_LAND_SPEED
+p.auto.land_crawl    = 0.3;         % MPC_LAND_CRWL (slow descent near ground)
+p.auto.land_alt1     = 5.0;         % MPC_LAND_ALT1: above this, land_speed
+p.auto.land_alt3     = 1.0;         % MPC_LAND_ALT3: below this, land_crawl
+p.auto.takeoff_speed = 1.5;         % MPC_TKO_SPEED
+p.auto.takeoff_alt   = 5.0;         % MIS_TAKEOFF_ALT (m above ground)
+p.auto.rtl_alt       = 15.0;        % RTL_ALT (m above ground)
+p.auto.land_alt_ground = 0.10;      % altitude below which we treat as landed
+
+% =====================================================================
+% Wind disturbance (NON-PX4 addition).
+% Steady NED component plus simplified Dryden / Ornstein-Uhlenbeck
+% turbulence (first-order low-passed Gaussian noise per axis with
+% correlation time tau and steady-state std sigma). Turbulence is off
+% by default; values below are the seed for the UI fields.
+% =====================================================================
+p.wind.steady      = [0; 0; 0];      % m/s, NED
+p.wind.turb_enable = false;
+p.wind.turb_sigma  = 1.0;            % m/s, 1-sigma intensity per axis
+p.wind.turb_tau    = 2.0;            % s, correlation time
+
+% =====================================================================
+% Lead compensators (NON-PX4 addition).
+% Setpoint pre-filters used to compensate the ramp-tracking lag inherent
+% to the cascaded P/PID controller. Each channel implements the
+% first-order lead H(s) = (Ts*s + 1) / (Tp*s + 1) with Ts > Tp:
+%   - DC gain is 1, so static setpoints pass through unchanged.
+%   - Max phase lead   = asin((Ts - Tp) / (Ts + Tp))
+%   - Centre frequency = 1 / sqrt(Ts*Tp)  [rad/s]
+% Disable a stage by setting <stage>.enable = false. Reset is performed
+% by run_interactive on Reset and on every mode change so the filter
+% state cannot kick when the setpoint jumps.
+% =====================================================================
+% Position setpoint lead (per [N; E; D] axis).
+%   xy : centre ~0.7 Hz, max phase ~33 deg
+%   z  : centre ~1.1 Hz, max phase ~33 deg
+p.lead.pos.enable = true;
+p.lead.pos.Ts = [0.40; 0.40; 0.25];
+p.lead.pos.Tp = [0.12; 0.12; 0.08];
+
+% Velocity feedforward lead (per [N; E; D] axis).
+%   xy : centre ~1.4 Hz, max phase ~25 deg
+%   z  : centre ~2.1 Hz, max phase ~25 deg
+p.lead.vel.enable = true;
+p.lead.vel.Ts = [0.18; 0.18; 0.12];
+p.lead.vel.Tp = [0.072; 0.072; 0.048];
+
+% Attitude setpoint lead (roll, pitch only). Yaw is intentionally
+% omitted: a lead filter on a +/-pi-wrapping signal would inject
+% spurious transients on wrap-around. Yaw is passed through untouched.
+%   roll/pitch : centre ~3.7 Hz, max phase ~20 deg
+p.lead.att.enable = true;
+p.lead.att.Ts = [0.06; 0.06];
+p.lead.att.Tp = [0.03; 0.03];
+
+% =====================================================================
 % Iris airframe (plant). Source: iris.sdf.
 % =====================================================================
 p.airframe.mass = 1.5;       % kg, base_link mass
