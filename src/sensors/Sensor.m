@@ -37,11 +37,12 @@ classdef Sensor < handle
     end
 
     properties (Access = protected)
-        sample_period_   % 1/sample_rate_hz
-        next_sample_t_   % time of next due sample (s)
-        delay_queue_     % FIFO of pending {publish_t, sample}
-        latest_          % most recently released sample (post-latency)
-        new_sample_      % logical — set true when a fresh sample is released
+        sample_period_     % 1/sample_rate_hz
+        next_sample_t_     % time of next due sample (s)
+        queue_publish_t_   % parallel array of pending publish times
+        queue_samples_     % parallel cell array of pending samples
+        latest_            % most recently released sample (post-latency)
+        new_sample_        % logical — set true when a fresh sample is released
     end
 
     methods
@@ -53,11 +54,12 @@ classdef Sensor < handle
             obj.instance       = instance;
             obj.device_id      = uint32(device_id);
             obj.healthy        = true;
-            obj.sample_period_ = 1.0 / rate_hz;
-            obj.next_sample_t_ = 0.0;
-            obj.delay_queue_   = repmat(struct('publish_t', 0, 'sample', []), 0, 1);
-            obj.latest_        = [];
-            obj.new_sample_    = false;
+            obj.sample_period_   = 1.0 / rate_hz;
+            obj.next_sample_t_   = 0.0;
+            obj.queue_publish_t_ = [];
+            obj.queue_samples_   = {};
+            obj.latest_          = [];
+            obj.new_sample_      = false;
             if nargin < 6 || isempty(seed)
                 seed = 1000 + uint32(instance) + uint32(mod(device_id, 1000));
             end
@@ -76,17 +78,17 @@ classdef Sensor < handle
                 if ~isfield(s, 't'),        s.t = t_sample;     end
                 if ~isfield(s, 'instance'), s.instance = obj.instance; end
                 if ~isfield(s, 'device_id'),s.device_id = obj.device_id; end
-                obj.delay_queue_(end+1, 1) = struct( ...
-                    'publish_t', t_sample + obj.latency_s, ...
-                    'sample',    s);
+                obj.queue_publish_t_(end+1) = t_sample + obj.latency_s;
+                obj.queue_samples_{end+1}   = s;
                 obj.next_sample_t_ = obj.next_sample_t_ + obj.sample_period_;
             end
 
             % Release any sample whose publish_t has elapsed.
-            while ~isempty(obj.delay_queue_) && t >= obj.delay_queue_(1).publish_t
-                obj.latest_     = obj.delay_queue_(1).sample;
+            while ~isempty(obj.queue_publish_t_) && t >= obj.queue_publish_t_(1)
+                obj.latest_     = obj.queue_samples_{1};
                 obj.new_sample_ = true;
-                obj.delay_queue_(1) = [];
+                obj.queue_publish_t_(1) = [];
+                obj.queue_samples_(1)   = [];
             end
         end
 
@@ -99,11 +101,12 @@ classdef Sensor < handle
         end
 
         function reset(obj)
-            obj.next_sample_t_ = 0.0;
-            obj.delay_queue_   = repmat(struct('publish_t', 0, 'sample', []), 0, 1);
-            obj.latest_        = [];
-            obj.new_sample_    = false;
-            obj.healthy        = true;
+            obj.next_sample_t_   = 0.0;
+            obj.queue_publish_t_ = [];
+            obj.queue_samples_   = {};
+            obj.latest_          = [];
+            obj.new_sample_      = false;
+            obj.healthy          = true;
         end
     end
 
