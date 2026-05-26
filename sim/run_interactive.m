@@ -205,7 +205,7 @@ turb_sigma_edit = uicontrol(wind_panel, 'Style', 'edit', 'Units', 'normalized', 
 
 % Estimator toggle: ground-truth state vs EKF2 sensor-driven state.
 est_cb = uicontrol(action_panel, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.04 0.50 0.92 0.13], 'String', 'Use EKF2 estimator (sensor-driven)', ...
+    'Position', [0.04 0.50 0.58 0.13], 'String', 'Use EKF2 estimator (sensor-driven)', ...
     'BackgroundColor', 'w', 'Value', 0, 'FontWeight', 'bold');
 
 % =====================================================================
@@ -218,6 +218,18 @@ att_ctl  = AttitudeController(p);
 rate_ctl = RateController(p);
 alloc    = ControlAllocator(p);
 fmm      = FlightModeManager(p);
+
+% --- Live gain-tuning window (separate figure) ------------------------
+% The controllers are handle classes that copy params into their own
+% properties at construction, so the tuning UI mutates those properties
+% directly and the sim loop picks up new gains on the next tick. The
+% "Tune Gains" button re-opens the window if it was closed.
+uicontrol(action_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.65 0.49 0.31 0.14], 'String', 'Tune Gains', ...
+    'FontWeight', 'bold', 'BackgroundColor', [0.85 0.90 0.95], ...
+    'Callback', @(~,~) openTuning(fig, p, pos_ctl, att_ctl, rate_ctl));
+tuning_fig = makeTuningWindow(p, pos_ctl, att_ctl, rate_ctl);
+setappdata(fig, 'tuning_fig', tuning_fig);
 
 % Lead-compensator pre-filters (non-PX4 augmentation; see p.lead.*).
 % Each filter is reset on Reset and on every mode change so that
@@ -629,6 +641,9 @@ end
 if ishandle(fig)
     delete(fig);
 end
+if exist('tuning_fig', 'var') && ishandle(tuning_fig)
+    delete(tuning_fig);
+end
 
 % =====================================================================
 % Push the log to base workspace so plot_sim() can pick it up on demand.
@@ -854,4 +869,286 @@ else
     V = s.vertices;
     F = s.faces;
 end
+end
+
+
+% =========================================================================
+% Live controller-gain tuning window.
+%
+% Builds a separate figure with one panel per controller (outer -> inner:
+% position, attitude, rate). Every tunable is a slider with a numeric
+% readout. Dragging a slider writes the new value straight onto the
+% handle-class controller object *continuously* (via the slider's
+% ContinuousValueChange event), so the running sim loop uses it on the
+% very next tick -- no commit / button press needed.
+%
+% Each panel has its own "Reset defaults" button that restores that
+% controller's params from px4_params (`p`).
+%
+% Gains shown are the *effective* values held by the objects. For the rate
+% loop that means MC_*RATE_K is already folded into P/I/D. Angles (tilt,
+% rate-max) are shown in degrees and converted to radians on write.
+%
+% rowSpec fields: label, tip, get(), set(v), lo, hi (slider range), def
+% (default value in display units, from px4_params). lo/hi/def may be
+% scalar (broadcast to all components) or per-component vectors.
+% =========================================================================
+function tfig = makeTuningWindow(p, pos_ctl, att_ctl, rate_ctl)
+tfig = figure('Name', 'Controller gains (live tuning)', ...
+              'NumberTitle', 'off', 'Color', 'w', ...
+              'MenuBar', 'none', 'ToolBar', 'none', ...
+              'Position', [60 40 640 780]);
+
+% --- Position controller (outer loop) ---
+pos_rows = {
+    rowSpec('Pos P  (N E D)',         'MPC_XY_P, MPC_XY_P, MPC_Z_P', ...
+            @() pos_ctl.gain_pos_p, @(v) setProp(pos_ctl, 'gain_pos_p', v), ...
+            0, 3, p.pos.gain_pos_p);
+    rowSpec('Vel P  (N E D)',         'MPC_XY_VEL_P_ACC / MPC_Z_VEL_P_ACC', ...
+            @() pos_ctl.gain_vel_p, @(v) setProp(pos_ctl, 'gain_vel_p', v), ...
+            0, 8, p.pos.gain_vel_p);
+    rowSpec('Vel I  (N E D)',         'MPC_XY_VEL_I_ACC / MPC_Z_VEL_I_ACC', ...
+            @() pos_ctl.gain_vel_i, @(v) setProp(pos_ctl, 'gain_vel_i', v), ...
+            0, 5, p.pos.gain_vel_i);
+    rowSpec('Vel D  (N E D)',         'MPC_XY_VEL_D_ACC / MPC_Z_VEL_D_ACC', ...
+            @() pos_ctl.gain_vel_d, @(v) setProp(pos_ctl, 'gain_vel_d', v), ...
+            0, 2, p.pos.gain_vel_d);
+    rowSpec('Vel max (xy up dn) m/s', 'MPC_XY_VEL_MAX, MPC_Z_VEL_MAX_UP, _DN', ...
+            @() [pos_ctl.lim_vel_horizontal; pos_ctl.lim_vel_up; pos_ctl.lim_vel_down], ...
+            @(v) setVelLims(pos_ctl, v), ...
+            [0;0;0], [25;10;10], [p.pos.vel_xy_max; p.pos.vel_z_up; p.pos.vel_z_down]);
+    rowSpec('Tilt max (deg)',         'MPC_TILTMAX_AIR', ...
+            @() rad2deg(pos_ctl.lim_tilt), @(v) setProp(pos_ctl, 'lim_tilt', deg2rad(v)), ...
+            0, 80, rad2deg(p.pos.tilt_max));
+    rowSpec('Thrust (min hov max)',   'MPC_THR_MIN, MPC_THR_HOVER, MPC_THR_MAX', ...
+            @() [pos_ctl.thr_min; pos_ctl.hover_thrust; pos_ctl.thr_max], ...
+            @(v) setThr(pos_ctl, v), ...
+            [0;0;0], [0.5;1;1], [p.pos.thr_min; p.pos.thr_hover; p.pos.thr_max]);
+};
+
+% --- Attitude controller ---
+att_rows = {
+    rowSpec('Att P  (r p y)',         'MC_ROLL_P, MC_PITCH_P, MC_YAW_P', ...
+            @() attPGet(att_ctl), @(v) att_ctl.setProportionalGain(v(:), att_ctl.yaw_w), ...
+            0, 12, p.att.gain_p);
+    rowSpec('Yaw weight',             'MC_YAW_WEIGHT (0..1)', ...
+            @() att_ctl.yaw_w, @(v) attYawSet(att_ctl, v), ...
+            0, 1, p.att.yaw_weight);
+    rowSpec('Rate max (r p y) deg/s', 'MC_ROLLRATE_MAX, MC_PITCHRATE_MAX, MC_YAWRATE_MAX', ...
+            @() rad2deg(att_ctl.rate_limit), @(v) setProp(att_ctl, 'rate_limit', deg2rad(v)), ...
+            0, 360, rad2deg(p.att.rate_max));
+};
+
+% --- Rate controller (inner loop). Defaults shown effective (x MC_*RATE_K). ---
+rate_rows = {
+    rowSpec('P  (r p y)',             'MC_*RATE_P x MC_*RATE_K (effective)', ...
+            @() rate_ctl.gain_p, @(v) setProp(rate_ctl, 'gain_p', v), ...
+            0, 0.6, p.rate.gain_p .* p.rate.gain_k);
+    rowSpec('I  (r p y)',             'MC_*RATE_I x MC_*RATE_K (effective)', ...
+            @() rate_ctl.gain_i, @(v) setProp(rate_ctl, 'gain_i', v), ...
+            0, 0.8, p.rate.gain_i .* p.rate.gain_k);
+    rowSpec('D  (r p y)',             'MC_*RATE_D x MC_*RATE_K (effective)', ...
+            @() rate_ctl.gain_d, @(v) setProp(rate_ctl, 'gain_d', v), ...
+            0, 0.02, p.rate.gain_d .* p.rate.gain_k);
+    rowSpec('FF (r p y)',             'MC_ROLLRATE_FF, MC_PITCHRATE_FF, MC_YAWRATE_FF', ...
+            @() rate_ctl.gain_ff, @(v) setProp(rate_ctl, 'gain_ff', v), ...
+            0, 0.5, p.rate.gain_ff);
+    rowSpec('Int lim (r p y)',        'MC_RR_INT_LIM, MC_PR_INT_LIM, MC_YR_INT_LIM', ...
+            @() rate_ctl.lim_int, @(v) setProp(rate_ctl, 'lim_int', v), ...
+            0, 1, p.rate.int_lim);
+};
+
+% Panel heights weighted by row count (+ title/padding), outer -> inner.
+buildGroup(tfig, [0.03 0.553 0.94 0.427], 'Position controller (outer loop)', pos_rows);
+buildGroup(tfig, [0.03 0.340 0.94 0.213], 'Attitude controller',              att_rows);
+buildGroup(tfig, [0.03 0.020 0.94 0.320], 'Rate controller (inner loop)',     rate_rows);
+end
+
+
+% Re-open the tuning window from the main figure if it was closed.
+function openTuning(fig, p, pos_ctl, att_ctl, rate_ctl)
+tf = getappdata(fig, 'tuning_fig');
+if ~isempty(tf) && ishandle(tf)
+    figure(tf);                 % bring existing window to front
+    return;
+end
+tf = makeTuningWindow(p, pos_ctl, att_ctl, rate_ctl);
+setappdata(fig, 'tuning_fig', tf);
+end
+
+
+% One tunable: label + N sliders. get() returns the current value(s) in
+% display units; set(v) writes them back. lo/hi are slider bounds and def
+% is the px4_params default (all in display units). Tip = source PX4 param.
+function spec = rowSpec(label, tip, get, set, lo, hi, def)
+spec = struct('label', label, 'tip', tip, 'get', get, 'set', set, ...
+              'lo', lo, 'hi', hi, 'def', def);
+end
+
+
+% Lay a group of rows into a titled panel at normalized position `pos`,
+% with a per-controller "Reset defaults" button along the top.
+function buildGroup(parent, pos, title, rows)
+panel = uipanel(parent, 'Units', 'normalized', 'Position', pos, ...
+                'Title', title, 'BackgroundColor', 'w', ...
+                'FontWeight', 'bold', 'FontSize', 9);
+nr        = numel(rows);
+reset_fns = cell(nr, 1);
+
+top  = 0.88;                 % rows start below the reset button strip
+bot  = 0.015;
+rowh = (top - bot) / nr;
+for r = 1:nr
+    reset_fns{r} = makeRow(panel, top - r * rowh, rowh, rows{r});
+end
+
+uicontrol(panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.70 0.905 0.28 0.085], 'String', 'Reset defaults', ...
+    'FontSize', 8, 'BackgroundColor', [0.95 0.90 0.85], ...
+    'Callback', @(~,~) resetGroup(reset_fns));
+end
+
+
+% Build one label + N (slider + editable readout) columns inside `panel`.
+% Returns a function handle that resets this row to its defaults.
+%
+% All sliders/edits are created first, THEN the callbacks are wired, so the
+% closures capture the fully-populated handle arrays (wiring inside the
+% build loop would snapshot still-unassigned GraphicsPlaceholders).
+function reset_fn = makeRow(panel, ybot, rowh, spec)
+ncols = 3;                              % grid columns (3-axis params)
+uicontrol(panel, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.02 ybot + 0.08*rowh 0.30 0.80*rowh], ...
+    'BackgroundColor', 'w', 'HorizontalAlignment', 'left', ...
+    'FontName', 'Courier New', 'FontSize', 8, ...
+    'String', spec.label, 'TooltipString', spec.tip);
+
+vals = spec.get(); vals = vals(:);
+n    = numel(vals);
+lo   = expandToN(spec.lo, n);
+hi   = expandToN(spec.hi, n);
+ew   = 0.66 / ncols;
+sliders = gobjects(n, 1);
+edits   = gobjects(n, 1);
+for c = 1:n
+    x0 = 0.34 + (c-1)*ew;
+    sliders(c) = uicontrol(panel, 'Style', 'slider', 'Units', 'normalized', ...
+        'Position', [x0, ybot + 0.50*rowh, ew*0.92, 0.40*rowh], ...
+        'Min', lo(c), 'Max', hi(c), ...
+        'Value', min(max(vals(c), lo(c)), hi(c)), 'TooltipString', spec.tip);
+    edits(c) = uicontrol(panel, 'Style', 'edit', 'Units', 'normalized', ...
+        'Position', [x0, ybot + 0.06*rowh, ew*0.92, 0.40*rowh], ...
+        'BackgroundColor', [0.99 0.99 0.97], 'FontSize', 8, ...
+        'String', num2str(vals(c), '%.4g'), 'TooltipString', spec.tip);
+end
+% Wire callbacks only after both arrays are fully built.
+for c = 1:n
+    addlistener(sliders(c), 'ContinuousValueChange', ...
+                @(~,~) onSlider(sliders, edits, spec));
+    set(sliders(c), 'Callback', @(~,~) onSlider(sliders, edits, spec));
+    set(edits(c),   'Callback', @(~,~) onEdit(sliders, edits, spec));
+end
+reset_fn = @() resetRow(sliders, edits, spec);
+end
+
+
+% Slider moved: read all sliders, mirror into the edit boxes, push to the
+% controller. Runs continuously during a drag.
+function onSlider(sliders, edits, spec)
+n = numel(sliders);
+v = zeros(n, 1);
+for c = 1:n
+    v(c) = get(sliders(c), 'Value');
+    set(edits(c), 'String', num2str(v(c), '%.4g'));
+end
+spec.set(v);
+end
+
+
+% Edit box committed: accept any finite value (not just within the slider
+% range) -- if it falls outside, the slider's Min/Max grow to include it so
+% the thumb stays consistent. Push the row vector to the controller.
+function onEdit(sliders, edits, spec)
+n = numel(sliders);
+v = zeros(n, 1);
+for c = 1:n
+    x = str2double(get(edits(c), 'String'));
+    if ~isfinite(x)
+        x = get(sliders(c), 'Value');           % invalid entry -> revert
+    end
+    lo = min(get(sliders(c), 'Min'), x);
+    hi = max(get(sliders(c), 'Max'), x);
+    if hi <= lo, hi = lo + eps; end
+    set(sliders(c), 'Min', lo);                  % widen first (old value
+    set(sliders(c), 'Max', hi);                  % stays inside [lo,hi]),
+    set(sliders(c), 'Value', x);                 % then move the thumb.
+    set(edits(c),   'String', num2str(x, '%.4g'));
+    v(c) = x;
+end
+spec.set(v);
+end
+
+
+% Restore one row to its px4_params defaults (sliders, edits, controller).
+function resetRow(sliders, edits, spec)
+d = expandToN(spec.def, numel(sliders));
+for c = 1:numel(sliders)
+    lo = min(get(sliders(c), 'Min'), d(c));
+    hi = max(get(sliders(c), 'Max'), d(c));
+    set(sliders(c), 'Min', lo);
+    set(sliders(c), 'Max', hi);
+    set(sliders(c), 'Value', d(c));
+    set(edits(c),   'String', num2str(d(c), '%.4g'));
+end
+spec.set(d);
+end
+
+
+% Reset every row in a controller panel to defaults.
+function resetGroup(reset_fns)
+for i = 1:numel(reset_fns)
+    reset_fns{i}();
+end
+end
+
+
+% Broadcast a scalar bound/default to an N-vector; pass vectors through.
+function out = expandToN(x, n)
+x = x(:);
+if isscalar(x)
+    out = repmat(x, n, 1);
+else
+    out = x;
+end
+end
+
+
+% --- Small setters for controller properties (used by tuning callbacks) ---
+function setProp(obj, name, v)
+obj.(name) = v(:);
+end
+
+function setVelLims(pc, v)
+pc.lim_vel_horizontal = v(1);
+pc.lim_vel_up         = v(2);
+pc.lim_vel_down       = v(3);
+end
+
+function setThr(pc, v)
+pc.thr_min      = v(1);
+pc.hover_thrust = v(2);
+pc.thr_max      = v(3);
+end
+
+% Attitude P is stored with yaw pre-divided by the yaw weight; reconstruct
+% the nominal MC_*_P gains for display and re-apply via setProportionalGain.
+function g = attPGet(att_ctl)
+g = att_ctl.proportional_gain;
+if att_ctl.yaw_w > 1e-4
+    g(3) = g(3) * att_ctl.yaw_w;
+end
+end
+
+function attYawSet(att_ctl, w)
+att_ctl.setProportionalGain(attPGet(att_ctl), w);
 end
