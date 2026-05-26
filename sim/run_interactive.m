@@ -236,8 +236,8 @@ est_bus = EstimatorBus(earth);
 % concrete truth to estimate. Edit these to test the convergence
 % behaviour. Realistic bias magnitudes are on the order of a few
 % hundredths of a rad/s for gyros and a few tenths of m/s² for accels.
-true_gyro_bias  = [ 0.020; -0.015;  0.008];   % rad/s
-true_accel_bias = [ 0.40;  -0.40;   0.40 ];   % m/s²
+true_gyro_bias  = [ 0.000; -0.00;  0.00];   % rad/s
+true_accel_bias = [ 0.0;  -0.0;   0.0 ];   % m/s²
 est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
 
 % Wind disturbance: steady NED component + first-order turbulence.
@@ -507,6 +507,13 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
 
         k = k + 1;
+
+        % Yield to MATLAB's event queue mid-frame so joystick clicks and
+        % mouse-motion callbacks fire promptly. limitrate self-throttles
+        % the actual render so this stays cheap.
+        if mod(i, 4) == 0
+            drawnow limitrate;
+        end
     end
 
     % --- Render ---
