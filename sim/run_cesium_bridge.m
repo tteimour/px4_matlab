@@ -1,4 +1,4 @@
-function run_cesium_bridge(duration_s)
+function run_cesium_bridge(duration_s, transport)
 %RUN_CESIUM_BRIDGE  Stream a synthetic trajectory to the Cesium-Unity scene.
 %
 % Standalone end-to-end check of the MATLAB -> Unity pose bridge, independent
@@ -11,20 +11,36 @@ function run_cesium_bridge(duration_s)
 %   2) Play the Quba scene in Unity.
 %   (PX4 SITL, the Micro-XRCE agent and Gazebo are NOT required.)
 %
-% Then in MATLAB:  run_cesium_bridge        % 60 s default
-%                  run_cesium_bridge(20)    % 20 s
+% transport selects how the pose reaches rosbridge:
+%   'dds' - native ROS 2 node (default on Linux; needs MATLAB ROS Toolbox and
+%           DDS reachability to rosbridge)
+%   'ws'  - rosbridge WebSocket via roslibpy (default on Windows, e.g. MATLAB
+%           on Windows + rosbridge in WSL2, where cross-boundary DDS fails)
+% Default is chosen by platform (ispc) but can be overridden.
 %
-% See CesiumBridge.m for the topic / frame contract.
+% In MATLAB:  run_cesium_bridge              % 60 s, auto transport
+%             run_cesium_bridge(20)          % 20 s
+%             run_cesium_bridge(20, 'ws')    % force WebSocket transport
+%
+% See CesiumBridge.m / CesiumBridgeWs.m for the topic / frame contract.
 
 if nargin < 1 || isempty(duration_s), duration_s = 60; end
+if nargin < 2 || isempty(transport)
+    if ispc, transport = 'ws'; else, transport = 'dds'; end   % Windows -> WS
+end
 
 here = fileparts(mfilename('fullpath'));
 root = fileparts(here);
 addpath(fullfile(root, 'src', 'math'));
 addpath(fullfile(root, 'src', 'bridge'));
 
-bridge  = CesiumBridge();
-cleanup = onCleanup(@() delete(bridge));   %#ok<NASGU>  tear down node on exit/Ctrl+C
+switch lower(transport)
+    case 'dds', bridge = CesiumBridge();
+    case 'ws',  bridge = CesiumBridgeWs();
+    otherwise,  error('run_cesium_bridge:transport', ...
+                      'transport must be ''dds'' or ''ws'' (got ''%s'').', transport);
+end
+cleanup = onCleanup(@() delete(bridge));   % tear down on exit/Ctrl+C
 
 fs  = 50;          % publish rate [Hz]
 dt  = 1 / fs;

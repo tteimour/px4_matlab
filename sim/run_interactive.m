@@ -620,7 +620,13 @@ while ishandle(fig) && getappdata(fig, 'running')
     if ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1
         if isempty(cesium_bridge)
             try
-                cesium_bridge = CesiumBridge();
+                % Windows (MATLAB + rosbridge in WSL2) can't do cross-boundary
+                % DDS, so use the WebSocket transport there; native DDS on Linux.
+                if ispc
+                    cesium_bridge = CesiumBridgeWs();
+                else
+                    cesium_bridge = CesiumBridge();
+                end
                 fprintf('Cesium bridge: publishing to %s\n', cesium_bridge.Topic);
             catch ME
                 warning('Cesium bridge failed to start (%s). Disabling.', ME.message);
