@@ -18,6 +18,12 @@ classdef CesiumBridgeWs < handle
 %       ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 %     reachable at ws://localhost:9090.
 %
+% Connection lifetime: roslibpy uses Twisted, whose reactor can be started
+% only ONCE per process, and MATLAB keeps Python alive for the whole session.
+% So the Ros connection is created once and REUSED across bridges/runs (see
+% the cesium_ws_ros helper), and delete() never stops the reactor. If you ever
+% hit ReactorNotRestartable, restart MATLAB once and re-run.
+%
 % Usage:
 %   b = CesiumBridgeWs();                    % localhost:9090
 %   b.publish(pos_ned, q_b2n, t_sim);        % call every frame
@@ -28,7 +34,6 @@ classdef CesiumBridgeWs < handle
     end
 
     properties (Access = private)
-        ros        % py.roslibpy.Ros
         topicObj   % py.roslibpy.Topic
     end
 
@@ -51,20 +56,9 @@ classdef CesiumBridgeWs < handle
                      '  2) pip install roslibpy  (into that Python)']);
             end
 
-            obj.Topic = topic;
-            obj.ros   = py.roslibpy.Ros(host, int32(port));
-            obj.ros.run();   % connect on a background thread (non-blocking)
-
-            t0 = tic;
-            while ~logical(obj.ros.is_connected) && toc(t0) < 5
-                pause(0.1);
-            end
-            if ~logical(obj.ros.is_connected)
-                error('CesiumBridgeWs:connect', ...
-                    'Could not connect to ws://%s:%d (is rosbridge running?).', host, port);
-            end
-
-            obj.topicObj = py.roslibpy.Topic(obj.ros, topic, 'geometry_msgs/PoseArray');
+            obj.Topic    = topic;
+            ros          = cesium_ws_ros(host, port);   % shared, session-persistent
+            obj.topicObj = py.roslibpy.Topic(ros, topic, 'geometry_msgs/PoseArray');
             obj.topicObj.advertise();
         end
 
@@ -83,8 +77,8 @@ classdef CesiumBridgeWs < handle
 
             % sec/nanosec are strict integer fields in ROS; cast to an integer
             % type so jsonencode emits integer literals (a double can be encoded
-            % as "2e7"/"2.0e7" on some MATLAB releases -> parsed as a float ->
-            % rosbridge rejects it with "nanosec field must be of type 'int'").
+            % as "2e7"/"7.0E+8" -> parsed as a float -> rosbridge rejects it with
+            % "nanosec field must be of type 'int'").
             m = struct();
             m.header = struct('stamp', struct('sec', int32(sec), 'nanosec', int32(nsec)), ...
                               'frame_id', 'map');
@@ -96,17 +90,55 @@ classdef CesiumBridgeWs < handle
         end
 
         function delete(obj)
-            % Best-effort teardown; ignore errors if never fully connected.
+            % Unadvertise the topic, but DO NOT stop the Twisted reactor: it
+            % must survive so the next run can reuse the same connection
+            % (the reactor cannot be restarted within one process).
             try
                 obj.topicObj.unadvertise();
             catch
                 % nothing to clean up
             end
-            try
-                obj.ros.terminate();
-            catch
-                % nothing to clean up
-            end
         end
     end
+end
+
+
+function ros = cesium_ws_ros(host, port)
+%CESIUM_WS_ROS  Session-persistent roslibpy Ros connection.
+% Twisted's reactor can be started only once per process, so create + run()
+% the Ros object once and reuse it for every bridge/run in this MATLAB session.
+persistent ROS
+
+% Reuse an existing, still-connected session.
+if ~isempty(ROS)
+    try
+        if logical(ROS.is_connected)
+            ros = ROS;
+            return;
+        end
+    catch
+        ROS = [];   % stale handle -> rebuild below
+    end
+end
+
+ROS = py.roslibpy.Ros(host, int32(port));
+try
+    ROS.run();                      % start the reactor (first time in process)
+catch ME
+    if contains(ME.message, 'ReactorNotRestartable')
+        ROS.connect();              % reactor already running -> just connect
+    else
+        rethrow(ME);
+    end
+end
+
+t0 = tic;
+while ~logical(ROS.is_connected) && toc(t0) < 5
+    pause(0.1);
+end
+if ~logical(ROS.is_connected)
+    error('CesiumBridgeWs:connect', ...
+        'Could not connect to ws://%s:%d (is rosbridge running?).', host, port);
+end
+ros = ROS;
 end
