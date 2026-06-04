@@ -81,8 +81,13 @@ classdef CesiumBridgeWs < handle
             vehPose  = struct('position',    struct('x', pos_enu(1), 'y', pos_enu(2), 'z', pos_enu(3)), ...
                               'orientation', struct('x', q(2), 'y', q(3), 'z', q(4), 'w', q(1)));
 
+            % sec/nanosec are strict integer fields in ROS; cast to an integer
+            % type so jsonencode emits integer literals (a double can be encoded
+            % as "2e7"/"2.0e7" on some MATLAB releases -> parsed as a float ->
+            % rosbridge rejects it with "nanosec field must be of type 'int'").
             m = struct();
-            m.header = struct('stamp', struct('sec', sec, 'nanosec', nsec), 'frame_id', 'map');
+            m.header = struct('stamp', struct('sec', int32(sec), 'nanosec', int32(nsec)), ...
+                              'frame_id', 'map');
             m.poses  = {zeroPose, vehPose};   % cell -> JSON array of two poses
 
             % Hand the message to roslibpy as a dict (struct -> JSON -> py dict).
