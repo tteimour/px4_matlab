@@ -10,6 +10,13 @@ sccprj/
 codegen/
 octave-workspace
 
+# Thesis figure helper (writes into ~/ytu_thesis, not part of the sim)
+render_quad.py
+
+# Generated autotune figures
+sim/autotune_excitation.png
+sim/autotune_identification.png
+
 # OS
 .DS_Store
 Thumbs.db

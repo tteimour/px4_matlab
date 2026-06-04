@@ -30,6 +30,7 @@ addpath(fullfile(root, 'src', 'params'));
 addpath(fullfile(root, 'src', 'math'));
 addpath(fullfile(root, 'src', 'plant'));
 addpath(fullfile(root, 'src', 'controllers'));
+addpath(fullfile(root, 'src', 'autotune'));
 addpath(fullfile(root, 'src', 'navigator'));
 addpath(fullfile(root, 'src', 'flight_modes'));
 addpath(fullfile(root, 'src', 'sensors'));
@@ -39,20 +40,43 @@ addpath(fullfile(root, 'src', 'sensors', 'mag'));
 addpath(fullfile(root, 'src', 'sensors', 'gnss'));
 addpath(fullfile(root, 'src', 'sensors', 'voter'));
 addpath(fullfile(root, 'src', 'estimator'));
+addpath(fullfile(root, 'src', 'bridge'));
 
 p = px4_params();
 
 range_xy = 50;            % ground-plane half-width (m), purely visual
 
 % =====================================================================
-% Figure / 3D axes
+% Tabbed GUI. Tab 1 ("3D UAV") holds the 3D scene (in a detachable panel)
+% plus the flight cockpit and joysticks; the remaining tabs are parameter
+% editors. Selecting any non-3D tab pops the 3D scene out into a floating
+% window beside the GUI (so the vehicle stays visible while editing);
+% selecting "3D UAV" docks it back in. See onTabSelected().
 % =====================================================================
-fig = figure('Name', 'PX4 interactive flight modes', ...
+fig = figure('Name', 'PX4 interactive — tabbed', ...
              'NumberTitle', 'off', 'Color', 'w', ...
-             'Position', [120 80 1280 800]);
+             'Position', [90 70 1320 840]);
 
-ax = axes('Parent', fig, 'Units', 'normalized', ...
-          'Position', [0.04 0.36 0.55 0.62]);
+tg = uitabgroup(fig, 'Units', 'normalized', 'Position', [0 0 1 1]);
+tab_viz  = uitab(tg, 'Title', '3D UAV');
+tab_ctrl = uitab(tg, 'Title', 'Controller');
+tab_ekf  = uitab(tg, 'Title', 'EKF');
+tab_sens = uitab(tg, 'Title', 'Sensors');
+tab_wind = uitab(tg, 'Title', 'Wind');
+tab_auto = uitab(tg, 'Title', 'Autotune');
+tab_cesium = uitab(tg, 'Title', 'Cesium');
+
+mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
+                'mission', 'rtl', 'land', 'takeoff'};
+default_mode_idx = 3;             % start in Position
+
+% --- 3D scene, inside a detachable panel ------------------------------
+viz_docked_pos = [0.005 0.305 0.655 0.690];
+viz_panel = uipanel(tab_viz, 'Units', 'normalized', ...
+    'Position', viz_docked_pos, 'BackgroundColor', 'w', 'BorderType', 'none');
+
+ax = axes('Parent', viz_panel, 'Units', 'normalized', ...
+          'Position', [0.10 0.10 0.86 0.84]);
 hold(ax, 'on'); grid(ax, 'on'); box(ax, 'on'); axis(ax, 'equal');
 view_half = 8;
 xlim(ax, [-view_half view_half]);
@@ -83,130 +107,86 @@ wind_arrow = quiver3(ax, 0, 0, 0, 0, 0, 0, ...
     'AutoScale', 'off', 'MaxHeadSize', 1.0);
 
 % =====================================================================
-% Right panel: mode dropdown + mission editor + state readout
+% Cockpit (mode dropdown + mission editor + state readout), right column
+% of the 3D-UAV tab.
 % =====================================================================
-right_panel = uipanel(fig, 'Units', 'normalized', ...
-    'Position', [0.61 0.36 0.36 0.62], ...
-    'Title', 'Control', 'BackgroundColor', 'w', 'FontWeight', 'bold');
+cockpit = uipanel(tab_viz, 'Units', 'normalized', ...
+    'Position', [0.665 0.305 0.330 0.690], ...
+    'Title', 'Flight control', 'BackgroundColor', 'w', 'FontWeight', 'bold');
 
-mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
-                'mission', 'rtl', 'land', 'takeoff'};
-default_mode_idx = 3;             % start in Position
-mode_dd = uicontrol(right_panel, 'Style', 'popupmenu', 'Units', 'normalized', ...
+mode_dd = uicontrol(cockpit, 'Style', 'popupmenu', 'Units', 'normalized', ...
     'String', mode_strings, 'Value', default_mode_idx, ...
     'Position', [0.04 0.92 0.92 0.06], ...
     'BackgroundColor', 'w', 'FontWeight', 'bold');
 
-uicontrol(right_panel, 'Style', 'text', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.04 0.86 0.92 0.04], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'left', 'String', 'Waypoint (NED, metres):');
 
 % N / E / D number entries with labels.
-uicontrol(right_panel, 'Style', 'text', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.04 0.79 0.04 0.05], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'right', 'String', 'N');
-n_edit = uicontrol(right_panel, 'Style', 'edit', 'Units', 'normalized', ...
+n_edit = uicontrol(cockpit, 'Style', 'edit', 'Units', 'normalized', ...
     'Position', [0.09 0.79 0.16 0.05], 'String', '0', ...
     'BackgroundColor', [0.99 0.99 0.97]);
 
-uicontrol(right_panel, 'Style', 'text', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.27 0.79 0.04 0.05], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'right', 'String', 'E');
-e_edit = uicontrol(right_panel, 'Style', 'edit', 'Units', 'normalized', ...
+e_edit = uicontrol(cockpit, 'Style', 'edit', 'Units', 'normalized', ...
     'Position', [0.32 0.79 0.16 0.05], 'String', '0', ...
     'BackgroundColor', [0.99 0.99 0.97]);
 
-uicontrol(right_panel, 'Style', 'text', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.50 0.79 0.04 0.05], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'right', 'String', 'D');
-d_edit = uicontrol(right_panel, 'Style', 'edit', 'Units', 'normalized', ...
+d_edit = uicontrol(cockpit, 'Style', 'edit', 'Units', 'normalized', ...
     'Position', [0.55 0.79 0.16 0.05], 'String', '-5', ...
     'BackgroundColor', [0.99 0.99 0.97]);
 
-uicontrol(right_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
     'Position', [0.73 0.79 0.23 0.05], 'String', 'Add', 'FontWeight', 'bold', ...
     'Callback', @(~,~) setappdata(fig, 'add_request', true));
 
-uicontrol(right_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
     'Position', [0.04 0.72 0.30 0.05], 'String', 'Clear', ...
     'Callback', @(~,~) setappdata(fig, 'clear_request', true));
-uicontrol(right_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
     'Position', [0.36 0.72 0.30 0.05], 'String', 'Remove last', ...
     'Callback', @(~,~) setappdata(fig, 'pop_request', true));
-uicontrol(right_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
+uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
     'Position', [0.68 0.72 0.28 0.05], 'String', 'Set Home', ...
     'Callback', @(~,~) setappdata(fig, 'set_home_request', true));
 
-wp_listbox = uicontrol(right_panel, 'Style', 'listbox', 'Units', 'normalized', ...
+wp_listbox = uicontrol(cockpit, 'Style', 'listbox', 'Units', 'normalized', ...
     'Position', [0.04 0.42 0.92 0.28], 'String', {}, ...
     'FontName', 'Courier New', 'FontSize', 9, ...
     'BackgroundColor', [0.99 0.99 0.97]);
 
-state_lbl = uicontrol(right_panel, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.04 0.04 0.92 0.36], 'BackgroundColor', 'w', ...
+state_lbl = uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.04 0.02 0.92 0.38], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'left', 'FontName', 'Courier New', ...
     'FontSize', 9, 'String', '');
 
 % =====================================================================
-% Bottom: joystick boxes + Reset/Stop buttons
+% Bottom strip of the 3D tab: joystick boxes + Reset/Stop buttons.
+% (Wind, estimator toggle, gains, autotune all live on their own tabs.)
 % =====================================================================
-ax_left = axes('Parent', fig, 'Units', 'normalized', ...
-               'Position', [0.04 0.04 0.20 0.28]);
-ax_right = axes('Parent', fig, 'Units', 'normalized', ...
-                'Position', [0.27 0.04 0.20 0.28]);
+ax_left = axes('Parent', tab_viz, 'Units', 'normalized', ...
+               'Position', [0.03 0.04 0.18 0.24]);
+ax_right = axes('Parent', tab_viz, 'Units', 'normalized', ...
+                'Position', [0.23 0.04 0.18 0.24]);
 
 [left_h, right_h] = makeJoysticks(fig, ax_left, ax_right);
 
-action_panel = uipanel(fig, 'Units', 'normalized', ...
-    'Position', [0.50 0.04 0.47 0.28], 'Title', 'Actions', ...
-    'BackgroundColor', 'w', 'FontWeight', 'bold');
-
-uicontrol(action_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.04 0.66 0.45 0.28], 'String', 'Reset', 'FontWeight', 'bold', ...
+uicontrol(tab_viz, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.45 0.16 0.12 0.10], 'String', 'Reset', 'FontWeight', 'bold', ...
     'Callback', @(~,~) setappdata(fig, 'reset_request', true));
-uicontrol(action_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.51 0.66 0.45 0.28], 'String', 'Stop', 'FontWeight', 'bold', ...
+uicontrol(tab_viz, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.45 0.04 0.12 0.10], 'String', 'Stop', 'FontWeight', 'bold', ...
     'BackgroundColor', [0.95 0.85 0.85], ...
     'Callback', @(~,~) setappdata(fig, 'running', false));
-
-% Wind sub-panel (steady NED + turbulence sigma).
-wind_panel = uipanel(action_panel, 'Units', 'normalized', ...
-    'Position', [0.02 0.04 0.96 0.58], 'Title', 'Wind (NED, m/s)', ...
-    'BackgroundColor', 'w', 'FontWeight', 'bold');
-
-uicontrol(wind_panel, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.02 0.55 0.07 0.30], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'N');
-wind_n_edit = uicontrol(wind_panel, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.10 0.55 0.18 0.30], 'String', '0', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-uicontrol(wind_panel, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.31 0.55 0.07 0.30], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'E');
-wind_e_edit = uicontrol(wind_panel, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.39 0.55 0.18 0.30], 'String', '0', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-uicontrol(wind_panel, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.60 0.55 0.07 0.30], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'D');
-wind_d_edit = uicontrol(wind_panel, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.68 0.55 0.18 0.30], 'String', '0', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-
-turb_cb = uicontrol(wind_panel, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.02 0.10 0.45 0.30], 'String', 'Turbulence', ...
-    'BackgroundColor', 'w', 'Value', 0);
-uicontrol(wind_panel, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.46 0.10 0.20 0.30], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'sigma');
-turb_sigma_edit = uicontrol(wind_panel, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.68 0.10 0.18 0.30], 'String', '1.0', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-
-% Estimator toggle: ground-truth state vs EKF2 sensor-driven state.
-est_cb = uicontrol(action_panel, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.04 0.50 0.58 0.13], 'String', 'Use EKF2 estimator (sensor-driven)', ...
-    'BackgroundColor', 'w', 'Value', 0, 'FontWeight', 'bold');
 
 % =====================================================================
 % Sim modules
@@ -218,18 +198,6 @@ att_ctl  = AttitudeController(p);
 rate_ctl = RateController(p);
 alloc    = ControlAllocator(p);
 fmm      = FlightModeManager(p);
-
-% --- Live gain-tuning window (separate figure) ------------------------
-% The controllers are handle classes that copy params into their own
-% properties at construction, so the tuning UI mutates those properties
-% directly and the sim loop picks up new gains on the next tick. The
-% "Tune Gains" button re-opens the window if it was closed.
-uicontrol(action_panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.65 0.49 0.31 0.14], 'String', 'Tune Gains', ...
-    'FontWeight', 'bold', 'BackgroundColor', [0.85 0.90 0.95], ...
-    'Callback', @(~,~) openTuning(fig, p, pos_ctl, att_ctl, rate_ctl));
-tuning_fig = makeTuningWindow(p, pos_ctl, att_ctl, rate_ctl);
-setappdata(fig, 'tuning_fig', tuning_fig);
 
 % Lead-compensator pre-filters (non-PX4 augmentation; see p.lead.*).
 % Each filter is reset on Reset and on every mode change so that
@@ -254,11 +222,41 @@ est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
 
 % Wind disturbance: steady NED component + first-order turbulence.
 wind = WindModel(p);
-set(wind_n_edit,     'String', num2str(p.wind.steady(1)));
-set(wind_e_edit,     'String', num2str(p.wind.steady(2)));
-set(wind_d_edit,     'String', num2str(p.wind.steady(3)));
-set(turb_cb,         'Value',  double(p.wind.turb_enable));
-set(turb_sigma_edit, 'String', num2str(p.wind.turb_sigma));
+
+% =====================================================================
+% Parameter tabs (all bind directly to the live module objects, so edits
+% take effect on the next sim tick / fusion).
+% =====================================================================
+ctrl_refresh = buildControllerTab(tab_ctrl, p, pos_ctl, att_ctl, rate_ctl);
+est_cb       = buildEkfTab(tab_ekf, est_bus);
+buildSensorTab(tab_sens, est_bus);
+buildWindTab(tab_wind, p, wind);
+cesium_cb = buildCesiumTab(tab_cesium);
+
+% --- System-identification autotuner (runs live in the sim loop) -------
+% Preconditions (airborne, low speed, position/hold mode, sticks centred)
+% are checked at start time. The tuner consumes a *modeled* gyro = ground
+% truth + ICM-45686 thermal noise + motor-vibration noise, so the
+% recursive-least-squares stays well-conditioned (PX4 relies on the real
+% gyro's broadband content for the same reason; a noise-free rate makes
+% the AR part unobservable). On success the identified gains are applied
+% to the live controllers AND mirrored onto the Controller tab.
+at_opts = struct('apply_mode', 0, 'gyro_cutoff', 40.0, ...
+                 'sysid_amp', 0.7, 'rise_time', 0.14, 'log_enable', false);
+at = McAutotuneAttitudeControl(p, at_opts);
+autotune_active = false;
+autotune_status = 'idle';
+% Read the gyro-noise model from the live primary IMU chip so the Sensors
+% tab also influences the tuner (recomputed at each Start).
+imu0          = est_bus.sensors.imu.sensors{1};
+gyro_sig_th   = imu0.gyro_nd / sqrt(1 / p.rate_hz.rate);
+gyro_vib_gain = imu0.gyro_vib_gain;
+[at_btn, amp_edit, rise_edit, at_status_lbl, at_results_lbl] = ...
+    buildAutotuneTab(tab_auto, fig, at_opts);
+
+% Pop the 3D scene out of / back into the GUI as tabs change.
+set(tg, 'SelectionChangedFcn', ...
+    @(src, ~) onTabSelected(src, fig, viz_panel, tab_viz, viz_docked_pos));
 
 dt_rate = 1 / p.rate_hz.rate;
 n_att   = round(p.rate_hz.rate / p.rate_hz.attitude);
@@ -324,10 +322,13 @@ setappdata(fig, 'add_request', false);
 setappdata(fig, 'clear_request', false);
 setappdata(fig, 'pop_request', false);
 setappdata(fig, 'set_home_request', false);
+setappdata(fig, 'autotune_request', false);
 waypoints = zeros(0, 3);                        % Nx3 [N E D]
+sticks = struct('left_x', 0, 'left_y', 0, 'right_x', 0, 'right_y', 0);
 
 k     = 0;
 t_sim = 0;
+cesium_bridge = [];   % lazily created when the Cesium toggle is first enabled
 while ishandle(fig) && getappdata(fig, 'running')
     frame_t0 = tic;
 
@@ -357,6 +358,43 @@ while ishandle(fig) && getappdata(fig, 'running')
     if getappdata(fig, 'set_home_request')
         fmm.setHome(plant.pos_ned);
         setappdata(fig, 'set_home_request', false);
+    end
+
+    % --- Autotune start/cancel (preconditions enforced here) ---
+    if getappdata(fig, 'autotune_request')
+        setappdata(fig, 'autotune_request', false);
+        if autotune_active
+            autotune_active = false;            % cancel -> stop injecting
+            autotune_status = 'autotune cancelled';
+        else
+            st = plant.state();                 % ground truth for gating
+            airborne = (-st.position_ned(3)) > 1.5;
+            slow     = norm(st.velocity_ned) < 0.6;
+            mode_ok  = any(strcmp(prev_mode, {'position', 'hold'}));
+            centred  = (abs(sticks.right_x) < 0.05) && (abs(sticks.right_y) < 0.05);
+            if airborne && slow && mode_ok && centred
+                % Pull amplitude / rise-time from the Autotune tab.
+                av = str2double(get(amp_edit, 'String'));
+                rv = str2double(get(rise_edit, 'String'));
+                if isfinite(av) && av > 0, at_opts.sysid_amp = av; end
+                if isfinite(rv) && rv > 0, at_opts.rise_time = rv; end
+                % Re-read the gyro-noise model from the (possibly edited)
+                % primary IMU chip so the Sensors tab influences the tuner.
+                gyro_sig_th   = imu0.gyro_nd / sqrt(dt_rate);
+                gyro_vib_gain = imu0.gyro_vib_gain;
+                at = McAutotuneAttitudeControl(p, at_opts);   % fresh run
+                at.start();
+                autotune_active = true;
+                autotune_status = 'running: roll...';
+            else
+                reasons = {};
+                if ~mode_ok,  reasons{end+1} = 'use position/hold'; end %#ok<AGROW>
+                if ~airborne, reasons{end+1} = 'climb >1.5m';       end %#ok<AGROW>
+                if ~slow,     reasons{end+1} = 'hold still';        end %#ok<AGROW>
+                if ~centred,  reasons{end+1} = 'centre sticks';     end %#ok<AGROW>
+                autotune_status = ['autotune blocked: ' strjoin(reasons, ', ')];
+            end
+        end
     end
 
     % --- Add waypoint ---
@@ -412,18 +450,7 @@ while ishandle(fig) && getappdata(fig, 'running')
     sticks.right_x = get(right_h, 'XData');
     sticks.right_y = get(right_h, 'YData');
 
-    % --- Read wind UI (cheap, once per frame) ---
-    wn = str2double(get(wind_n_edit, 'String'));
-    we = str2double(get(wind_e_edit, 'String'));
-    wd = str2double(get(wind_d_edit, 'String'));
-    if all(isfinite([wn we wd]))
-        wind.steady_ned = [wn; we; wd];
-    end
-    wind.turb_enable = logical(get(turb_cb, 'Value'));
-    sg = str2double(get(turb_sigma_edit, 'String'));
-    if isfinite(sg) && sg >= 0
-        wind.turb_sigma = sg;
-    end
+    % Wind parameters are set directly by the Wind tab callbacks.
 
     % --- Advance physics by dt_frame in dt_rate substeps ---
     n_steps = max(1, round(dt_frame / dt_rate));
@@ -499,16 +526,35 @@ while ishandle(fig) && getappdata(fig, 'running')
             rate_sp = att_ctl.update(s.attitude_q, q_sp, yawspeed_sp);
         end
 
+        % Autotune excitation: add the injected rate setpoint (held between
+        % the tuner's 100 ms publishes) on top of the attitude-loop output.
+        if autotune_active
+            inj = at.injection();
+        else
+            inj = [0; 0; 0];
+        end
+        rate_sp_cmd = rate_sp + inj;
+
         % Landed: ground + slow + commanded altitude target near ground.
         % Use ground truth so estimator noise doesn't cause hover flapping.
         landed = (s_truth.position_ned(3) > -0.05) && ...
                  (norm(s_truth.velocity_ned) < 0.3) && ...
                  (cmd.pos_sp(3) > -0.10);
-        torque = rate_ctl.update(s.angular_vel_b, rate_sp, [0;0;0], dt_rate, landed);
+        torque = rate_ctl.update(s.angular_vel_b, rate_sp_cmd, [0;0;0], dt_rate, landed);
         T_mag  = max(0, -thrust_body_z);
         [m, sat_pos, sat_neg] = alloc.allocate(torque, T_mag);
         rate_ctl.setSaturationStatus(sat_pos, sat_neg);
         m_last = m;
+
+        % Feed the tuner the torque it produced + a modeled (noisy) gyro;
+        % a roll/pitch stick deflection aborts the run inside step().
+        if autotune_active
+            omega_meas = s_truth.angular_vel_b ...
+                + gyro_sig_th * randn(3, 1) ...
+                + gyro_vib_gain * norm(m_last) * randn(3, 1);
+            at.step(dt_rate, torque, omega_meas, ~landed, ...
+                    [sticks.right_x; sticks.right_y]);
+        end
 
         wind_ned = wind.update(dt_rate);
         plant.step(m, dt_rate, wind_ned);
@@ -528,6 +574,31 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
+    % --- Autotune lifecycle: report progress, apply gains on success ---
+    if autotune_active
+        autotune_status = sprintf('running: %s', at.stateName());
+        if at.isDone()
+            r = at.getResults();
+            if r.success
+                applyTunedGains(rate_ctl, att_ctl, r);
+                ctrl_refresh();   % mirror the new gains onto the Controller tab
+                autotune_status = sprintf( ...
+                    'DONE — gains applied (rate P r/p/y = %.3f/%.3f/%.3f)', ...
+                    r.rate_k(1), r.rate_k(2), r.rate_k(3));
+            else
+                autotune_status = 'FAILED — gains unchanged';
+            end
+            set(at_results_lbl, 'String', autotuneResultText(r));
+            autotune_active = false;
+        end
+    end
+    if autotune_active
+        set(at_btn, 'String', 'Cancel Autotune');
+    else
+        set(at_btn, 'String', 'Start Autotune');
+    end
+    set(at_status_lbl, 'String', ['autotune: ' autotune_status]);
+
     % --- Render ---
     s = plant.state();
     eN = s.position_ned(1);
@@ -541,6 +612,33 @@ while ishandle(fig) && getappdata(fig, 'running')
     set(sp_line, 'XData', [eE eE_sp], 'YData', [eN eN_sp], 'ZData', [eU eU_sp]);
 
     drone = updateDrone(drone, s.position_ned, s.attitude_q, m_last, dt_frame);
+
+    % --- Stream pose to Cesium/Unity (opt-in via the Cesium tab) ----------
+    % Same ground-truth pose the 3D view renders, converted NED/FRD->ENU/FLU
+    % and published as geometry_msgs/PoseArray. Failures disable the toggle
+    % rather than killing the sim.
+    if ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1
+        if isempty(cesium_bridge)
+            try
+                cesium_bridge = CesiumBridge();
+                fprintf('Cesium bridge: publishing to %s\n', cesium_bridge.Topic);
+            catch ME
+                warning('Cesium bridge failed to start (%s). Disabling.', ME.message);
+                set(cesium_cb, 'Value', 0);
+                cesium_bridge = [];
+            end
+        end
+        if ~isempty(cesium_bridge)
+            try
+                cesium_bridge.publish(s.position_ned, s.attitude_q, t_sim);
+            catch ME
+                warning('Cesium bridge publish failed (%s). Disabling.', ME.message);
+                set(cesium_cb, 'Value', 0);
+                delete(cesium_bridge);
+                cesium_bridge = [];
+            end
+        end
+    end
 
     % Wind arrow: anchored ~3 m above the drone in plot frame, direction
     % is total NED wind mapped to (E, N, U). Length 0.4 m per m/s.
@@ -625,10 +723,12 @@ while ishandle(fig) && getappdata(fig, 'running')
          'pos_sp  N=%+6.2f  E=%+6.2f  Alt=%5.2f\n' ...
          'vel     %5.2f m/s\n' ...
          'yaw     %+6.1f deg   yaw_sp %+6.1f\n' ...
-         'sticks  L=(%+.2f,%+.2f)  R=(%+.2f,%+.2f)'], ...
+         'sticks  L=(%+.2f,%+.2f)  R=(%+.2f,%+.2f)\n' ...
+         '%s'], ...
         prev_mode, eN, eE, eU, eN_sp, eE_sp, eU_sp, ...
         norm(s.velocity_ned), rad2deg(rpy(3)), rad2deg(cmd.yaw_sp), ...
-        sticks.left_x, sticks.left_y, sticks.right_x, sticks.right_y));
+        sticks.left_x, sticks.left_y, sticks.right_x, sticks.right_y, ...
+        autotune_status));
 
     drawnow limitrate;
 
@@ -638,11 +738,16 @@ while ishandle(fig) && getappdata(fig, 'running')
     end
 end
 
+% Tear down the Cesium/Unity ROS 2 node if it was started.
+if ~isempty(cesium_bridge) && isvalid(cesium_bridge)
+    delete(cesium_bridge);
+end
+
+% Close the detached 3D window if it was popped out (found by tag so it
+% is cleaned up even if the main window was closed first).
+delete(findobj(0, 'Type', 'figure', 'Tag', 'px4_float_viz'));
 if ishandle(fig)
     delete(fig);
-end
-if exist('tuning_fig', 'var') && ishandle(tuning_fig)
-    delete(tuning_fig);
 end
 
 % =====================================================================
@@ -665,6 +770,21 @@ if log_idx > 1
     fprintf(['Logged %d samples to base workspace as `sim_log`. ' ...
              'Run plot_sim() to plot.\n'], log_idx);
 end
+end
+
+
+% =========================================================================
+% Apply autotune results to the live controllers. The tuner reports gains
+% in standard form (kc, ki, kd); RateController holds effective parallel-
+% form gains (with MC_*RATE_K = 1): P = kc, I = kc*ki, D = kc*kd. The
+% attitude P uses AttitudeController.setProportionalGain (preserves the
+% current yaw weight). This is the in-air apply path; safe in simulation.
+% =========================================================================
+function applyTunedGains(rate_ctl, att_ctl, r)
+rate_ctl.gain_p = r.rate_k(:);
+rate_ctl.gain_i = r.rate_k(:) .* r.rate_i(:);
+rate_ctl.gain_d = r.rate_k(:) .* r.rate_d(:);
+att_ctl.setProportionalGain(r.att_p(:), att_ctl.yaw_w);
 end
 
 
@@ -893,12 +1013,38 @@ end
 % (default value in display units, from px4_params). lo/hi/def may be
 % scalar (broadcast to all components) or per-component vectors.
 % =========================================================================
-function tfig = makeTuningWindow(p, pos_ctl, att_ctl, rate_ctl)
-tfig = figure('Name', 'Controller gains (live tuning)', ...
-              'NumberTitle', 'off', 'Color', 'w', ...
-              'MenuBar', 'none', 'ToolBar', 'none', ...
-              'Position', [60 40 640 780]);
+% =========================================================================
+% Pop the 3D scene out into a floating window when a non-3D tab is shown,
+% and dock it back when the "3D UAV" tab is selected.
+% =========================================================================
+function onTabSelected(src, fig, viz_panel, tab_viz, docked_pos)
+sel = src.SelectedTab;
+ff  = getappdata(fig, 'float_fig');
+if strcmp(get(sel, 'Title'), '3D UAV')
+    set(viz_panel, 'Parent', tab_viz, 'Position', docked_pos);
+    if ~isempty(ff) && ishandle(ff), set(ff, 'Visible', 'off'); end
+else
+    if isempty(ff) || ~ishandle(ff)
+        mp = get(fig, 'Position');
+        ff = figure('Name', '3D UAV (detached)', 'NumberTitle', 'off', ...
+                    'Color', 'w', 'MenuBar', 'none', 'ToolBar', 'none', ...
+                    'Tag', 'px4_float_viz', ...
+                    'Position', [mp(1)+mp(3)+14, mp(2)+max(0,mp(4)-600), 640, 600], ...
+                    'CloseRequestFcn', @(o,~) set(o, 'Visible', 'off'));
+        setappdata(fig, 'float_fig', ff);
+    end
+    set(viz_panel, 'Parent', ff, 'Position', [0 0 1 1]);
+    set(ff, 'Visible', 'on');
+    figure(fig);    % keep the main GUI active so parameter edits register
+end
+end
 
+
+% =========================================================================
+% Controller-gains tab. Returns a refresh() handle that re-reads the live
+% controller gains into the sliders/edits (used after autotuning).
+% =========================================================================
+function refresh = buildControllerTab(parent, p, pos_ctl, att_ctl, rate_ctl)
 % --- Position controller (outer loop) ---
 pos_rows = {
     rowSpec('Pos P  (N E D)',         'MPC_XY_P, MPC_XY_P, MPC_Z_P', ...
@@ -959,21 +1105,223 @@ rate_rows = {
 };
 
 % Panel heights weighted by row count (+ title/padding), outer -> inner.
-buildGroup(tfig, [0.03 0.553 0.94 0.427], 'Position controller (outer loop)', pos_rows);
-buildGroup(tfig, [0.03 0.340 0.94 0.213], 'Attitude controller',              att_rows);
-buildGroup(tfig, [0.03 0.020 0.94 0.320], 'Rate controller (inner loop)',     rate_rows);
+rp = buildGroup(parent, [0.03 0.553 0.94 0.427], 'Position controller (outer loop)', pos_rows);
+ra = buildGroup(parent, [0.03 0.340 0.94 0.205], 'Attitude controller',              att_rows);
+ri = buildGroup(parent, [0.03 0.020 0.94 0.310], 'Rate controller (inner loop)',     rate_rows);
+refresh = @() cellfun(@(f) f(), {rp, ra, ri});
 end
 
 
-% Re-open the tuning window from the main figure if it was closed.
-function openTuning(fig, p, pos_ctl, att_ctl, rate_ctl)
-tf = getappdata(fig, 'tuning_fig');
-if ~isempty(tf) && ishandle(tf)
-    figure(tf);                 % bring existing window to front
-    return;
+% =========================================================================
+% EKF2 tab: live measurement-noise / gate edits + the estimator-feed
+% toggle (returned so the sim loop can read it). Measurement-noise and
+% gate edits take effect on the next fusion; init covariances need Reset.
+% =========================================================================
+function est_cb = buildEkfTab(parent, est_bus)
+ekf = est_bus.ekf;
+d   = Ekf2Params();
+rows = {
+    rowSpec('Gyro proc noise',  'EKF2_GYR_NOISE (rad/s)', ...
+            @() ekf.params.gyr_noise,  @(v) setEkfParam(ekf, 'gyr_noise', v),  0, 0.1,  d.gyr_noise);
+    rowSpec('Accel proc noise', 'EKF2_ACC_NOISE (m/s^2)', ...
+            @() ekf.params.acc_noise,  @(v) setEkfParam(ekf, 'acc_noise', v),  0, 1.0,  d.acc_noise);
+    rowSpec('Gyro bias noise',  'EKF2_GYR_B_NOISE', ...
+            @() ekf.params.gyr_b_noise, @(v) setEkfParam(ekf, 'gyr_b_noise', v), 0, 0.01, d.gyr_b_noise);
+    rowSpec('Accel bias noise', 'EKF2_ACC_B_NOISE', ...
+            @() ekf.params.acc_b_noise, @(v) setEkfParam(ekf, 'acc_b_noise', v), 0, 0.02, d.acc_b_noise);
+    rowSpec('Baro noise (m)',   'EKF2_BARO_NOISE', ...
+            @() ekf.params.baro_noise, @(v) setEkfParam(ekf, 'baro_noise', v), 0, 6,    d.baro_noise);
+    rowSpec('GPS pos noise (m)', 'EKF2_GPS_P_NOISE', ...
+            @() ekf.params.gps_p_noise, @(v) setEkfParam(ekf, 'gps_p_noise', v), 0, 3,  d.gps_p_noise);
+    rowSpec('GPS vel noise (m/s)', 'EKF2_GPS_V_NOISE', ...
+            @() ekf.params.gps_v_noise, @(v) setEkfParam(ekf, 'gps_v_noise', v), 0, 2,  d.gps_v_noise);
+    rowSpec('Mag noise (G)',    'EKF2_MAG_NOISE', ...
+            @() ekf.params.mag_noise,  @(v) setEkfParam(ekf, 'mag_noise', v),  0, 0.2,  d.mag_noise);
+    rowSpec('Heading noise',    'EKF2_HEAD_NOISE (rad)', ...
+            @() ekf.params.head_noise, @(v) setEkfParam(ekf, 'head_noise', v), 0, 1,    d.head_noise);
+};
+buildGroup(parent, [0.03 0.18 0.94 0.80], 'EKF2 noise parameters (live)', rows);
+
+est_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.05 0.09 0.9 0.05], 'BackgroundColor', 'w', 'Value', 0, ...
+    'FontWeight', 'bold', 'String', 'Use EKF2 estimator (sensor-driven state feed)');
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.05 0.02 0.9 0.06], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontSize', 8, ...
+    'String', ['Noise/gate edits apply on the next fusion. Initial-covariance ' ...
+               'and time-constant params take effect on Reset.']);
 end
-tf = makeTuningWindow(p, pos_ctl, att_ctl, rate_ctl);
-setappdata(fig, 'tuning_fig', tf);
+
+
+% =========================================================================
+% Sensor-noise tab: edits apply to every chip of each type so whichever is
+% voted primary uses the new value. All fields read live in measure().
+% =========================================================================
+function buildSensorTab(parent, est_bus)
+imus  = est_bus.sensors.imu.sensors;
+baros = est_bus.sensors.baro.sensors;
+mags  = est_bus.sensors.mag.sensors;
+gnss  = est_bus.sensors.gnss.sensors;
+rows = {
+    rowSpec('Gyro noise dens',  'IMU gyro_nd (rad/s/sqrt Hz)', ...
+            @() imus{1}.gyro_nd,  @(v) setAll(imus, 'gyro_nd', v),  0, 5e-3, imus{1}.gyro_nd);
+    rowSpec('Accel noise dens', 'IMU accel_nd (m/s^2/sqrt Hz)', ...
+            @() imus{1}.accel_nd, @(v) setAll(imus, 'accel_nd', v), 0, 5e-3, imus{1}.accel_nd);
+    rowSpec('Gyro vib gain',    'rad/s per unit vib_level', ...
+            @() imus{1}.gyro_vib_gain,  @(v) setAll(imus, 'gyro_vib_gain', v),  0, 1,  imus{1}.gyro_vib_gain);
+    rowSpec('Accel vib gain',   'm/s^2 per unit vib_level', ...
+            @() imus{1}.accel_vib_gain, @(v) setAll(imus, 'accel_vib_gain', v), 0, 20, imus{1}.accel_vib_gain);
+    rowSpec('Baro noise (m)',   'BaroSensor alt_noise_m', ...
+            @() baros{1}.alt_noise_m, @(v) setAll(baros, 'alt_noise_m', v), 0, 5,   baros{1}.alt_noise_m);
+    rowSpec('Mag noise (G)',    'MagSensor mag_noise_g', ...
+            @() mags{1}.mag_noise_g,  @(v) setAll(mags, 'mag_noise_g', v),  0, 0.2, mags{1}.mag_noise_g);
+    rowSpec('GPS pos H/V (m)',  'GNSS pos_h/pos_v noise', ...
+            @() [gnss{1}.pos_h_noise_m; gnss{1}.pos_v_noise_m], ...
+            @(v) setGnss(gnss, {'pos_h_noise_m', 'pos_v_noise_m'}, v), ...
+            [0; 0], [5; 8], [gnss{1}.pos_h_noise_m; gnss{1}.pos_v_noise_m]);
+    rowSpec('GPS vel H/V (m/s)', 'GNSS vel_h/vel_v noise', ...
+            @() [gnss{1}.vel_h_noise_mps; gnss{1}.vel_v_noise_mps], ...
+            @(v) setGnss(gnss, {'vel_h_noise_mps', 'vel_v_noise_mps'}, v), ...
+            [0; 0], [2; 2], [gnss{1}.vel_h_noise_mps; gnss{1}.vel_v_noise_mps]);
+};
+buildGroup(parent, [0.03 0.03 0.94 0.95], ...
+           'Sensor noise (applied to every chip of each type)', rows);
+end
+
+
+% =========================================================================
+% Wind-model tab: steady NED + turbulence intensity/correlation, all bound
+% to the live WindModel object.
+% =========================================================================
+function buildWindTab(parent, p, wind)
+rows = {
+    rowSpec('Steady N E D (m/s)', 'steady wind in NED', ...
+            @() wind.steady_ned, @(v) setProp(wind, 'steady_ned', v), ...
+            [-15; -15; -15], [15; 15; 15], p.wind.steady);
+    rowSpec('Turb sigma (m/s)', 'turbulence 1-sigma per axis', ...
+            @() wind.turb_sigma, @(v) setProp(wind, 'turb_sigma', v), 0, 5, p.wind.turb_sigma);
+    rowSpec('Turb tau (s)', 'turbulence correlation time', ...
+            @() wind.turb_tau, @(v) setProp(wind, 'turb_tau', v), 0.1, 10, p.wind.turb_tau);
+};
+buildGroup(parent, [0.03 0.18 0.94 0.80], 'Wind model (NED)', rows);
+cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.05 0.07 0.9 0.06], 'BackgroundColor', 'w', ...
+    'Value', double(wind.turb_enable), 'FontWeight', 'bold', ...
+    'String', 'Enable turbulence (Ornstein-Uhlenbeck)');
+set(cb, 'Callback', @(src, ~) setWindEnable(wind, src));
+end
+
+
+% =========================================================================
+% Cesium/Unity streaming tab: a single opt-in toggle. When checked, the sim
+% loop streams the vehicle pose to the Cesium-Unity scene via CesiumBridge
+% (geometry_msgs/PoseArray on /world/default/pose/info, 50 Hz frame rate).
+% Only rosbridge_server is needed on the Unity side; PX4/Gazebo are not.
+% =========================================================================
+function cesium_cb = buildCesiumTab(parent)
+cesium_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.05 0.88 0.9 0.06], 'BackgroundColor', 'w', 'Value', 0, ...
+    'FontWeight', 'bold', 'String', 'Stream pose to Cesium/Unity (ROS 2)');
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.05 0.60 0.9 0.26], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontSize', 9, ...
+    'String', sprintf(['Publishes the vehicle pose (ground truth, same as the 3D ' ...
+        'view) as geometry_msgs/PoseArray on /world/default/pose/info at the ' ...
+        '50 Hz frame rate.\n\nUnity side needs only:\n' ...
+        '    ros2 launch rosbridge_server rosbridge_websocket_launch.xml\n' ...
+        'then play the Quba scene. PX4 SITL, the Micro-XRCE agent and Gazebo ' ...
+        'are NOT required. MATLAB and rosbridge must share ROS_DOMAIN_ID ' ...
+        '(default 0).']));
+end
+
+
+% =========================================================================
+% Autotune tab: amplitude / rise-time inputs, the Start/Cancel button,
+% a live status line, and a results panel. The sim loop owns the actual
+% start/cancel logic (preconditions) and updates the labels.
+% =========================================================================
+function [at_btn, amp_edit, rise_edit, status_lbl, results_lbl] = ...
+        buildAutotuneTab(parent, fig, at_opts)
+pan = uipanel(parent, 'Units', 'normalized', 'Position', [0.03 0.55 0.94 0.43], ...
+    'Title', 'System-identification autotune', 'BackgroundColor', 'w', 'FontWeight', 'bold');
+
+uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.03 0.80 0.45 0.12], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'String', 'Inject amplitude MC_AT_SYSID_AMP (rad/s):');
+amp_edit = uicontrol(pan, 'Style', 'edit', 'Units', 'normalized', ...
+    'Position', [0.50 0.80 0.15 0.13], 'BackgroundColor', [0.99 0.99 0.97], ...
+    'String', num2str(at_opts.sysid_amp));
+uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.03 0.62 0.45 0.12], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'String', 'Desired rise time MC_AT_RISE_TIME (s):');
+rise_edit = uicontrol(pan, 'Style', 'edit', 'Units', 'normalized', ...
+    'Position', [0.50 0.62 0.15 0.13], 'BackgroundColor', [0.99 0.99 0.97], ...
+    'String', num2str(at_opts.rise_time));
+
+at_btn = uicontrol(pan, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.70 0.62 0.27 0.30], 'String', 'Start Autotune', ...
+    'FontWeight', 'bold', 'BackgroundColor', [0.88 0.93 0.82], ...
+    'Callback', @(~, ~) setappdata(fig, 'autotune_request', true));
+
+uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.03 0.28 0.94 0.26], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontSize', 8, ...
+    'String', ['Preconditions (checked at Start): airborne (>1.5 m), low speed, ' ...
+               'position/hold mode, sticks centred. A roll/pitch stick deflection ' ...
+               'aborts. On success the identified gains are applied to the live ' ...
+               'controllers and mirrored onto the Controller tab.']);
+
+status_lbl = uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.03 0.04 0.94 0.20], 'BackgroundColor', [0.97 0.97 0.93], ...
+    'HorizontalAlignment', 'left', 'FontName', 'Courier New', 'FontSize', 9, ...
+    'String', 'autotune: idle');
+
+results_lbl = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.03 0.03 0.94 0.49], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontName', 'Courier New', 'FontSize', 9, ...
+    'String', 'Identified models and tuned gains will appear here after a run.');
+end
+
+
+% --- Setters for the parameter tabs ---
+function setEkfParam(ekf, name, v)
+ekf.params.(name) = v(1);
+end
+
+function setAll(cells, name, v)
+for i = 1:numel(cells)
+    cells{i}.(name) = v(1);
+end
+end
+
+function setGnss(cells, names, v)
+for i = 1:numel(cells)
+    cells{i}.(names{1}) = v(1);
+    cells{i}.(names{2}) = v(2);
+end
+end
+
+function setWindEnable(wind, src)
+wind.turb_enable = logical(get(src, 'Value'));
+end
+
+
+% Format the autotune result struct as a fixed-width text block.
+function s = autotuneResultText(r)
+ax = {'roll ', 'pitch', 'yaw  '};
+lines = {sprintf('Final state: %s   (passed verification: %d)', r.state, r.success)};
+lines{end+1} = 'Identified model  [b0 b1 b2 | a1 a2]   (scaled)';
+for k = 1:3
+    c = r.id_coeff(:, k);   % [a1;a2;b0;b1;b2]
+    lines{end+1} = sprintf('  %s %+6.3f %+6.3f %+6.3f | %+6.3f %+6.3f', ...
+        ax{k}, c(3), c(4), c(5), c(1), c(2)); %#ok<AGROW>
+end
+lines{end+1} = 'Designed gains   kc       ki       kd     att_p';
+for k = 1:3
+    lines{end+1} = sprintf('  %s %7.4f %8.4f %8.4f %7.3f', ...
+        ax{k}, r.rate_k(k), r.rate_i(k), r.rate_d(k), r.att_p(k)); %#ok<AGROW>
+end
+s = strjoin(lines, newline);
 end
 
 
@@ -988,24 +1336,28 @@ end
 
 % Lay a group of rows into a titled panel at normalized position `pos`,
 % with a per-controller "Reset defaults" button along the top.
-function buildGroup(parent, pos, title, rows)
+function group_refresh = buildGroup(parent, pos, title, rows)
 panel = uipanel(parent, 'Units', 'normalized', 'Position', pos, ...
                 'Title', title, 'BackgroundColor', 'w', ...
                 'FontWeight', 'bold', 'FontSize', 9);
-nr        = numel(rows);
-reset_fns = cell(nr, 1);
+nr          = numel(rows);
+reset_fns   = cell(nr, 1);
+refresh_fns = cell(nr, 1);
 
 top  = 0.88;                 % rows start below the reset button strip
 bot  = 0.015;
 rowh = (top - bot) / nr;
 for r = 1:nr
-    reset_fns{r} = makeRow(panel, top - r * rowh, rowh, rows{r});
+    [reset_fns{r}, refresh_fns{r}] = makeRow(panel, top - r * rowh, rowh, rows{r});
 end
 
 uicontrol(panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
     'Position', [0.70 0.905 0.28 0.085], 'String', 'Reset defaults', ...
     'FontSize', 8, 'BackgroundColor', [0.95 0.90 0.85], ...
     'Callback', @(~,~) resetGroup(reset_fns));
+
+% Re-read live values into this group's sliders/edits (no controller write).
+group_refresh = @() resetGroup(refresh_fns);
 end
 
 
@@ -1015,7 +1367,7 @@ end
 % All sliders/edits are created first, THEN the callbacks are wired, so the
 % closures capture the fully-populated handle arrays (wiring inside the
 % build loop would snapshot still-unassigned GraphicsPlaceholders).
-function reset_fn = makeRow(panel, ybot, rowh, spec)
+function [reset_fn, refresh_fn] = makeRow(panel, ybot, rowh, spec)
 ncols = 3;                              % grid columns (3-axis params)
 uicontrol(panel, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.02 ybot + 0.08*rowh 0.30 0.80*rowh], ...
@@ -1048,7 +1400,8 @@ for c = 1:n
     set(sliders(c), 'Callback', @(~,~) onSlider(sliders, edits, spec));
     set(edits(c),   'Callback', @(~,~) onEdit(sliders, edits, spec));
 end
-reset_fn = @() resetRow(sliders, edits, spec);
+reset_fn   = @() resetRow(sliders, edits, spec);
+refresh_fn = @() refreshRow(sliders, edits, spec);
 end
 
 
@@ -1101,6 +1454,22 @@ for c = 1:numel(sliders)
     set(edits(c),   'String', num2str(d(c), '%.4g'));
 end
 spec.set(d);
+end
+
+
+% Re-read the row's CURRENT live value into its sliders/edits without
+% writing back to the object (used to mirror autotuned gains onto the UI).
+function refreshRow(sliders, edits, spec)
+v = spec.get(); v = v(:);
+for c = 1:numel(sliders)
+    lo = min(get(sliders(c), 'Min'), v(c));
+    hi = max(get(sliders(c), 'Max'), v(c));
+    if hi <= lo, hi = lo + eps; end
+    set(sliders(c), 'Min', lo);
+    set(sliders(c), 'Max', hi);
+    set(sliders(c), 'Value', v(c));
+    set(edits(c),   'String', num2str(v(c), '%.4g'));
+end
 end
 
 

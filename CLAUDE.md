@@ -25,6 +25,9 @@ In-scope modules (PX4 → MATLAB mapping):
 - `ekf2` — 24-state EKF subset: predict + covariance, fusions for
   baro, GNSS pos+vel, mag (heading + 3D), gravity. Output predictor
   with delay-compensated buffer
+- `mc_autotune_attitude_control` — system-identification attitude/rate
+  auto-tuner: ARX recursive-least-squares (`system_identification` lib),
+  GMVC PID design (`pid_design` lib), per-axis excitation + state machine
 
 Out of scope:
 - LPE / other estimators (only EKF2 is replicated)
@@ -44,6 +47,9 @@ to consult when implementing each module:
 - Attitude control: `src/modules/mc_att_control/AttitudeControl/AttitudeControl.cpp`
 - Rate control: `src/lib/rate_control/RateControl.cpp`
 - Control allocation: `src/modules/control_allocator/`
+- Autotune: `src/modules/mc_autotune_attitude_control/`,
+  `src/lib/system_identification/` (arx_rls, system_identification,
+  signal_generator), `src/lib/pid_design/pid_design.hpp`
 - Navigator: `src/modules/navigator/`
 - Sensor drivers: `src/drivers/imu/`, `src/drivers/barometer/`,
   `src/drivers/magnetometer/`, `src/drivers/gps/`
@@ -181,6 +187,9 @@ sim step.
 - [x] EKF2 24-state subset (predict + baro + GNSS + mag + gravity)
 - [x] Output predictor
 - [x] Estimator-feed toggle in run_interactive
+- [x] System-identification autotune (ArxRls + SystemIdentification +
+      GMVC pid_design + McAutotuneAttitudeControl state machine);
+      demo in sim/run_autotune.m, unit tests vs PX4 reference values
 - [ ] Estimator validation (unit + bench tests)
 
 ## Mission Plan
