@@ -102,5 +102,14 @@ classdef SensorHub < handle
                 g = zeros(3, 1); a = zeros(3, 1);
             end
         end
+
+        function reset(obj)
+            % Reset every sensor group (clocks, delay queues, validators,
+            % primary selection) back to its initial state.
+            obj.imu.reset();
+            obj.baro.reset();
+            obj.mag.reset();
+            obj.gnss.reset();
+        end
     end
 end

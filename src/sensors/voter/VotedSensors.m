@@ -110,6 +110,22 @@ classdef VotedSensors < handle
             if obj.selected_idx <= 0, id = uint32(0); return; end
             id = obj.sensors{obj.selected_idx}.device_id;
         end
+
+        function reset(obj)
+            % Reset all sensors and rebuild validators / primary selection so
+            % a sim restart begins from a clean state.
+            for i = 1:numel(obj.sensors)
+                obj.sensors{i}.reset();
+                v = DataValidator();
+                v.priority  = obj.sensors{i}.priority;
+                v.timeout_s = max(0.05, 5.0 / max(obj.sensors{i}.sample_rate_hz, 1));
+                obj.validators{i} = v;
+            end
+            [~, idx] = max(cellfun(@(s) s.priority, obj.sensors));
+            obj.selected_idx   = idx;
+            obj.failover_count = 0;
+            obj.failover_state = 'none';
+        end
     end
 
     methods (Access = private)

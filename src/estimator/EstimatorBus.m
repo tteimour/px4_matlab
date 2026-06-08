@@ -98,5 +98,19 @@ classdef EstimatorBus < handle
             if ~isempty(imu) && isfield(imu, 'gyro_b'), omega = imu.gyro_b; end
             s = obj.output_pred.stateOut(omega);
         end
+
+        function reset(obj)
+            % Full reset: sensor clocks/queues, EKF, output predictor, and the
+            % per-sample staleness trackers. Without resetting the sensors and
+            % the last_*_t trackers, a sim-time restart leaves the IMU sample
+            % frozen at its pre-reset timestamp and the EKF predict gated off.
+            obj.sensors.reset();
+            obj.ekf.reset();
+            obj.output_pred.reset();
+            obj.last_imu_t  = -inf;
+            obj.last_baro_t = -inf;
+            obj.last_mag_t  = -inf;
+            obj.last_gps_t  = -inf;
+        end
     end
 end

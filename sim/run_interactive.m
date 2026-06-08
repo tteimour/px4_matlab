@@ -98,7 +98,7 @@ sp_line = plot3(ax, [0 0], [0 0], [0 0], 'r:', 'LineWidth', 0.8);
 mission_h = plot3(ax, NaN, NaN, NaN, 'g--o', 'LineWidth', 1.0, ...
                   'MarkerSize', 6, 'MarkerFaceColor', [0.6 0.95 0.6]);
 
-drone = makeDrone(ax, root);
+drone = makeDrone(ax);
 
 % Wind indicator: arrow rendered at a fixed offset above the drone,
 % direction = total wind in NED, length proportional to speed.
@@ -266,6 +266,9 @@ dt_pos  = n_pos * dt_rate;
 fps      = 50;
 dt_frame = 1 / fps;
 
+imu_pub_hz = 200;            % OpenVINS IMU stream rate [Hz] (decimated from 1 kHz)
+imu_pub_dt = 1 / imu_pub_hz;
+
 % Initialize FMM in the chosen mode against the spawned vehicle pose.
 fmm.setHome([0; 0; 0]);
 prev_mode = mode_strings{default_mode_idx};
@@ -328,7 +331,10 @@ sticks = struct('left_x', 0, 'left_y', 0, 'right_x', 0, 'right_y', 0);
 
 k     = 0;
 t_sim = 0;
-cesium_bridge = [];   % lazily created when the Cesium toggle is first enabled
+cesium_bridge  = [];   % lazily created when the Cesium toggle is first enabled
+imu_bridge     = [];   % lazily created with cesium_bridge; streams IMU to OpenVINS
+last_imu_pub_t = -inf; % sim-time of last published IMU sample (200 Hz decimation)
+imu_stream_failed = false; % latched on IMU publish failure to stop recreate churn
 while ishandle(fig) && getappdata(fig, 'running')
     frame_t0 = tic;
 
@@ -341,13 +347,18 @@ while ishandle(fig) && getappdata(fig, 'running')
         vel_lead.reset();
         att_lead.reset();
         wind.reset();
-        est_bus.ekf.reset();
-        est_bus.output_pred.reset();
-        % Re-inject the known bias after EKF reset so post-Reset runs
+        % Full estimator reset: sensors (clocks/queues/validators), EKF,
+        % output predictor, and the staleness trackers — so post-Reset sim time
+        % restarts cleanly at 0 and fresh IMU samples flow again (required for
+        % the VIO IMU bridge, and fixes the pre-existing estimator stall on Reset).
+        est_bus.reset();
+        % Re-inject the known bias after reset so post-Reset runs
         % have the same truth bias to estimate.
         est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
         clearpoints(trail);
         t_sim   = 0;
+        last_imu_pub_t    = -inf;  % sim time restarts at 0; re-arm IMU decimation
+        imu_stream_failed = false; % re-arm IMU bridge after a Reset
         log_idx = 0;
         fmm.setHome([0; 0; 0]);
         fmm.setMode(prev_mode, plant.state());
@@ -455,6 +466,9 @@ while ishandle(fig) && getappdata(fig, 'running')
     % --- Advance physics by dt_frame in dt_rate substeps ---
     n_steps = max(1, round(dt_frame / dt_rate));
     use_est = logical(get(est_cb, 'Value'));
+    % VIO streaming on? Read once per frame (the substep loop runs at ~1 kHz;
+    % avoid a GUI read per substep). Gates the IMU publish inside the loop.
+    stream_on = ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1;
     for i = 1:n_steps
         s_truth = plant.state();
 
@@ -467,6 +481,26 @@ while ishandle(fig) && getappdata(fig, 'running')
         % regardless of the toggle. The toggle controls whose state
         % the controllers consume.
         est_bus.step(t_sim + (i-1)*dt_rate, s_truth);
+
+        % --- Stream IMU to OpenVINS at imu_pub_hz (sim-time stamped) --------
+        % Decimate the 1 kHz voted IMU to ~200 Hz. imu.t is the sample's sim
+        % time -- the same clock the Cesium pose (and thus the Unity camera)
+        % carry -- so camera and IMU stay in one clock domain for VIO.
+        if stream_on && ~isempty(imu_bridge)
+            imu = est_bus.sensors.vehicleImu();
+            if ~isempty(imu) && isfield(imu, 't') && ...
+                    imu.t >= last_imu_pub_t + imu_pub_dt - 1e-9
+                try
+                    imu_bridge.publish(imu.gyro_b, imu.accel_b, imu.t);
+                    last_imu_pub_t = imu.t;
+                catch ME
+                    warning('IMU bridge publish failed (%s). Disabling.', ME.message);
+                    delete(imu_bridge);
+                    imu_bridge = [];
+                    imu_stream_failed = true;  % stop per-frame recreate churn
+                end
+            end
+        end
 
         if use_est
             s = est_bus.stateOut();
@@ -611,7 +645,7 @@ while ishandle(fig) && getappdata(fig, 'running')
     set(sp_dot,  'XData', eE_sp, 'YData', eN_sp, 'ZData', eU_sp);
     set(sp_line, 'XData', [eE eE_sp], 'YData', [eN eN_sp], 'ZData', [eU eU_sp]);
 
-    drone = updateDrone(drone, s.position_ned, s.attitude_q, m_last, dt_frame);
+    drone = updateDrone(drone, s.position_ned, s.attitude_q);
 
     % --- Stream pose to Cesium/Unity (opt-in via the Cesium tab) ----------
     % Same ground-truth pose the 3D view renders, converted NED/FRD->ENU/FLU
@@ -632,6 +666,20 @@ while ishandle(fig) && getappdata(fig, 'running')
                 warning('Cesium bridge failed to start (%s). Disabling.', ME.message);
                 set(cesium_cb, 'Value', 0);
                 cesium_bridge = [];
+            end
+        end
+        % IMU bridge to OpenVINS (native DDS, no rosbridge). Created with the
+        % Cesium toggle so the VIO pipeline (Unity camera + MATLAB IMU) comes
+        % up together; the substep loop above does the 200 Hz publishing.
+        if isempty(imu_bridge) && ~imu_stream_failed
+            try
+                imu_bridge = ImuBridge();
+                last_imu_pub_t = -inf;
+                fprintf('IMU bridge: publishing to %s @ %d Hz\n', ...
+                        imu_bridge.Topic, imu_pub_hz);
+            catch ME
+                warning('IMU bridge failed to start (%s). Disabling.', ME.message);
+                imu_bridge = [];
             end
         end
         if ~isempty(cesium_bridge)
@@ -747,6 +795,10 @@ end
 % Tear down the Cesium/Unity ROS 2 node if it was started.
 if ~isempty(cesium_bridge) && isvalid(cesium_bridge)
     delete(cesium_bridge);
+end
+% Tear down the OpenVINS IMU ROS 2 node if it was started.
+if ~isempty(imu_bridge) && isvalid(imu_bridge)
+    delete(imu_bridge);
 end
 
 % Close the detached 3D window if it was popped out (found by tag so it
@@ -883,118 +935,56 @@ end
 
 
 % =========================================================================
-% Drone visual: STL mesh body + four spinning propellers (hgtransform-based).
-% Rotor mounts auto-detected from the body STL by quadrant clustering.
-% Frame mapping STL -> FRD: (X, Y, Z) -> (X, Z, Y).
+% Drone visual: lightweight quad marker (hgtransform-based).
+% No STL mesh and no scene lighting -- an X-frame of arms with rotor disks and a
+% forward indicator, all under one hgtransform so updateDrone only sets a 4x4
+% Matrix per frame. Keeps position + attitude readable at near-zero render cost
+% (replaces the heavy ~12k-face STL body + 4 spinning-prop meshes).
 % =========================================================================
-function drone = makeDrone(ax, root)
+function drone = makeDrone(ax)
 arm = 1.2;
-
-% --- Body STL ---
-[bV, bF] = readStlAny(fullfile(root, 'QuadCopter_Body.stl'));
-bV = bV - mean(bV, 1);
-
-horiz_r = sqrt(bV(:, 1).^2 + bV(:, 3).^2);
-mask_outer = horiz_r > quantile(horiz_r, 0.85);
-quads = [+1 +1; -1 +1; +1 -1; -1 -1];
-mounts_raw = zeros(4, 3);
-for i = 1:4
-    m = mask_outer & (sign(bV(:, 1)) == quads(i, 1)) ...
-                   & (sign(bV(:, 3)) == quads(i, 2));
-    if any(m)
-        mounts_raw(i, :) = mean(bV(m, :), 1);
-    else
-        mounts_raw(i, :) = [quads(i, 1)*max(abs(bV(:,1))), 0, ...
-                            quads(i, 2)*max(abs(bV(:,3)))];
-    end
-end
-
-bV          = swapToFRD(bV);
-mounts_frd  = swapToFRD(mounts_raw);
-
-horiz_extent = max(max(abs(bV(:, 1:2)), [], 1));
-scale = arm / max(horiz_extent, eps);
-bV          = bV * scale;
-mounts_frd  = mounts_frd * scale;
-
-if size(bF, 1) > 12000
-    fv = reducepatch(struct('faces', bF, 'vertices', bV), 12000);
-    bV = fv.vertices; bF = fv.faces;
-end
+d   = arm / sqrt(2);                       % rotor offset along body X/Y (FRD)
+% Rotor tips in FRD body frame: front-right, front-left, rear-right, rear-left.
+tips = [ +d +d 0;
+         +d -d 0;
+         -d +d 0;
+         -d -d 0];
 
 drone.body_xform = hgtransform('Parent', ax);
-drone.body_h = patch('Parent', drone.body_xform, ...
-                     'Faces', bF, 'Vertices', bV, ...
-                     'FaceColor', [0.40 0.42 0.48], 'EdgeColor', 'none', ...
-                     'FaceLighting', 'gouraud', 'AmbientStrength', 0.4);
 
-% --- Propeller STL (shared by all 4 props) ---
-[pV, pF] = readStlAny(fullfile(root, 'QuadCopter_Propeller.stl'));
-pV = pV - mean(pV, 1);
-pV = swapToFRD(pV);
-prop_horiz = max(max(abs(pV(:, 1:2)), [], 1));
-pV = pV * (arm * 0.45 / max(prop_horiz, eps));
-
-drone.prop_xform   = gobjects(1, 4);
+% Arms: centre -> each tip, as one NaN-separated line object.
+ax_x = []; ax_y = []; ax_z = [];
 for i = 1:4
-    drone.prop_xform(i) = hgtransform('Parent', drone.body_xform);
-    patch('Parent', drone.prop_xform(i), 'Faces', pF, 'Vertices', pV, ...
-          'FaceColor', [0.10 0.10 0.12], 'EdgeColor', 'none', ...
-          'FaceLighting', 'gouraud', 'AmbientStrength', 0.5);
+    ax_x = [ax_x, 0, tips(i, 1), NaN]; %#ok<AGROW>
+    ax_y = [ax_y, 0, tips(i, 2), NaN]; %#ok<AGROW>
+    ax_z = [ax_z, 0, tips(i, 3), NaN]; %#ok<AGROW>
 end
-drone.rotors_body  = mounts_frd';
-drone.prop_angle   = zeros(1, 4);
-drone.prop_spin_dir = [+1 -1 +1 -1];
-drone.prop_spin_max = 250;
+line('Parent', drone.body_xform, 'XData', ax_x, 'YData', ax_y, 'ZData', ax_z, ...
+     'Color', [0.45 0.47 0.52], 'LineWidth', 2);
 
+% Rotor disks: front pair green, rear pair dark, so heading is readable.
+line('Parent', drone.body_xform, 'XData', tips(1:2, 1), 'YData', tips(1:2, 2), ...
+     'ZData', tips(1:2, 3), 'LineStyle', 'none', 'Marker', 'o', ...
+     'MarkerSize', 9, 'MarkerFaceColor', [0.20 0.70 0.30], 'MarkerEdgeColor', 'none');
+line('Parent', drone.body_xform, 'XData', tips(3:4, 1), 'YData', tips(3:4, 2), ...
+     'ZData', tips(3:4, 3), 'LineStyle', 'none', 'Marker', 'o', ...
+     'MarkerSize', 9, 'MarkerFaceColor', [0.15 0.15 0.18], 'MarkerEdgeColor', 'none');
+
+% Forward (+X body) indicator.
 drone.front = line('Parent', drone.body_xform, ...
                    'XData', [0, 1.4*arm], 'YData', [0, 0], 'ZData', [0, 0], ...
-                   'Color', 'r', 'LineWidth', 3.5);
-
-if isempty(findobj(ax, 'Type', 'light'))
-    camlight(ax, 'headlight');
-    lighting(ax, 'gouraud');
-end
+                   'Color', 'r', 'LineWidth', 3);
 end
 
 
-function drone = updateDrone(drone, pos_ned, q, motor_cmd, dt)
+function drone = updateDrone(drone, pos_ned, q)
+% Cheap per-frame update: just place/orient the marker (no mesh, no props).
 ned_to_plot = [0 1 0; 1 0 0; 0 0 -1];
 R_b2n = quat_to_dcm(q);
 M_body = eye(4);
 M_body(1:3, 1:3) = ned_to_plot * R_b2n;
 M_body(1:3, 4)   = ned_to_plot * pos_ned;
 set(drone.body_xform, 'Matrix', M_body);
-
-for i = 1:4
-    drone.prop_angle(i) = drone.prop_angle(i) + ...
-        drone.prop_spin_dir(i) * drone.prop_spin_max * sqrt(max(0, motor_cmd(i))) * dt;
-    a = drone.prop_angle(i);
-    M_prop = eye(4);
-    M_prop(1:3, 1:3) = [cos(a) -sin(a) 0; sin(a) cos(a) 0; 0 0 1];
-    M_prop(1:3, 4)   = drone.rotors_body(:, i);
-    set(drone.prop_xform(i), 'Matrix', M_prop);
-end
-end
-
-
-function V = swapToFRD(V)
-V = [V(:, 1), V(:, 3), V(:, 2)];
-end
-
-
-function [V, F] = readStlAny(path)
-% Cross-version STL loader. MATLAB's built-in stlread (R2018b+) returns a
-% triangulation object with Points / ConnectivityList; older toolboxes
-% (and the File Exchange version) return a struct with vertices / faces.
-s = stlread(path);
-if isa(s, 'triangulation')
-    V = s.Points;
-    F = s.ConnectivityList;
-else
-    V = s.vertices;
-    F = s.faces;
-end
 end
 
 
