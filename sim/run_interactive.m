@@ -65,13 +65,15 @@ tab_sens = uitab(tg, 'Title', 'Sensors');
 tab_wind = uitab(tg, 'Title', 'Wind');
 tab_auto = uitab(tg, 'Title', 'Autotune');
 tab_cesium = uitab(tg, 'Title', 'Cesium');
+tab_vio = uitab(tg, 'Title', 'VIO');
+tab_mission = uitab(tg, 'Title', 'Mission');
 
 mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
                 'mission', 'rtl', 'land', 'takeoff'};
 default_mode_idx = 3;             % start in Position
 
 % --- 3D scene, inside a detachable panel ------------------------------
-viz_docked_pos = [0.005 0.305 0.655 0.690];
+viz_docked_pos = [0.005 0.02 0.985 0.965];   % fills the tab (joysticks moved out)
 viz_panel = uipanel(tab_viz, 'Units', 'normalized', ...
     'Position', viz_docked_pos, 'BackgroundColor', 'w', 'BorderType', 'none');
 
@@ -107,86 +109,39 @@ wind_arrow = quiver3(ax, 0, 0, 0, 0, 0, 0, ...
     'AutoScale', 'off', 'MaxHeadSize', 1.0);
 
 % =====================================================================
-% Cockpit (mode dropdown + mission editor + state readout), right column
-% of the 3D-UAV tab.
+% The old "Flight control" cockpit panel was removed from the 3D-UAV tab.
+% Mode selection (now big buttons), the waypoint editor, the live state
+% readout, and mission save/load all live on the Mission tab instead.
+% `mode_bg` / `state_lbl` are created there (buildMissionTab) and grabbed
+% from the returned struct below.
 % =====================================================================
-cockpit = uipanel(tab_viz, 'Units', 'normalized', ...
-    'Position', [0.665 0.305 0.330 0.690], ...
-    'Title', 'Flight control', 'BackgroundColor', 'w', 'FontWeight', 'bold');
-
-mode_dd = uicontrol(cockpit, 'Style', 'popupmenu', 'Units', 'normalized', ...
-    'String', mode_strings, 'Value', default_mode_idx, ...
-    'Position', [0.04 0.92 0.92 0.06], ...
-    'BackgroundColor', 'w', 'FontWeight', 'bold');
-
-uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.04 0.86 0.92 0.04], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'left', 'String', 'Waypoint (NED, metres):');
-
-% N / E / D number entries with labels.
-uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.04 0.79 0.04 0.05], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'N');
-n_edit = uicontrol(cockpit, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.09 0.79 0.16 0.05], 'String', '0', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-
-uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.27 0.79 0.04 0.05], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'E');
-e_edit = uicontrol(cockpit, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.32 0.79 0.16 0.05], 'String', '0', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-
-uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.50 0.79 0.04 0.05], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'right', 'String', 'D');
-d_edit = uicontrol(cockpit, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.55 0.79 0.16 0.05], 'String', '-5', ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-
-uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.73 0.79 0.23 0.05], 'String', 'Add', 'FontWeight', 'bold', ...
-    'Callback', @(~,~) setappdata(fig, 'add_request', true));
-
-uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.04 0.72 0.30 0.05], 'String', 'Clear', ...
-    'Callback', @(~,~) setappdata(fig, 'clear_request', true));
-uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.36 0.72 0.30 0.05], 'String', 'Remove last', ...
-    'Callback', @(~,~) setappdata(fig, 'pop_request', true));
-uicontrol(cockpit, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.68 0.72 0.28 0.05], 'String', 'Set Home', ...
-    'Callback', @(~,~) setappdata(fig, 'set_home_request', true));
-
-wp_listbox = uicontrol(cockpit, 'Style', 'listbox', 'Units', 'normalized', ...
-    'Position', [0.04 0.42 0.92 0.28], 'String', {}, ...
-    'FontName', 'Courier New', 'FontSize', 9, ...
-    'BackgroundColor', [0.99 0.99 0.97]);
-
-state_lbl = uicontrol(cockpit, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.04 0.02 0.92 0.38], 'BackgroundColor', 'w', ...
-    'HorizontalAlignment', 'left', 'FontName', 'Courier New', ...
-    'FontSize', 9, 'String', '');
 
 % =====================================================================
-% Bottom strip of the 3D tab: joystick boxes + Reset/Stop buttons.
-% (Wind, estimator toggle, gains, autotune all live on their own tabs.)
+% Manual control lives in a SEPARATE floating window (ctrl_fig) so you can
+% fly the drone from ANY tab -- the joysticks used to sit on the 3D tab and
+% vanished when you switched tabs. The drag callbacks are wired to ctrl_fig;
+% the sim loop reads left_h/right_h regardless of which figure holds them.
+% Reset/Stop are here too (they act on the main figure `fig`). Closing this
+% window stops the sim.
 % =====================================================================
-ax_left = axes('Parent', tab_viz, 'Units', 'normalized', ...
-               'Position', [0.03 0.04 0.18 0.24]);
-ax_right = axes('Parent', tab_viz, 'Units', 'normalized', ...
-                'Position', [0.23 0.04 0.18 0.24]);
+ctrl_fig = figure('Name', 'Manual control (works on any tab)', ...
+    'NumberTitle', 'off', 'MenuBar', 'none', 'ToolBar', 'none', ...
+    'Color', 'w', 'Position', [60 90 480 300], ...
+    'CloseRequestFcn', @(~,~) setappdata(fig, 'running', false));
+ax_left = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
+               'Position', [0.06 0.32 0.40 0.60]);
+ax_right = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
+                'Position', [0.54 0.32 0.40 0.60]);
+[left_h, right_h] = makeJoysticks(ctrl_fig, ax_left, ax_right);
 
-[left_h, right_h] = makeJoysticks(fig, ax_left, ax_right);
-
-uicontrol(tab_viz, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.45 0.16 0.12 0.10], 'String', 'Reset', 'FontWeight', 'bold', ...
+uicontrol(ctrl_fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.06 0.06 0.40 0.18], 'String', 'Reset', 'FontWeight', 'bold', ...
     'Callback', @(~,~) setappdata(fig, 'reset_request', true));
-uicontrol(tab_viz, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.45 0.04 0.12 0.10], 'String', 'Stop', 'FontWeight', 'bold', ...
+uicontrol(ctrl_fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.54 0.06 0.40 0.18], 'String', 'Stop', 'FontWeight', 'bold', ...
     'BackgroundColor', [0.95 0.85 0.85], ...
     'Callback', @(~,~) setappdata(fig, 'running', false));
+figure(fig);   % bring the main tabbed window back to the front
 
 % =====================================================================
 % Sim modules
@@ -232,6 +187,15 @@ est_cb       = buildEkfTab(tab_ekf, est_bus);
 buildSensorTab(tab_sens, est_bus);
 buildWindTab(tab_wind, p, wind);
 cesium_cb = buildCesiumTab(tab_cesium);
+vio_ui = buildVioTab(tab_vio, fig);   % VIO control tab (enable, params, streams)
+vio_cb = vio_ui.vio_cb;               % the loop drives VIO off this checkbox
+
+% Mission tab: north-up satellite map at the Cesium origin (Baku); click to
+% drop waypoints, set per-waypoint altitude. Writes the same `waypoints`
+% array (via map_add_request / alt_edit_request) the cockpit editor uses.
+mission_map = buildMissionTab(tab_mission, fig, mode_strings);
+state_lbl = mission_map.state_lbl;   % live state readout now lives on Mission tab
+mode_bg   = mission_map.mode_bg;     % flight-mode buttons (replace the dropdown)
 
 % --- System-identification autotuner (runs live in the sim loop) -------
 % Preconditions (airborne, low speed, position/hold mode, sticks centred)
@@ -286,55 +250,94 @@ cmd           = struct('kind', 'position', 'pos_sp', [0;0;0], ...
                        'mode', prev_mode);
 
 % =====================================================================
-% Log buffers (preallocated, trimmed at end)
+% Logging (optional, OFF by default for performance).
+%
+%   LOG_ENABLE = true  -> record tracking / sensor / estimator signals into
+%                         `sim_log` (base workspace) so plot_sim() can plot.
+%   LOG_ENABLE = false -> skip ALL per-frame logging work. Default. Keeps the
+%                         sim loop light so the Cesium/Unity pose stream stays
+%                         smooth. Flip this single flag to turn logging on/off.
 % =====================================================================
+LOG_ENABLE = false;       % 1 = log to base workspace, 0 = no logging (default)
+
 max_log = 60000;
-log.t        = nan(max_log, 1);
-log.pos      = nan(max_log, 3);     % ground-truth position
-log.pos_sp   = nan(max_log, 3);
-log.vel      = nan(max_log, 3);     % ground-truth velocity
-log.vel_sp   = nan(max_log, 3);
-log.rpy      = nan(max_log, 3);     % ground-truth roll/pitch/yaw
-log.rpy_sp   = nan(max_log, 3);
-log.omega    = nan(max_log, 3);
-log.rate_sp  = nan(max_log, 3);
-log.motor    = nan(max_log, 4);
-log.mode_idx = nan(max_log, 1);
-% Sensor + estimator logs — populated every frame regardless of toggle.
-log.imu_gyro  = nan(max_log, 3);    % voted vehicle_imu gyro_b (rad/s)
-log.imu_accel = nan(max_log, 3);    % voted vehicle_imu accel_b (m/s^2)
-log.baro_alt  = nan(max_log, 1);    % voted vehicle_air_data altitude (m)
-log.mag_b     = nan(max_log, 3);    % voted vehicle_magnetometer mag_b (G)
-log.gps_pos   = nan(max_log, 3);    % vehicle_gps_position pos_ned (m)
-log.gps_vel   = nan(max_log, 3);    % vehicle_gps_position vel_ned (m/s)
-log.gps_eph   = nan(max_log, 1);
-log.est_pos   = nan(max_log, 3);    % EKF/output-predictor position
-log.est_vel   = nan(max_log, 3);
-log.est_rpy   = nan(max_log, 3);
-log.use_est   = false(max_log, 1);  % logical: was the controller fed EKF state?
-% IMU bias estimation logs.
-log.true_gyro_bias  = nan(max_log, 3);   % live body-frame bias of primary IMU
-log.true_accel_bias = nan(max_log, 3);
-log.est_gyro_bias   = nan(max_log, 3);   % EKF state.gyro_b
-log.est_accel_bias  = nan(max_log, 3);   % EKF state.accel_b
-log_idx      = 0;
+log_idx = 0;
+log     = struct();
+if LOG_ENABLE
+    log.t        = nan(max_log, 1);
+    log.pos      = nan(max_log, 3);     % ground-truth position
+    log.pos_sp   = nan(max_log, 3);
+    log.vel      = nan(max_log, 3);     % ground-truth velocity
+    log.vel_sp   = nan(max_log, 3);
+    log.rpy      = nan(max_log, 3);     % ground-truth roll/pitch/yaw
+    log.rpy_sp   = nan(max_log, 3);
+    log.omega    = nan(max_log, 3);
+    log.rate_sp  = nan(max_log, 3);
+    log.motor    = nan(max_log, 4);
+    log.mode_idx = nan(max_log, 1);
+    % Sensor + estimator logs.
+    log.imu_gyro  = nan(max_log, 3);    % voted vehicle_imu gyro_b (rad/s)
+    log.imu_accel = nan(max_log, 3);    % voted vehicle_imu accel_b (m/s^2)
+    log.baro_alt  = nan(max_log, 1);    % voted vehicle_air_data altitude (m)
+    log.mag_b     = nan(max_log, 3);    % voted vehicle_magnetometer mag_b (G)
+    log.gps_pos   = nan(max_log, 3);    % vehicle_gps_position pos_ned (m)
+    log.gps_vel   = nan(max_log, 3);    % vehicle_gps_position vel_ned (m/s)
+    log.gps_eph   = nan(max_log, 1);
+    log.est_pos   = nan(max_log, 3);    % EKF/output-predictor position
+    log.est_vel   = nan(max_log, 3);
+    log.est_rpy   = nan(max_log, 3);
+    log.use_est   = false(max_log, 1);  % logical: was the controller fed EKF state?
+    % IMU bias estimation logs.
+    log.true_gyro_bias  = nan(max_log, 3);   % live body-frame bias of primary IMU
+    log.true_accel_bias = nan(max_log, 3);
+    log.est_gyro_bias   = nan(max_log, 3);   % EKF state.gyro_b
+    log.est_accel_bias  = nan(max_log, 3);   % EKF state.accel_b
+end
 
 setappdata(fig, 'running', true);
 setappdata(fig, 'reset_request', false);
-setappdata(fig, 'add_request', false);
 setappdata(fig, 'clear_request', false);
 setappdata(fig, 'pop_request', false);
 setappdata(fig, 'set_home_request', false);
 setappdata(fig, 'autotune_request', false);
+setappdata(fig, 'map_add_request', []);         % [N E D] from a Mission-map click
+setappdata(fig, 'alt_edit_request', []);        % [row alt_m] from the Mission table
+setappdata(fig, 'load_plan_request', []);       % struct(waypoints,lat0,lon0) from a .plan
+setappdata(fig, 'save_plan_request', false);    % Save-.plan button
 waypoints = zeros(0, 3);                        % Nx3 [N E D]
 sticks = struct('left_x', 0, 'left_y', 0, 'right_x', 0, 'right_y', 0);
 
 k     = 0;
 t_sim = 0;
+vio_ui_tick = 0;       % throttles the (heavy) VIO image decode so joysticks stay snappy
 cesium_bridge  = [];   % lazily created when the Cesium toggle is first enabled
 imu_bridge     = [];   % lazily created with cesium_bridge; streams IMU to OpenVINS
 last_imu_pub_t = -inf; % sim-time of last published IMU sample (200 Hz decimation)
 imu_stream_failed = false; % latched on IMU publish failure to stop recreate churn
+
+% --- VIO comparison logging (Cesium-tab toggle) -----------------------
+vio_node       = [];      % ROS 2 node for the OpenVINS odom subscriber
+vio_sub        = [];      % subscriber to /ov_msckf/odomimu
+vio_sub_raw    = [];      % lazy: /down_cam/image_raw (only while VIO tab open)
+vio_sub_trk    = [];      % lazy: /ov_msckf/trackhist (only while VIO tab open)
+openvins_pid   = [];      % OpenVINS launch PID (auto-started with the VIO toggle)
+vio_align_R    = [];      % frozen SE3 rotation OpenVINS-global -> NED (map trail)
+vio_align_t    = [];      % frozen SE3 translation (map trail)
+vio_logging    = false;   % true while the VIO toggle is on
+prev_vio_on    = false;   % edge detection for the VIO toggle
+vio_idx        = 0;       % rows logged this VIO session
+vio_last_stamp = -inf;    % last logged VIO message sim-time stamp (dedup)
+vio_overflow_warned = false;  % warn-once when the VIO buffer fills
+vio_log = struct('t', nan(max_log, 1), 'vt', nan(max_log, 1), ...
+    'gt_pos',  nan(max_log, 3), 'gt_vel',  nan(max_log, 3), ...
+    'ekf_pos', nan(max_log, 3), 'ekf_vel', nan(max_log, 3), ...
+    'vio_pos', nan(max_log, 3), 'vio_vel', nan(max_log, 3));
+
+% Auto-launch rosbridge_server for the Unity/Cesium path. onCleanup guarantees
+% it is stopped on any exit (Stop, window close, or an error in the loop).
+rosbridge_pid = startRosbridge();
+cleanup_rosbridge = onCleanup(@() stopRosbridge(rosbridge_pid));
+
 while ishandle(fig) && getappdata(fig, 'running')
     frame_t0 = tic;
 
@@ -359,6 +362,16 @@ while ishandle(fig) && getappdata(fig, 'running')
         t_sim   = 0;
         last_imu_pub_t    = -inf;  % sim time restarts at 0; re-arm IMU decimation
         imu_stream_failed = false; % re-arm IMU bridge after a Reset
+        if vio_logging             % sim clock restarts -> VIO can't span Reset
+            vio_logging = false; set(vio_cb, 'Value', 0); prev_vio_on = false;
+            if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
+            vio_node = []; vio_sub = []; vio_sub_raw = []; vio_sub_trk = [];
+            stopOpenvins(openvins_pid); openvins_pid = [];
+            vio_align_R = []; vio_align_t = [];
+            clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
+            clearpoints(mission_map.vio_trail);
+            fprintf('VIO logging stopped by Reset (sim clock restarted).\n');
+        end
         log_idx = 0;
         fmm.setHome([0; 0; 0]);
         fmm.setMode(prev_mode, plant.state());
@@ -408,17 +421,44 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
-    % --- Add waypoint ---
-    if getappdata(fig, 'add_request')
-        nv = str2double(get(n_edit, 'String'));
-        ev = str2double(get(e_edit, 'String'));
-        dv = str2double(get(d_edit, 'String'));
-        if all(isfinite([nv ev dv]))
-            waypoints(end+1, :) = [nv ev dv]; %#ok<AGROW>
+    % --- Add waypoint (Mission-tab map click: [N E D]) ---
+    map_add = getappdata(fig, 'map_add_request');
+    if ~isempty(map_add)
+        waypoints(end+1, :) = map_add; %#ok<AGROW>
+        fmm.setMission(waypoints);
+        updateWaypointUI(mission_h, waypoints);
+        updateMissionMap(mission_map, waypoints);
+        setappdata(fig, 'map_add_request', []);
+    end
+
+    % --- Edit a waypoint altitude (Mission table: [row alt_m]) ---
+    alt_edit = getappdata(fig, 'alt_edit_request');
+    if ~isempty(alt_edit)
+        row = alt_edit(1);
+        if row >= 1 && row <= size(waypoints, 1) && isfinite(alt_edit(2))
+            waypoints(row, 3) = -alt_edit(2);   % D = -altitude (positive = up)
             fmm.setMission(waypoints);
-            updateWaypointUI(wp_listbox, mission_h, waypoints);
+            updateWaypointUI(mission_h, waypoints);
+            updateMissionMap(mission_map, waypoints);
         end
-        setappdata(fig, 'add_request', false);
+        setappdata(fig, 'alt_edit_request', []);
+    end
+
+    % --- Load a QGC .plan (re-anchors the map on the plan's home) ---
+    load_plan = getappdata(fig, 'load_plan_request');
+    if ~isempty(load_plan)
+        setMissionAnchor(mission_map, load_plan.lat0, load_plan.lon0);
+        waypoints = load_plan.waypoints;
+        if isempty(waypoints), fmm.clearMission(); else, fmm.setMission(waypoints); end
+        updateWaypointUI(mission_h, waypoints);
+        updateMissionMap(mission_map, waypoints);
+        setappdata(fig, 'load_plan_request', []);
+    end
+
+    % --- Save the current waypoints as a QGC .plan ---
+    if getappdata(fig, 'save_plan_request')
+        savePlanDialog(mission_map, waypoints);
+        setappdata(fig, 'save_plan_request', false);
     end
 
     % --- Remove last waypoint ---
@@ -426,7 +466,8 @@ while ishandle(fig) && getappdata(fig, 'running')
         if ~isempty(waypoints)
             waypoints(end, :) = [];
             if isempty(waypoints), fmm.clearMission(); else, fmm.setMission(waypoints); end
-            updateWaypointUI(wp_listbox, mission_h, waypoints);
+            updateWaypointUI(mission_h, waypoints);
+            updateMissionMap(mission_map, waypoints);
         end
         setappdata(fig, 'pop_request', false);
     end
@@ -435,12 +476,15 @@ while ishandle(fig) && getappdata(fig, 'running')
     if getappdata(fig, 'clear_request')
         waypoints = zeros(0, 3);
         fmm.clearMission();
-        updateWaypointUI(wp_listbox, mission_h, waypoints);
+        updateWaypointUI(mission_h, waypoints);
+        updateMissionMap(mission_map, waypoints);
         setappdata(fig, 'clear_request', false);
     end
 
-    % --- Mode change detection (dropdown) ---
-    new_mode = mode_strings{get(mode_dd, 'Value')};
+    % --- Mode change detection (big mode buttons on the Mission tab) ---
+    sel_mode_btn = get(mode_bg, 'SelectedObject');
+    if isempty(sel_mode_btn), new_mode = prev_mode;
+    else,                     new_mode = get(sel_mode_btn, 'Tag'); end
     if ~strcmp(new_mode, prev_mode)
         fmm.setMode(new_mode, plant.state());
         % Takeoff pins home to the takeoff point so RTL returns here.
@@ -455,11 +499,13 @@ while ishandle(fig) && getappdata(fig, 'running')
         prev_mode = new_mode;
     end
 
-    % --- Read sticks (each frame) ---
-    sticks.left_x  = get(left_h,  'XData');
-    sticks.left_y  = get(left_h,  'YData');
-    sticks.right_x = get(right_h, 'XData');
-    sticks.right_y = get(right_h, 'YData');
+    % --- Read sticks (each frame; guard if the control window was closed) ---
+    if ishandle(left_h) && ishandle(right_h)
+        sticks.left_x  = get(left_h,  'XData');
+        sticks.left_y  = get(left_h,  'YData');
+        sticks.right_x = get(right_h, 'XData');
+        sticks.right_y = get(right_h, 'YData');
+    end
 
     % Wind parameters are set directly by the Wind tab callbacks.
 
@@ -511,10 +557,9 @@ while ishandle(fig) && getappdata(fig, 'running')
         if mod(k, n_pos) == 0
             cmd = fmm.update(s, sticks, dt_pos);
             % Mode may have auto-transitioned (Takeoff -> Hold). Reflect in
-            % dropdown and reset lead state across the discontinuity.
+            % the mode buttons and reset lead state across the discontinuity.
             if ~strcmp(cmd.mode, prev_mode)
-                idx = find(strcmp(mode_strings, cmd.mode), 1);
-                if ~isempty(idx), set(mode_dd, 'Value', idx); end
+                setModeButton(mission_map, cmd.mode);
                 prev_mode = cmd.mode;
                 pos_lead.reset();
                 vel_lead.reset();
@@ -694,6 +739,141 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
+    % --- VIO logging + comparison (Cesium-tab toggle) ---------------------
+    % On enable, subscribe to /ov_msckf/odomimu and from this frame on record
+    % ground truth, EKF and VIO (OpenVINS global frame) every frame. On
+    % disable (or Stop, in teardown) plot GT vs EKF vs VIO. "Start from the
+    % latest ground-truth point" = logging begins now and the VIO trajectory
+    % is rigidly aligned to GT over the logged window at plot time.
+    vio_on = ishandle(vio_cb) && get(vio_cb, 'Value') == 1;
+    if vio_on && ~prev_vio_on                 % rising edge: start a session
+        if isempty(openvins_pid)              % write params, then launch OpenVINS
+            writeVioParams(vio_ui);           % apply the VIO-tab params to the config
+            openvins_pid = startOpenvins();
+        end
+        if isempty(vio_node)                  % gate on node (sub may be stale)
+            try
+                vio_node = ros2node('/px4_matlab_vio', 0);
+                vio_sub  = ros2subscriber(vio_node, '/ov_msckf/odomimu', ...
+                    'nav_msgs/Odometry', @(m) onVioMessage(fig, m));
+                % Image subscribers are created lazily below, only while the VIO
+                % tab is open -- deserializing ~60 frames/s on MATLAB's single
+                % thread is what froze the GUI when flying on other tabs.
+            catch ME
+                warning('VIO subscriber failed to start (%s). Disabling.', ME.message);
+                if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
+                vio_node = []; vio_sub = []; vio_idx = 0; set(vio_cb, 'Value', 0);
+            end
+        end
+        if ~isempty(vio_sub)
+            setappdata(fig, 'vio_latest', []);   % drop any stale message
+            vio_idx = 0; vio_last_stamp = -inf; vio_overflow_warned = false;
+            vio_logging = true;
+            vio_align_R = []; vio_align_t = [];  % fresh map-trail alignment
+            clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
+            clearpoints(mission_map.vio_trail);
+            fprintf('VIO logging started at t=%.2f s (anchored at ground truth).\n', t_sim);
+        end
+    elseif ~vio_on && prev_vio_on             % falling edge: stop, plot, free
+        vio_logging = false;
+        plotVioComparison(vio_log, vio_idx);
+        if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
+        vio_node = []; vio_sub = [];          % so re-enable rebuilds cleanly
+        vio_sub_raw = []; vio_sub_trk = [];   % image subs dropped with the node
+        stopOpenvins(openvins_pid); openvins_pid = [];
+    end
+    prev_vio_on = vio_on;
+
+    % --- lazy image subscriptions: only while the VIO tab is open ----------
+    % Deserializing two image streams (~60 msg/s of 512x512) on the main thread
+    % is what froze the GUI. Subscribe only when you are looking at them.
+    want_vio_imgs = vio_logging && ~isempty(vio_node) && isvalid(vio_node) && ...
+                    ishandle(tg) && tg.SelectedTab == tab_vio;
+    if want_vio_imgs && isempty(vio_sub_raw)
+        try
+            setappdata(fig, 'vio_img_raw', []); setappdata(fig, 'vio_img_trk', []);
+            vio_sub_raw = ros2subscriber(vio_node, '/down_cam/image_raw', ...
+                'sensor_msgs/Image', @(m) onVioImage(fig, 'vio_img_raw', m));
+            vio_sub_trk = ros2subscriber(vio_node, '/ov_msckf/trackhist', ...
+                'sensor_msgs/Image', @(m) onVioImage(fig, 'vio_img_trk', m));
+        catch
+            vio_sub_raw = []; vio_sub_trk = [];
+        end
+    elseif ~want_vio_imgs && ~isempty(vio_sub_raw)
+        try, delete(vio_sub_raw); catch, end %#ok<NOCOM>
+        try, delete(vio_sub_trk); catch, end %#ok<NOCOM>
+        vio_sub_raw = []; vio_sub_trk = [];
+    end
+
+    if vio_logging && ~isempty(vio_sub)
+        vmsg = getappdata(fig, 'vio_latest');
+        if ~isempty(vmsg)
+            vstamp = double(vmsg.header.stamp.sec) + ...
+                     double(vmsg.header.stamp.nanosec) * 1e-9;
+            vp = [vmsg.pose.pose.position.x, vmsg.pose.pose.position.y, ...
+                  vmsg.pose.pose.position.z];
+            vv = [vmsg.twist.twist.linear.x, vmsg.twist.twist.linear.y, ...
+                  vmsg.twist.twist.linear.z];
+            if vstamp > vio_last_stamp && all(isfinite([vstamp, vp, vv]))
+                if vio_idx >= max_log
+                    if ~vio_overflow_warned
+                        warning('VIO log buffer full (%d samples); dropping the rest.', max_log);
+                        vio_overflow_warned = true;
+                    end
+                else
+                    % GT/EKF sampled now (t_sim); VIO carries its own sim-time
+                    % stamp (vt) -- aligned by interpolation at plot time.
+                    gtn  = plant.state();
+                    estn = est_bus.stateOut();
+                    vio_idx = vio_idx + 1;
+                    vio_log.t(vio_idx)          = t_sim;
+                    vio_log.vt(vio_idx)         = vstamp;
+                    vio_log.gt_pos(vio_idx, :)  = gtn.position_ned';
+                    vio_log.gt_vel(vio_idx, :)  = gtn.velocity_ned';
+                    vio_log.ekf_pos(vio_idx, :) = estn.position_ned';
+                    vio_log.ekf_vel(vio_idx, :) = estn.velocity_ned';
+                    vio_log.vio_pos(vio_idx, :) = vp;
+                    vio_log.vio_vel(vio_idx, :) = vv;
+                    vio_last_stamp = vstamp;
+
+                    % --- live 2D map trails (Mission tab) ------------------
+                    % GT (white) + EKF (cyan) appended every sample; VIO (red)
+                    % once a frozen GT alignment exists -- so VIO divergence
+                    % shows as the red trail drifting off GT.
+                    addpoints(mission_map.gt_trail,  gtn.position_ned(2),  gtn.position_ned(1));
+                    addpoints(mission_map.ekf_trail, estn.position_ned(2), estn.position_ned(1));
+                    if ~isempty(vio_align_R)
+                        a = vio_align_R * vp.' + vio_align_t;
+                        addpoints(mission_map.vio_trail, a(2), a(1));
+                    elseif vio_idx >= 80 && mod(vio_idx, 10) == 0
+                        gn = vio_log.gt_pos(1:vio_idx, 1:2);
+                        if max(max(gn, [], 1) - min(gn, [], 1)) > 2   % moved enough to fix yaw
+                            [vio_align_R, vio_align_t] = umeyama_align( ...
+                                vio_log.vio_pos(1:vio_idx, :).', vio_log.gt_pos(1:vio_idx, :).');
+                            al = (vio_align_R * vio_log.vio_pos(1:vio_idx, :).' + vio_align_t).';
+                            clearpoints(mission_map.vio_trail);
+                            addpoints(mission_map.vio_trail, al(:, 2), al(:, 1));
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    % --- refresh the VIO tab (camera streams + live odom readout) ----------
+    % Decoding two 512x512 frames every loop iteration starves MATLAB's single
+    % thread and makes the joysticks lag. So only do it when the VIO tab is
+    % actually visible, throttled to ~every 4th frame, flushing queued mouse
+    % events right after the heavy decode.
+    if vio_logging && ishandle(tg) && tg.SelectedTab == tab_vio
+        vio_ui_tick = vio_ui_tick + 1;
+        if mod(vio_ui_tick, 4) == 0
+            updateVioImages(vio_ui, fig);
+            updateVioReadout(vio_ui, getappdata(fig, 'vio_latest'), vio_idx, ~isempty(vio_align_R));
+            drawnow limitrate;   % process queued joystick/mouse events after decode
+        end
+    end
+
     % Wind arrow: anchored ~3 m above the drone in plot frame, direction
     % is total NED wind mapped to (E, N, U). Length 0.4 m per m/s.
     w_ned   = wind.last_wind_ned;
@@ -719,7 +899,7 @@ while ishandle(fig) && getappdata(fig, 'running')
 
     t_sim = t_sim + dt_frame;
 
-    if log_idx < max_log
+    if LOG_ENABLE && log_idx < max_log
         log_idx = log_idx + 1;
         log.t(log_idx)          = t_sim;
         log.pos(log_idx, :)     = s.position_ned';
@@ -735,7 +915,7 @@ while ishandle(fig) && getappdata(fig, 'running')
         if isempty(idx_mode), idx_mode = NaN; end
         log.mode_idx(log_idx)   = idx_mode;
 
-        % Sensor + estimator snapshot (always logged, regardless of toggle).
+        % Sensor + estimator snapshot (logged independent of the EKF-feed toggle).
         imu_pub = est_bus.sensors.vehicleImu();
         if ~isempty(imu_pub)
             log.imu_gyro(log_idx, :)  = imu_pub.gyro_b';
@@ -801,9 +981,23 @@ if ~isempty(imu_bridge) && isvalid(imu_bridge)
     delete(imu_bridge);
 end
 
+% VIO comparison: if logging was still on at Stop, plot before tearing down.
+if vio_logging
+    plotVioComparison(vio_log, vio_idx);
+end
+if ~isempty(vio_node) && isvalid(vio_node)
+    delete(vio_node);     % also drops vio_sub
+end
+% Stop OpenVINS if the toggle was still on at Stop (no-op if we did not start it).
+stopOpenvins(openvins_pid);
+% rosbridge_server is stopped by the onCleanup guard registered at start.
+
 % Close the detached 3D window if it was popped out (found by tag so it
 % is cleaned up even if the main window was closed first).
 delete(findobj(0, 'Type', 'figure', 'Tag', 'px4_float_viz'));
+if exist('ctrl_fig', 'var') && ishandle(ctrl_fig)
+    delete(ctrl_fig);            % close the floating manual-control window
+end
 if ishandle(fig)
     delete(fig);
 end
@@ -812,7 +1006,7 @@ end
 % Push the log to base workspace so plot_sim() can pick it up on demand.
 % No automatic plotting here.
 % =====================================================================
-if log_idx > 1
+if LOG_ENABLE && log_idx > 1
     fields = {'t', 'pos', 'pos_sp', 'vel', 'vel_sp', 'rpy', 'rpy_sp', ...
               'omega', 'rate_sp', 'motor', 'mode_idx', ...
               'imu_gyro', 'imu_accel', 'baro_alt', 'mag_b', ...
@@ -913,22 +1107,14 @@ end
 
 
 % =========================================================================
-% Update the waypoint listbox + 3D-view polyline from the current Nx3
-% waypoint list (NED metres).
+% Update the 3D-view mission polyline from the current Nx3 waypoint list
+% (NED metres). The waypoint *list* now lives in the Mission-tab table.
 % =========================================================================
-function updateWaypointUI(listbox, mission_h, wps)
+function updateWaypointUI(mission_h, wps)
 if isempty(wps)
-    set(listbox, 'String', {}, 'Value', 1);
     set(mission_h, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
     return;
 end
-n = size(wps, 1);
-strs = cell(n, 1);
-for i = 1:n
-    strs{i} = sprintf('W%-2d  N=%+7.2f  E=%+7.2f  D=%+7.2f', ...
-                      i, wps(i, 1), wps(i, 2), wps(i, 3));
-end
-set(listbox, 'String', strs, 'Value', max(1, min(n, get(listbox, 'Value'))));
 % 3D view: plot in (East, North, Up).
 set(mission_h, 'XData', wps(:, 2), 'YData', wps(:, 1), 'ZData', -wps(:, 3));
 end
@@ -1216,18 +1402,793 @@ end
 % =========================================================================
 function cesium_cb = buildCesiumTab(parent)
 cesium_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.05 0.88 0.9 0.06], 'BackgroundColor', 'w', 'Value', 0, ...
+    'Position', [0.05 0.91 0.9 0.05], 'BackgroundColor', 'w', 'Value', 1, ...
     'FontWeight', 'bold', 'String', 'Stream pose to Cesium/Unity (ROS 2)');
 uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.05 0.60 0.9 0.26], 'BackgroundColor', 'w', ...
+    'Position', [0.05 0.56 0.9 0.30], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'left', 'FontSize', 9, ...
-    'String', sprintf(['Publishes the vehicle pose (ground truth, same as the 3D ' ...
-        'view) as geometry_msgs/PoseArray on /world/default/pose/info at the ' ...
-        '50 Hz frame rate.\n\nUnity side needs only:\n' ...
-        '    ros2 launch rosbridge_server rosbridge_websocket_launch.xml\n' ...
-        'then play the Quba scene. PX4 SITL, the Micro-XRCE agent and Gazebo ' ...
-        'are NOT required. MATLAB and rosbridge must share ROS_DOMAIN_ID ' ...
-        '(default 0).']));
+    'String', sprintf(['Pose stream: ground-truth pose as geometry_msgs/' ...
+        'PoseArray on /world/default/pose/info (50 Hz). rosbridge_server is ' ...
+        'auto-launched when run_interactive starts and stopped on Stop ' ...
+        '(log: /tmp/px4_rosbridge.log).\n\n' ...
+        'VIO logging + control moved to the VIO tab.']));
+end
+
+
+% =========================================================================
+% VIO tab: enable checkbox, editable OpenVINS parameters (written to the
+% config and applied when VIO is enabled -> OpenVINS relaunches), a live odom
+% readout (/ov_msckf/odomimu), and the two image streams side by side
+% (/down_cam/image_raw + /ov_msckf/trackhist). Returns a struct of handles;
+% the sim loop drives everything off vio_ui.vio_cb.
+% =========================================================================
+function vio_ui = buildVioTab(parent, fig)
+[estCfg, camCfg] = vioCfgPaths();
+
+vio_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.02 0.945 0.6 0.04], 'BackgroundColor', 'w', 'Value', 0, ...
+    'FontWeight', 'bold', 'FontSize', 11, ...
+    'String', 'Enable VIO  (auto-launch OpenVINS + log + plot)');
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.02 0.90 0.96 0.04], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontSize', 8, ...
+    'String', ['Params are written to the OpenVINS config and applied on Enable ' ...
+        '(OpenVINS relaunches). Tip: fly up to ~30 m, THEN enable -- a wider ground ' ...
+        'footprint = many more features (this is why Gazebo worked). Lower ' ...
+        'fast_threshold and CLAHE find more features on smooth terrain.']);
+
+% --- editable parameters (left panel) -------------------------------------
+pan = uipanel(parent, 'Units', 'normalized', 'Position', [0.02 0.30 0.40 0.585], ...
+    'Title', 'OpenVINS parameters (applied on Enable)', 'BackgroundColor', 'w', ...
+    'FontWeight', 'bold');
+ed = struct();
+ed.num_pts = vioParamRow(pan, 0.88, 'num features (num\_pts)',  readYamlScalar(estCfg, 'num_pts'));
+ed.fast    = vioParamRow(pan, 0.795,'fast\_threshold (lower=more)', readYamlScalar(estCfg, 'fast_threshold'));
+ed.grid_x  = vioParamRow(pan, 0.71, 'grid\_x',        readYamlScalar(estCfg, 'grid_x'));
+ed.grid_y  = vioParamRow(pan, 0.625,'grid\_y',        readYamlScalar(estCfg, 'grid_y'));
+ed.min_px  = vioParamRow(pan, 0.54, 'min\_px\_dist',  readYamlScalar(estCfg, 'min_px_dist'));
+intr = readYamlArray(camCfg, 'intrinsics');   % [fx fy cx cy]
+if numel(intr) < 4, intr = [394.2 394.2 256 256]; end
+ed.fx = vioParamRow(pan, 0.455, 'fx',  num2str(intr(1)));
+ed.fy = vioParamRow(pan, 0.37,  'fy',  num2str(intr(2)));
+ed.cx = vioParamRow(pan, 0.285, 'cx',  num2str(intr(3)));
+ed.cy = vioParamRow(pan, 0.20,  'cy',  num2str(intr(4)));
+% init method + histogram as dropdowns
+uicontrol(pan, 'Style', 'text', 'Units', 'normalized', 'Position', [0.04 0.105 0.44 0.055], ...
+    'BackgroundColor', 'w', 'HorizontalAlignment', 'left', 'FontSize', 9, 'String', 'init method');
+initDyn = strcmpi(strtrim(readYamlScalar(estCfg, 'init_dyn_use')), 'true');
+ed.init = uicontrol(pan, 'Style', 'popupmenu', 'Units', 'normalized', ...
+    'Position', [0.50 0.11 0.44 0.06], 'String', {'dynamic', 'static'}, ...
+    'Value', 1 + ~initDyn, 'BackgroundColor', 'w');
+uicontrol(pan, 'Style', 'text', 'Units', 'normalized', 'Position', [0.04 0.02 0.44 0.055], ...
+    'BackgroundColor', 'w', 'HorizontalAlignment', 'left', 'FontSize', 9, 'String', 'histogram');
+hm = upper(strrep(strtrim(readYamlScalar(estCfg, 'histogram_method')), '"', ''));
+hopts = {'NONE', 'HISTOGRAM', 'CLAHE'}; hidx = find(strcmp(hopts, hm), 1);
+if isempty(hidx), hidx = 2; end
+ed.hist = uicontrol(pan, 'Style', 'popupmenu', 'Units', 'normalized', ...
+    'Position', [0.50 0.025 0.44 0.06], 'String', hopts, 'Value', hidx, 'BackgroundColor', 'w');
+
+% --- live odom readout (left, below the panel) ----------------------------
+readout = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.02 0.04 0.40 0.24], 'BackgroundColor', [0.97 0.97 0.97], ...
+    'HorizontalAlignment', 'left', 'FontName', 'Courier New', 'FontSize', 9, ...
+    'String', 'VIO odom: (enable VIO to start)');
+
+% --- two image streams side by side (right) -------------------------------
+axRaw = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.45 0.34 0.26 0.50]);
+imgRaw = image(axRaw, zeros(2, 2, 3, 'uint8')); axis(axRaw, 'image', 'off');
+title(axRaw, '/down\_cam/image\_raw', 'FontSize', 9);
+axTrk = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.72 0.34 0.26 0.50]);
+imgTrk = image(axTrk, zeros(2, 2, 3, 'uint8')); axis(axTrk, 'image', 'off');
+title(axTrk, '/ov\_msckf/trackhist (features)', 'FontSize', 9);
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.45 0.04 0.53 0.26], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontSize', 8, ...
+    'String', ['Left: raw camera Unity sends OpenVINS. Right: OpenVINS'' tracked ' ...
+        'features. If the right view has few/no points, the camera is feature-' ...
+        'starved (fly higher, lower fast_threshold, or CLAHE).']);
+
+vio_ui = struct('vio_cb', vio_cb, 'ed', ed, 'readout', readout, ...
+    'axRaw', axRaw, 'imgRaw', imgRaw, 'axTrk', axTrk, 'imgTrk', imgTrk);
+end
+
+% One "label + edit" row inside the VIO parameter panel; returns the edit handle.
+function h = vioParamRow(pan, y, lbl, val)
+uicontrol(pan, 'Style', 'text', 'Units', 'normalized', 'Position', [0.04 y 0.44 0.055], ...
+    'BackgroundColor', 'w', 'HorizontalAlignment', 'left', 'FontSize', 9, 'String', lbl);
+h = uicontrol(pan, 'Style', 'edit', 'Units', 'normalized', 'Position', [0.50 y+0.005 0.44 0.06], ...
+    'BackgroundColor', [0.99 0.99 0.97], 'String', val);
+end
+
+% Absolute paths of the two OpenVINS config files the launch reads.
+function [estCfg, camCfg] = vioCfgPaths()
+base = '/home/teymur/ytu_thesis/simulation/open_vins/config/matlab_unity';
+estCfg = fullfile(base, 'estimator_config.yaml');
+camCfg = fullfile(base, 'kalibr_imucam_chain.yaml');
+end
+
+% Read a scalar YAML value as a char (e.g. '200', 'true', '"CLAHE"'); '' if absent.
+function v = readYamlScalar(file, key)
+v = '';
+if ~isfile(file), return; end
+lines = readlines(file);
+for i = 1:numel(lines)
+    tok = regexp(lines(i), "^\s*" + key + ":\s*(\S+)", 'tokens', 'once');
+    if ~isempty(tok), v = char(tok(1)); return; end
+end
+end
+
+% Read a YAML array "key: [a, b, c]" as a numeric row vector; [] if absent.
+function v = readYamlArray(file, key)
+v = [];
+if ~isfile(file), return; end
+lines = readlines(file);
+for i = 1:numel(lines)
+    tok = regexp(lines(i), "^\s*" + key + ":\s*\[([^\]]*)\]", 'tokens', 'once');
+    if ~isempty(tok), v = str2double(strsplit(char(tok(1)), ',')); return; end
+end
+end
+
+% Replace the value of "key: VALUE  # comment" in-place, preserving the comment.
+% val may be numeric or char. Only the first matching line is changed.
+function setYamlScalar(file, key, val)
+if isnumeric(val), valstr = num2str(val); else, valstr = char(val); end
+lines = readlines(file);
+for i = 1:numel(lines)
+    if ~isempty(regexp(lines(i), "^\s*" + key + ":(\s|$)", 'once'))
+        lines(i) = regexprep(lines(i), "^(\s*" + key + ":\s*)\S+", "$1" + valstr, 'once');
+        writelines(lines, file);
+        return;
+    end
+end
+end
+
+% Replace "key: [ ... ]" with the given numeric vector, preserving the comment.
+function setYamlArray(file, key, vals)
+s = "[" + strjoin(string(vals), ", ") + "]";
+lines = readlines(file);
+for i = 1:numel(lines)
+    if ~isempty(regexp(lines(i), "^\s*" + key + ":\s*\[", 'once'))
+        lines(i) = regexprep(lines(i), "(^\s*" + key + ":\s*)\[[^\]]*\]", "$1" + s, 'once');
+        writelines(lines, file);
+        return;
+    end
+end
+end
+
+% Write the VIO-tab parameter fields into the OpenVINS config files. Called on
+% VIO enable, just before OpenVINS launches, so the values take effect.
+function writeVioParams(vio_ui)
+[estCfg, camCfg] = vioCfgPaths();
+gn = @(h, d) vioFieldNum(h, d);
+setYamlScalar(estCfg, 'num_pts',        gn(vio_ui.ed.num_pts, 200));
+setYamlScalar(estCfg, 'fast_threshold', gn(vio_ui.ed.fast,    15));
+setYamlScalar(estCfg, 'grid_x',         gn(vio_ui.ed.grid_x,  16));
+setYamlScalar(estCfg, 'grid_y',         gn(vio_ui.ed.grid_y,  16));
+setYamlScalar(estCfg, 'min_px_dist',    gn(vio_ui.ed.min_px,  12));
+initStrs = get(vio_ui.ed.init, 'String');
+isDyn = strcmp(initStrs{get(vio_ui.ed.init, 'Value')}, 'dynamic');
+setYamlScalar(estCfg, 'init_dyn_use', char("" + string(isDyn)));   % 'true'/'false'
+histStrs = get(vio_ui.ed.hist, 'String');
+setYamlScalar(estCfg, 'histogram_method', ['"' histStrs{get(vio_ui.ed.hist, 'Value')} '"']);
+setYamlArray(camCfg, 'intrinsics', [gn(vio_ui.ed.fx, 394.2), gn(vio_ui.ed.fy, 394.2), ...
+    gn(vio_ui.ed.cx, 256), gn(vio_ui.ed.cy, 256)]);
+fprintf('VIO params written to OpenVINS config.\n');
+end
+
+function v = vioFieldNum(h, def)
+v = str2double(get(h, 'String'));
+if ~isfinite(v), v = def; end
+end
+
+% Guarded image-subscriber callback: stash latest image, skip if fig is gone.
+function onVioImage(fig, key, m)
+if ishandle(fig), setappdata(fig, key, m); end
+end
+
+% sensor_msgs/Image struct -> HxWx3 uint8 (mono replicated to RGB).
+function im = decodeRosImage(msg)
+if isempty(msg) || ~isfield(msg, 'width') || double(msg.width) == 0
+    im = zeros(2, 2, 3, 'uint8'); return;
+end
+try
+    im = rosReadImage(msg);
+    if size(im, 3) == 1, im = repmat(im, [1 1 3]); end
+catch
+    w = double(msg.width); h = double(msg.height); d = uint8(msg.data(:));
+    g = reshape(d(1:min(w*h, numel(d))), w, []).';
+    im = repmat(g, [1 1 3]);
+end
+end
+
+% Refresh the two image axes from the latest cached frames. Decodes only when
+% a NEW frame arrived (loop runs faster than the camera), keyed on the stamp.
+function updateVioImages(vio_ui, fig)
+refreshVioImage(fig, 'vio_img_raw', 'vio_img_raw_st', vio_ui.imgRaw, vio_ui.axRaw);
+refreshVioImage(fig, 'vio_img_trk', 'vio_img_trk_st', vio_ui.imgTrk, vio_ui.axTrk);
+end
+
+function refreshVioImage(fig, key, stKey, imgH, axH)
+m = getappdata(fig, key);
+if isempty(m) || ~isfield(m, 'header'), return; end
+st = double(m.header.stamp.sec) + double(m.header.stamp.nanosec) * 1e-9;
+if isequal(st, getappdata(fig, stKey)), return; end   % unchanged -> skip decode
+im = decodeRosImage(m);
+set(imgH, 'CData', im);
+set(axH, 'XLim', [0.5, size(im, 2) + 0.5], 'YLim', [0.5, size(im, 1) + 0.5]);
+setappdata(fig, stKey, st);
+end
+
+% Refresh the odom readout from the latest /ov_msckf/odomimu message.
+function updateVioReadout(vio_ui, vmsg, n, aligned)
+if isempty(vmsg)
+    set(vio_ui.readout, 'String', sprintf(['VIO odom (/ov_msckf/odomimu)\n' ...
+        'waiting for OpenVINS to publish...\nsamples logged: %d'], n));
+    return;
+end
+p = [vmsg.pose.pose.position.x, vmsg.pose.pose.position.y, vmsg.pose.pose.position.z];
+v = [vmsg.twist.twist.linear.x, vmsg.twist.twist.linear.y, vmsg.twist.twist.linear.z];
+if aligned, astr = 'locked'; else, astr = 'pending motion'; end
+set(vio_ui.readout, 'String', sprintf(['VIO odom (/ov_msckf/odomimu)\n' ...
+    'pos[global] x=%+8.2f\n            y=%+8.2f\n            z=%+8.2f m\n' ...
+    'speed |v| = %6.2f m/s\n' ...
+    'samples logged: %d\n' ...
+    'map-trail align: %s'], p(1), p(2), p(3), norm(v), n, astr));
+end
+
+
+% =========================================================================
+% rosbridge_server lifecycle. Auto-launched on run_interactive start (for the
+% Unity/Cesium WebSocket path) and stopped on Stop. Returns the launch PID, or
+% [] if it was already running / could not be started (so we never kill a
+% rosbridge we did not start). MATLAB's LD_LIBRARY_PATH is stripped so the
+% ros2 CLI (python) does not load MATLAB's shared libs.
+% =========================================================================
+function pid = startRosbridge()
+pid = [];
+if ~isunix
+    warning('rosbridge auto-launch is wired for Linux only; start it manually.');
+    return;
+end
+[~, running] = system('pgrep -f rosbridge_websocket');
+if ~isempty(strtrim(running))
+    fprintf('rosbridge_server already running; leaving it as-is.\n');
+    return;   % pid stays [] -> stopRosbridge() will not touch it
+end
+% `exec` makes the backgrounded subshell BECOME ros2 launch, so $! is the
+% ros2-launch PID (not a throwaway subshell) and SIGINT later reaches it.
+cmd = ['bash -lc ''unset LD_LIBRARY_PATH; ' ...
+       'source /opt/ros/humble/setup.bash && ' ...
+       'exec ros2 launch rosbridge_server rosbridge_websocket_launch.xml ' ...
+       '>/tmp/px4_rosbridge.log 2>&1 & echo $!'''];
+[st, out] = system(cmd);
+pidnum = str2double(strtrim(out));
+if st == 0 && isfinite(pidnum) && pidnum > 0
+    pid = pidnum;
+    fprintf('Started rosbridge_server (pid %d). Log: /tmp/px4_rosbridge.log\n', pid);
+else
+    warning(['Could not auto-launch rosbridge_server (see ' ...
+             '/tmp/px4_rosbridge.log). Start it manually if you need Unity.']);
+end
+end
+
+function stopRosbridge(pid)
+if isempty(pid) || ~isfinite(pid) || pid <= 0, return; end
+% Only SIGINT if the PID is STILL a rosbridge/ros2-launch process (guards
+% against PID reuse). ros2 launch then shuts its child nodes down gracefully.
+cmd = sprintf(['ps -p %d -o args= 2>/dev/null | grep -q rosbridge ' ...
+               '&& kill -INT %d 2>/dev/null'], pid, pid);
+[st, ~] = system(cmd);
+if st == 0
+    fprintf('Stopped rosbridge_server (pid %d).\n', pid);
+end
+end
+
+
+% =========================================================================
+% OpenVINS lifecycle. Auto-launched when the VIO toggle is ticked (sources
+% ROS 2 + the two OpenVINS overlays, then ros2 launch the matlab_unity
+% pipeline) and SIGINT'd when it is unticked / on Stop. Clean-slate: kills any
+% prior OpenVINS pipeline first -- a stray run_subscribe_msckf (e.g. an
+% ov_msckf launched WITHOUT its image bridge) otherwise silently blocks the
+% launch and starves the camera. Needs the IMU bridge (Cesium toggle) + Unity
+% camera up, and motion + features to initialise before /ov_msckf/odomimu flows.
+% =========================================================================
+function pid = startOpenvins()
+pid = [];
+if ~isunix
+    warning('OpenVINS auto-launch is wired for Linux only; launch it manually.');
+    return;
+end
+% clean slate: drop any prior pipeline (strays block the relaunch + image bridge)
+system(['pkill -KILL -f run_subscribe_msckf 2>/dev/null; ' ...
+        'pkill -KILL -f unity_image_bridge 2>/dev/null; ' ...
+        'pkill -KILL -f "ros2 launch openvins" 2>/dev/null; true']);
+ws1 = '/home/teymur/ytu_thesis/simulation/open_vins/install/setup.bash';
+ws2 = '/home/teymur/ytu_thesis/simulation/openvins_ws/install/setup.bash';
+cmd = ['bash -lc ''unset LD_LIBRARY_PATH; ' ...
+       'source /opt/ros/humble/setup.bash && source ' ws1 ' && source ' ws2 ' && ' ...
+       'exec ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py ' ...
+       '>/tmp/px4_openvins.log 2>&1 & echo $!'''];
+[st, out] = system(cmd);
+pidnum = str2double(strtrim(out));
+if st == 0 && isfinite(pidnum) && pidnum > 0
+    pid = pidnum;
+    fprintf('Started OpenVINS (pid %d). Log: /tmp/px4_openvins.log\n', pid);
+    fprintf(['  needs Unity Quba playing (camera) + enough features: fly ~30 m,\n' ...
+             '  reload Unity for 30 fps, lower fast_threshold / use CLAHE on the VIO tab.\n']);
+else
+    warning('Could not auto-launch OpenVINS (see /tmp/px4_openvins.log).');
+end
+end
+
+function stopOpenvins(pid)
+if isempty(pid) || ~isfinite(pid) || pid <= 0, return; end
+% Only SIGINT if the PID is STILL the OpenVINS launch (guards PID reuse).
+cmd = sprintf(['ps -p %d -o args= 2>/dev/null | grep -qE "openvins|ros2 launch" ' ...
+               '&& kill -INT %d 2>/dev/null'], pid, pid);
+[st, ~] = system(cmd);
+if st == 0
+    fprintf('Stopped OpenVINS (pid %d).\n', pid);
+end
+end
+
+% Subscriber callback: stash the latest odom, guarding a possibly-deleted fig.
+function onVioMessage(fig, m)
+if ishandle(fig)
+    setappdata(fig, 'vio_latest', m);
+end
+end
+
+% Reuse (or create) a tagged figure so repeated VIO sessions don't pile up
+% windows.
+function f = namedFigure(tag, name)
+f = findobj(0, 'Type', 'figure', 'Tag', tag);
+if isempty(f)
+    f = figure('Name', name, 'Tag', tag);
+else
+    f = f(1); clf(f); set(f, 'Name', name); figure(f);
+end
+end
+
+
+% =========================================================================
+% Plot the live VIO session: ground truth vs EKF vs VIO. The VIO trajectory
+% (OpenVINS `global` frame, arbitrary yaw+origin) is rigidly SE3-aligned to
+% ground truth over the logged window (Umeyama / standard ATE), which anchors
+% it at the start ground-truth point. Velocity is compared as speed |v| (VIO
+% twist is body-frame). L is the vio_log struct, n the row count.
+% =========================================================================
+function plotVioComparison(L, n)
+if n < 10
+    fprintf('VIO comparison: only %d sample(s) logged; nothing to plot.\n', max(n, 0));
+    return;
+end
+t   = L.t(1:n);          vt   = L.vt(1:n);     % GT/EKF time, VIO message time
+gt  = L.gt_pos(1:n, :);  gtv  = L.gt_vel(1:n, :);
+ekf = L.ekf_pos(1:n, :); ekfv = L.ekf_vel(1:n, :);
+vio = L.vio_pos(1:n, :); viov = L.vio_vel(1:n, :);
+ok  = ~isnan(t) & ~isnan(vt) & all(~isnan(vio), 2) & ...
+      all(~isnan(gt), 2) & all(~isnan(ekf), 2);
+t = t(ok); vt = vt(ok); gt = gt(ok, :); gtv = gtv(ok, :);
+ekf = ekf(ok, :); ekfv = ekfv(ok, :); vio = vio(ok, :); viov = viov(ok, :);
+if size(vio, 1) < 10
+    fprintf(['VIO comparison: <10 valid VIO samples (OpenVINS not ' ...
+             'publishing /ov_msckf/odomimu?). Skipping plot.\n']);
+    return;
+end
+
+% GT/EKF were sampled at frame time t; the VIO sample carries its own (lagged)
+% sim-time vt. Interpolate GT/EKF onto vt so each VIO sample is compared to GT
+% at the SAME instant, then plot against vt.
+gt   = interp1(t, gt,   vt, 'linear', 'extrap');
+ekf  = interp1(t, ekf,  vt, 'linear', 'extrap');
+gtv  = interp1(t, gtv,  vt, 'linear', 'extrap');
+ekfv = interp1(t, ekfv, vt, 'linear', 'extrap');
+
+% SE3-align VIO -> ground truth (no scale; metric VIO).
+[R, tt, ate] = umeyama_align(vio.', gt.');
+vio_a = (R * vio.' + tt).';
+err_ekf = vecnorm(ekf - gt, 2, 2);
+err_vio = vecnorm(vio_a - gt, 2, 2);
+% speed |v| is rotation-invariant, so VIO body-frame velocity norm == NED speed.
+sp_gt = vecnorm(gtv, 2, 2); sp_ekf = vecnorm(ekfv, 2, 2); sp_vio = vecnorm(viov, 2, 2);
+rmse_ekf = sqrt(mean(err_ekf.^2));
+
+fprintf('\n=== VIO vs EKF vs ground truth (%d samples, %.1f s) ===\n', ...
+        size(vio, 1), vt(end) - vt(1));
+fprintf('EKF position RMSE: %.3f m  (mean %.3f, max %.3f)\n', ...
+        rmse_ekf, mean(err_ekf), max(err_ekf));
+fprintf('VIO position ATE : %.3f m  (mean %.3f, max %.3f) after SE3 align\n', ...
+        ate, mean(err_vio), max(err_vio));
+
+% Downsample for PLOTTING only (the metrics above use every sample). Rendering
+% 8 line plots of every sample across 3 figures is what freezes the GUI on long
+% flights; ~3000 points per line is visually identical and renders instantly.
+np = numel(vt); ds = max(1, ceil(np / 3000)); di = 1:ds:np;
+vt = vt(di); gt = gt(di, :); ekf = ekf(di, :); vio_a = vio_a(di, :);
+err_ekf = err_ekf(di); err_vio = err_vio(di);
+sp_gt = sp_gt(di); sp_ekf = sp_ekf(di); sp_vio = sp_vio(di);
+
+lbl = {'North', 'East', 'Down'};
+namedFigure('vio_cmp_pos', 'VIO/EKF/GT: position (NED)');
+for i = 1:3
+    subplot(3, 1, i); hold on; grid on;
+    plot(vt, gt(:, i),    'k',   'LineWidth', 1.3);
+    plot(vt, ekf(:, i),   'b',   'LineWidth', 1.0);
+    plot(vt, vio_a(:, i), 'r--', 'LineWidth', 1.2);
+    ylabel([lbl{i} ' [m]']);
+    if i == 1, legend('ground truth', 'EKF', 'VIO (aligned)', 'Location', 'best'); end
+end
+xlabel('sim time [s]');
+
+namedFigure('vio_cmp_err', 'VIO/EKF/GT: error + speed');
+subplot(2, 1, 1); hold on; grid on;
+plot(vt, err_ekf, 'b', 'LineWidth', 1.2);
+plot(vt, err_vio, 'r', 'LineWidth', 1.2);
+ylabel('position error vs GT [m]');
+legend('EKF', 'VIO', 'Location', 'best');
+title(sprintf('EKF RMSE %.3f m   |   VIO ATE %.3f m', rmse_ekf, ate));
+subplot(2, 1, 2); hold on; grid on;
+plot(vt, sp_gt,  'k',   'LineWidth', 1.3);
+plot(vt, sp_ekf, 'b',   'LineWidth', 1.0);
+plot(vt, sp_vio, 'r--', 'LineWidth', 1.2);
+ylabel('speed [m/s]'); xlabel('sim time [s]');
+legend('ground truth', 'EKF', 'VIO', 'Location', 'best');
+
+namedFigure('vio_cmp_traj', 'VIO/EKF/GT: trajectory (top-down)');
+hold on; grid on; axis equal;
+plot(gt(:, 2),    gt(:, 1),    'k',   'LineWidth', 1.3);
+plot(ekf(:, 2),   ekf(:, 1),   'b',   'LineWidth', 1.0);
+plot(vio_a(:, 2), vio_a(:, 1), 'r--', 'LineWidth', 1.2);
+xlabel('East [m]'); ylabel('North [m]'); title('Trajectory (top-down)');
+legend('ground truth', 'EKF', 'VIO', 'Location', 'best');
+end
+
+
+% =========================================================================
+% Mission tab: a north-up satellite map (700 m x 700 m) anchored at the
+% Cesium/Unity georeference origin (Quba.unity CesiumGeoreference: lat
+% 40.32214266903304, lon 49.59745, Baku) by default, re-anchored on the
+% home position when a QGC .plan is loaded. Click the map to drop a
+% waypoint at the clicked (East, North) using the altitude field (metres,
+% +up); markers are colour coded launch=green, end=red, mid=yellow, each
+% labelled with its lat/lon. Big buttons select flight mode; Save/Load
+% read+write QGroundControl .plan files. All waypoint edits flow through the
+% shared `waypoints` array (map_add_request / alt_edit_request /
+% load_plan_request, applied by the sim loop) so the map and 3D view stay in
+% sync. Waypoints are local NED offsets; the geodesy here places the basemap
+% and converts to/from lat/lon for labels and .plan I/O. The anchor (lat0,
+% lon0), half-extent, basemap image, and label handles live in appdata on
+% the axes (mm is a value struct).
+% =========================================================================
+function mm = buildMissionTab(parent, fig, modes)
+lat0 = 40.32214266903304;   % Cesium origin (Baku), verified from Quba.unity
+lon0 = 49.59745;
+HALF = 350;                 % half-extent -> 700 m x 700 m map
+
+% --- map axes (left), north-up local metres -------------------------------
+axm = axes('Parent', parent, 'Units', 'normalized', ...
+           'Position', [0.05 0.13 0.58 0.83]);
+hold(axm, 'on'); box(axm, 'on'); axis(axm, 'equal');
+set(axm, 'YDir', 'normal');                       % North up
+xlim(axm, [-HALF HALF]); ylim(axm, [-HALF HALF]);
+xlabel(axm, 'East (m)'); ylabel(axm, 'North (m)');
+% persistent state for re-anchoring / labels / save (mm is a value struct).
+setappdata(axm, 'lat0', lat0);  setappdata(axm, 'lon0', lon0);
+setappdata(axm, 'HALF', HALF);  setappdata(axm, 'wp_labels', gobjects(0));
+title(axm, sprintf('Mission map @ %.5f, %.5f — click to add a waypoint', ...
+                   lat0, lon0));
+
+addSatelliteBasemap(axm, lat0, lon0, HALF);       % best-effort imagery
+
+grid(axm, 'on');
+set(axm, 'Layer', 'top', 'GridColor', [1 1 1], 'GridAlpha', 0.3);
+plot(axm, 0, 0, '+', 'Color', 'k', 'MarkerSize', 12, 'LineWidth', 1.5, ...
+     'HitTest', 'off', 'PickableParts', 'none');   % origin / home
+
+% waypoint graphics (data filled by updateMissionMap); HitTest off so clicks
+% fall through to the axes ButtonDownFcn.
+hPath   = plot(axm, NaN, NaN, '-', 'Color', 'w', 'LineWidth', 1.2, ...
+               'HitTest', 'off', 'PickableParts', 'none');
+hMid    = plot(axm, NaN, NaN, 'o', 'MarkerSize', 9,  'LineWidth', 1.0, ...
+               'MarkerFaceColor', [1 0.85 0], 'MarkerEdgeColor', 'k', ...
+               'HitTest', 'off', 'PickableParts', 'none');
+hLaunch = plot(axm, NaN, NaN, 'o', 'MarkerSize', 11, 'LineWidth', 1.0, ...
+               'MarkerFaceColor', [0 0.8 0], 'MarkerEdgeColor', 'k', ...
+               'HitTest', 'off', 'PickableParts', 'none');
+hEnd    = plot(axm, NaN, NaN, 'o', 'MarkerSize', 11, 'LineWidth', 1.0, ...
+               'MarkerFaceColor', [0.9 0 0], 'MarkerEdgeColor', 'k', ...
+               'HitTest', 'off', 'PickableParts', 'none');
+
+% Live 2D flown-path trails (filled by the sim loop while VIO logging is on):
+% ground truth (white), EKF (cyan), VIO aligned to GT (red). animatedline is
+% incremental, so per-frame appends stay cheap.
+% MaximumNumPoints caps the trail so the Mission map does not slow down over a
+% long flight (the full path still goes to the comparison plot via vio_log).
+gtTrail  = animatedline(axm, 'Color', [1 1 1],     'LineWidth', 2.0, ...
+                        'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
+ekfTrail = animatedline(axm, 'Color', [0 1 1],     'LineWidth', 1.5, ...
+                        'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
+vioTrail = animatedline(axm, 'Color', [1 0.2 0.2], 'LineStyle', '--', ...
+                        'MaximumNumPoints', 6000, 'LineWidth', 1.5, ...
+                        'HitTest', 'off', 'PickableParts', 'none');
+text(axm, 0.02, 0.97, 'trails:  GT  EKF  VIO', 'Units', 'normalized', ...
+     'Color', 'k', 'FontSize', 8, 'FontWeight', 'bold', ...
+     'BackgroundColor', [1 1 1 0.6], 'VerticalAlignment', 'top', ...
+     'HitTest', 'off', 'PickableParts', 'none');
+
+% --- controls (right column) ----------------------------------------------
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.66 0.915 0.33 0.035], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontWeight', 'bold', ...
+    'String', 'Altitude for next waypoint (m, +up):');
+altEdit = uicontrol(parent, 'Style', 'edit', 'Units', 'normalized', ...
+    'Position', [0.66 0.88 0.12 0.035], 'String', '10', ...
+    'BackgroundColor', [0.99 0.99 0.97]);
+
+uicontrol(parent, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.66 0.83 0.16 0.042], 'String', 'Load .plan', ...
+    'FontWeight', 'bold', 'Callback', @(~,~) onLoadPlan(fig));
+uicontrol(parent, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.83 0.83 0.16 0.042], 'String', 'Save .plan', ...
+    'FontWeight', 'bold', 'Callback', @(~,~) setappdata(fig, 'save_plan_request', true));
+
+uicontrol(parent, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.66 0.782 0.16 0.042], 'String', 'Set Home', ...
+    'Callback', @(~,~) setappdata(fig, 'set_home_request', true));
+uicontrol(parent, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.66 0.734 0.16 0.042], 'String', 'Remove last', ...
+    'Callback', @(~,~) setappdata(fig, 'pop_request', true));
+uicontrol(parent, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.83 0.734 0.16 0.042], 'String', 'Clear all', ...
+    'Callback', @(~,~) setappdata(fig, 'clear_request', true));
+
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.66 0.692 0.33 0.035], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontSize', 8, ...
+    'String', 'Green=launch  yellow=mid  red=end.  Edit Alt to change height.');
+
+tbl = uitable('Parent', parent, 'Units', 'normalized', ...
+    'Position', [0.66 0.40 0.33 0.285], ...
+    'ColumnName', {'N (m)', 'E (m)', 'Alt (m)'}, ...
+    'ColumnEditable', [false false true], ...
+    'ColumnWidth', {70 70 70}, 'RowName', 'numbered', ...
+    'CellEditCallback', @(~, ev) onAltEdit(fig, ev));
+
+state_lbl = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.66 0.13 0.33 0.255], 'BackgroundColor', 'w', ...
+    'HorizontalAlignment', 'left', 'FontName', 'Courier New', ...
+    'FontSize', 9, 'String', '');
+
+% --- big flight-mode buttons (bottom strip) -------------------------------
+mode_bg = uibuttongroup('Parent', parent, 'Units', 'normalized', ...
+    'Position', [0.01 0.01 0.98 0.095], 'Title', 'Flight mode', ...
+    'BackgroundColor', 'w', 'FontWeight', 'bold');
+nM = numel(modes);
+bw = 0.97 / nM;
+for i = 1:nM
+    s = modes{i};
+    if strcmp(s, 'rtl'), disp_s = 'RTL'; else, disp_s = [upper(s(1)) s(2:end)]; end
+    uicontrol(mode_bg, 'Style', 'togglebutton', 'Units', 'normalized', ...
+        'Position', [0.015 + (i-1)*bw, 0.08, bw*0.95, 0.84], ...
+        'String', disp_s, 'Tag', s, 'FontWeight', 'bold', 'FontSize', 10);
+end
+posBtn = findobj(mode_bg, 'Tag', 'position');   % default = Position
+if ~isempty(posBtn), set(mode_bg, 'SelectedObject', posBtn(1)); end
+
+% click handler: axes children have HitTest off, so the axes gets the click.
+set(axm, 'ButtonDownFcn', @(src, ~) onMapClick(src, fig, altEdit, HALF));
+
+mm = struct('ax', axm, 'path', hPath, 'launch', hLaunch, 'mid', hMid, ...
+            'endp', hEnd, 'table', tbl, 'altEdit', altEdit, ...
+            'mode_bg', mode_bg, 'state_lbl', state_lbl, ...
+            'gt_trail', gtTrail, 'ekf_trail', ekfTrail, 'vio_trail', vioTrail);
+end
+
+% Lay Esri 'satellite' tiles under the local-metre axes (best-effort).
+function addSatelliteBasemap(axm, lat0, lon0, HALF)
+Re = 6378137; d = pi / 180;
+dLat = HALF / (Re * d);
+dLon = HALF / (Re * d * cosd(lat0));
+latlim = [lat0 - dLat, lat0 + dLat];
+lonlim = [lon0 - dLon, lon0 + dLon];
+try
+    [A, RA] = readBasemapImage('satellite', latlim, lonlim);
+    if isprop(RA, 'LatitudeLimits')           % geographic raster reference
+        latImg = RA.LatitudeLimits;
+        lonImg = RA.LongitudeLimits;
+    else                                      % map raster ref (Web Mercator)
+        lonImg = RA.XWorldLimits / (Re * d);
+        latImg = (2 * atan(exp(RA.YWorldLimits / Re)) - pi/2) / d;
+    end
+    Eimg = (lonImg - lon0) * d * Re * cosd(lat0);
+    Nimg = (latImg - lat0) * d * Re;
+    % A row 1 = northern edge -> map it to the larger N (top, YDir normal).
+    h = image(axm, 'XData', Eimg, 'YData', [Nimg(2) Nimg(1)], 'CData', A, ...
+              'HitTest', 'off', 'PickableParts', 'none');
+    uistack(h, 'bottom');                   % keep under markers/grid on reanchor
+    setappdata(axm, 'basemap_img', h);
+catch ME
+    set(axm, 'Color', [0.15 0.18 0.20]);
+    setappdata(axm, 'basemap_img', gobjects(0));
+    warning('Mission map: satellite basemap unavailable (%s). Grid only.', ...
+            ME.message);
+end
+end
+
+% Re-anchor the map on a new (lat0, lon0): refresh the basemap + title.
+function setMissionAnchor(mm, lat0, lon0)
+if ~isstruct(mm) || ~isfield(mm, 'ax') || ~isvalid(mm.ax), return; end
+HALF = getappdata(mm.ax, 'HALF');
+setappdata(mm.ax, 'lat0', lat0);
+setappdata(mm.ax, 'lon0', lon0);
+old = getappdata(mm.ax, 'basemap_img');
+if ~isempty(old) && all(isgraphics(old)), delete(old); end
+set(mm.ax, 'Color', [1 1 1]);
+addSatelliteBasemap(mm.ax, lat0, lon0, HALF);
+title(mm.ax, sprintf('Mission map @ %.5f, %.5f — click to add a waypoint', ...
+                     lat0, lon0));
+end
+
+% Select the mode toggle-button whose Tag matches modeStr.
+function setModeButton(mm, modeStr)
+if ~isstruct(mm) || ~isfield(mm, 'mode_bg') || ~isvalid(mm.mode_bg), return; end
+btn = findobj(mm.mode_bg, 'Tag', modeStr);
+if ~isempty(btn), set(mm.mode_bg, 'SelectedObject', btn(1)); end
+end
+
+% Map click -> stash an [N E D] add request for the sim loop.
+function onMapClick(axm, fig, altEdit, HALF)
+cp = get(axm, 'CurrentPoint');
+E = cp(1, 1); N = cp(1, 2);
+if abs(E) > HALF || abs(N) > HALF, return; end   % ignore clicks outside box
+alt = str2double(get(altEdit, 'String'));
+if ~isfinite(alt), alt = 10; end
+setappdata(fig, 'map_add_request', [N, E, -alt]);   % NED, D = -altitude
+end
+
+% Table Alt-column edit -> stash a [row alt_m] request for the sim loop.
+function onAltEdit(fig, ev)
+if isempty(ev.Indices), return; end
+row = ev.Indices(1);
+newAlt = ev.NewData;
+if ischar(newAlt) || isstring(newAlt), newAlt = str2double(newAlt); end
+setappdata(fig, 'alt_edit_request', [row, double(newAlt)]);
+end
+
+% Redraw the Mission-map markers + table from the waypoint list (NED metres).
+function updateMissionMap(mm, wps)
+if ~isstruct(mm) || ~isfield(mm, 'ax') || ~isvalid(mm.ax), return; end
+old = getappdata(mm.ax, 'wp_labels');           % clear old coordinate labels
+if ~isempty(old), delete(old(isgraphics(old))); end
+if isempty(wps)
+    set([mm.path mm.launch mm.mid mm.endp], 'XData', NaN, 'YData', NaN);
+    set(mm.table, 'Data', {});
+    setappdata(mm.ax, 'wp_labels', gobjects(0));
+    return;
+end
+N = wps(:, 1); E = wps(:, 2); alt = -wps(:, 3);
+n = size(wps, 1);
+set(mm.path,   'XData', E,    'YData', N);
+set(mm.launch, 'XData', E(1), 'YData', N(1));
+if n >= 2, set(mm.endp, 'XData', E(end), 'YData', N(end));
+else,      set(mm.endp, 'XData', NaN,    'YData', NaN); end
+if n >= 3, set(mm.mid, 'XData', E(2:end-1), 'YData', N(2:end-1));
+else,      set(mm.mid, 'XData', NaN,        'YData', NaN); end
+set(mm.table, 'Data', num2cell([N, E, alt]));
+
+% lat/lon coordinate label at each clicked point (current anchor)
+lat0 = getappdata(mm.ax, 'lat0'); lon0 = getappdata(mm.ax, 'lon0');
+Re = 6378137; d = pi / 180;
+labels = gobjects(n, 1);
+for i = 1:n
+    lat = lat0 + N(i) / (Re * d);
+    lon = lon0 + E(i) / (Re * d * cosd(lat0));
+    labels(i) = text(mm.ax, E(i), N(i), ...
+        sprintf('  %d: %.6f, %.6f', i, lat, lon), ...
+        'Color', 'w', 'FontSize', 7, 'FontWeight', 'bold', ...
+        'VerticalAlignment', 'bottom', 'Clipping', 'on', ...
+        'HitTest', 'off', 'PickableParts', 'none');
+end
+setappdata(mm.ax, 'wp_labels', labels);
+end
+
+
+% =========================================================================
+% QGroundControl .plan I/O (JSON). Waypoints are converted to/from lat/lon
+% with a flat-earth model at the plan's home (load) or the map anchor (save).
+% =========================================================================
+function onLoadPlan(fig)
+mdir = fullfile(fileparts(mfilename('fullpath')), 'missions');
+[f, p] = uigetfile({'*.plan;*.json', 'QGC plan (*.plan, *.json)'}, ...
+                   'Load mission .plan', [mdir filesep]);
+if isequal(f, 0), return; end
+try
+    data = plan_load(fullfile(p, f));
+catch ME
+    errordlg(sprintf('Failed to parse plan:\n%s', ME.message), 'Load .plan');
+    return;
+end
+setappdata(fig, 'load_plan_request', data);     % sim loop applies it
+end
+
+function savePlanDialog(mm, waypoints)
+if isempty(waypoints)
+    warndlg('No waypoints to save.', 'Save .plan'); return;
+end
+lat0 = getappdata(mm.ax, 'lat0'); lon0 = getappdata(mm.ax, 'lon0');
+mdir = fullfile(fileparts(mfilename('fullpath')), 'missions');
+[f, p] = uiputfile({'*.plan', 'QGC plan (*.plan)'}, 'Save mission .plan', ...
+                   fullfile(mdir, 'mission.plan'));
+if isequal(f, 0), return; end
+try
+    plan_save(fullfile(p, f), waypoints, lat0, lon0);
+catch ME
+    errordlg(sprintf('Failed to save plan:\n%s', ME.message), 'Save .plan');
+end
+end
+
+% Parse a QGC .plan -> struct(waypoints[Nx3 NED], lat0, lon0). NAV_WAYPOINT
+% (16) and TAKEOFF (22) items are converted from lat/lon to NED about the
+% plan's plannedHomePosition; items without coordinates (e.g. RTL) are skipped.
+function out = plan_load(path)
+plan = jsondecode(fileread(path));
+m = plan.mission;
+home = m.plannedHomePosition;
+lat0 = home(1); lon0 = home(2);
+items = m.items;
+if isstruct(items), items = num2cell(items); end   % homogeneous -> cell
+Re = 6378137; d = pi / 180;
+wps = zeros(0, 3);
+for k = 1:numel(items)
+    it = items{k};
+    if ~isfield(it, 'command') || ~ismember(it.command, [16 22]), continue; end
+    pr = it.params;
+    if iscell(pr), lat = cellnum(pr{5}); lon = cellnum(pr{6}); alt = cellnum(pr{7});
+    else,          lat = pr(5);          lon = pr(6);          alt = pr(7);        end
+    if ~isfinite(lat) || ~isfinite(lon), continue; end
+    if ~isfinite(alt) && isfield(it, 'Altitude'), alt = it.Altitude; end
+    N = (lat - lat0) * d * Re;
+    E = (lon - lon0) * d * Re * cosd(lat0);
+    wps(end+1, :) = [N, E, -alt]; %#ok<AGROW>
+end
+out = struct('waypoints', wps, 'lat0', lat0, 'lon0', lon0);
+end
+
+function v = cellnum(x)
+if isempty(x), v = NaN; else, v = double(x); end
+end
+
+% Write waypoints as a QGC .plan: item 1 = TAKEOFF (22), the rest =
+% NAV_WAYPOINT (16), terminated by RTL (20). Frame 3 = global/rel-alt.
+function plan_save(path, waypoints, lat0, lon0)
+Re = 6378137; d = pi / 180;
+n = size(waypoints, 1);
+items = cell(1, n + 1);
+for k = 1:n
+    N = waypoints(k, 1); E = waypoints(k, 2); alt = -waypoints(k, 3);
+    lat = lat0 + N / (Re * d);
+    lon = lon0 + E / (Re * d * cosd(lat0));
+    if k == 1, cmd = 22; else, cmd = 16; end
+    items{k} = struct('AMSLAltAboveTerrain', [], 'Altitude', alt, ...
+        'AltitudeMode', 1, 'autoContinue', true, 'command', cmd, ...
+        'doJumpId', k, 'frame', 3, ...
+        'params', {{0, 0, 0, [], lat, lon, alt}}, 'type', 'SimpleItem');
+end
+items{n + 1} = struct('autoContinue', true, 'command', 20, 'doJumpId', n + 1, ...
+    'frame', 2, 'params', {{0, 0, 0, 0, 0, 0, 0}}, 'type', 'SimpleItem');
+mission = struct('cruiseSpeed', 15, 'firmwareType', 12, ...
+    'globalPlanAltitudeMode', 0, 'hoverSpeed', 5, 'items', {items}, ...
+    'plannedHomePosition', [lat0, lon0, 0], 'vehicleType', 2, 'version', 2);
+plan = struct('fileType', 'Plan', ...
+    'geoFence', struct('circles', {{}}, 'polygons', {{}}, 'version', 2), ...
+    'groundStation', 'QGroundControl', 'mission', mission, ...
+    'rallyPoints', struct('points', {{}}, 'version', 2), 'version', 1);
+txt = jsonencode(plan, 'PrettyPrint', true);
+fid = fopen(path, 'w');
+if fid < 0, error('cannot open %s for writing', path); end
+fwrite(fid, txt); fclose(fid);
 end
 
 

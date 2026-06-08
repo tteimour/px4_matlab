@@ -1,0 +1,13 @@
+{
+  "typeCheckingMode": "basic",
+  "extraPaths": [
+    "/opt/ros/humble/lib/python3.10/site-packages"
+  ],
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownParameterType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportMissingModuleSource": false,
+  "reportAttributeAccessIssue": false
+}
