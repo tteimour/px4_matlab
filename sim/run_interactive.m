@@ -44,21 +44,17 @@ addpath(fullfile(root, 'src', 'bridge'));
 
 p = px4_params();
 
-range_xy = 50;            % ground-plane half-width (m), purely visual
-
 % =====================================================================
-% Tabbed GUI. Tab 1 ("3D UAV") holds the 3D scene (in a detachable panel)
-% plus the flight cockpit and joysticks; the remaining tabs are parameter
-% editors. Selecting any non-3D tab pops the 3D scene out into a floating
-% window beside the GUI (so the vehicle stays visible while editing);
-% selecting "3D UAV" docks it back in. See onTabSelected().
+% Tabbed GUI. The 3D scene was removed -- Unity/Cesium now provides the
+% visualization, so the tabs are parameter editors plus the Mission map
+% (live 2D trails) and the VIO control tab. Manual control lives in a
+% separate floating window so you can fly from any tab.
 % =====================================================================
 fig = figure('Name', 'PX4 interactive — tabbed', ...
              'NumberTitle', 'off', 'Color', 'w', ...
              'Position', [90 70 1320 840]);
 
 tg = uitabgroup(fig, 'Units', 'normalized', 'Position', [0 0 1 1]);
-tab_viz  = uitab(tg, 'Title', '3D UAV');
 tab_ctrl = uitab(tg, 'Title', 'Controller');
 tab_ekf  = uitab(tg, 'Title', 'EKF');
 tab_sens = uitab(tg, 'Title', 'Sensors');
@@ -72,41 +68,8 @@ mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
                 'mission', 'rtl', 'land', 'takeoff'};
 default_mode_idx = 3;             % start in Position
 
-% --- 3D scene, inside a detachable panel ------------------------------
-viz_docked_pos = [0.005 0.02 0.985 0.965];   % fills the tab (joysticks moved out)
-viz_panel = uipanel(tab_viz, 'Units', 'normalized', ...
-    'Position', viz_docked_pos, 'BackgroundColor', 'w', 'BorderType', 'none');
-
-ax = axes('Parent', viz_panel, 'Units', 'normalized', ...
-          'Position', [0.10 0.10 0.86 0.84]);
-hold(ax, 'on'); grid(ax, 'on'); box(ax, 'on'); axis(ax, 'equal');
-view_half = 8;
-xlim(ax, [-view_half view_half]);
-ylim(ax, [-view_half view_half]);
-zlim(ax, [0 view_half * 1.2]);
-xlabel(ax, 'East (m)'); ylabel(ax, 'North (m)'); zlabel(ax, 'Altitude (m)');
-title(ax, 'PX4 cascaded controller — pick a mode and fly');
-view(ax, 35, 25);
-
-gp = range_xy;
-ground = patch(ax, [-gp gp gp -gp], [-gp -gp gp gp], [0 0 0 0], ...
-      [0.93 0.95 0.93], 'EdgeColor', [0.7 0.75 0.7], 'FaceAlpha', 0.6); %#ok<NASGU>
-
-trail   = animatedline(ax, 'Color', [0.2 0.4 0.9], 'LineWidth', 1.0, ...
-                       'MaximumNumPoints', 6000);
-sp_dot  = plot3(ax, 0, 0, 0, 'rs', 'MarkerSize', 12, ...
-                'MarkerFaceColor', [1 0.7 0.7]);
-sp_line = plot3(ax, [0 0], [0 0], [0 0], 'r:', 'LineWidth', 0.8);
-mission_h = plot3(ax, NaN, NaN, NaN, 'g--o', 'LineWidth', 1.0, ...
-                  'MarkerSize', 6, 'MarkerFaceColor', [0.6 0.95 0.6]);
-
-drone = makeDrone(ax);
-
-% Wind indicator: arrow rendered at a fixed offset above the drone,
-% direction = total wind in NED, length proportional to speed.
-wind_arrow = quiver3(ax, 0, 0, 0, 0, 0, 0, ...
-    'Color', [0.10 0.55 0.85], 'LineWidth', 2.0, ...
-    'AutoScale', 'off', 'MaxHeadSize', 1.0);
+% The in-GUI 3D scene was removed (Unity/Cesium renders the vehicle now).
+% Ground truth / EKF / VIO are shown as live 2D trails on the Mission tab.
 
 % =====================================================================
 % The old "Flight control" cockpit panel was removed from the 3D-UAV tab.
@@ -217,10 +180,6 @@ gyro_sig_th   = imu0.gyro_nd / sqrt(1 / p.rate_hz.rate);
 gyro_vib_gain = imu0.gyro_vib_gain;
 [at_btn, amp_edit, rise_edit, at_status_lbl, at_results_lbl] = ...
     buildAutotuneTab(tab_auto, fig, at_opts);
-
-% Pop the 3D scene out of / back into the GUI as tabs change.
-set(tg, 'SelectionChangedFcn', ...
-    @(src, ~) onTabSelected(src, fig, viz_panel, tab_viz, viz_docked_pos));
 
 dt_rate = 1 / p.rate_hz.rate;
 n_att   = round(p.rate_hz.rate / p.rate_hz.attitude);
@@ -358,7 +317,6 @@ while ishandle(fig) && getappdata(fig, 'running')
         % Re-inject the known bias after reset so post-Reset runs
         % have the same truth bias to estimate.
         est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
-        clearpoints(trail);
         t_sim   = 0;
         last_imu_pub_t    = -inf;  % sim time restarts at 0; re-arm IMU decimation
         imu_stream_failed = false; % re-arm IMU bridge after a Reset
@@ -426,7 +384,6 @@ while ishandle(fig) && getappdata(fig, 'running')
     if ~isempty(map_add)
         waypoints(end+1, :) = map_add; %#ok<AGROW>
         fmm.setMission(waypoints);
-        updateWaypointUI(mission_h, waypoints);
         updateMissionMap(mission_map, waypoints);
         setappdata(fig, 'map_add_request', []);
     end
@@ -438,8 +395,7 @@ while ishandle(fig) && getappdata(fig, 'running')
         if row >= 1 && row <= size(waypoints, 1) && isfinite(alt_edit(2))
             waypoints(row, 3) = -alt_edit(2);   % D = -altitude (positive = up)
             fmm.setMission(waypoints);
-            updateWaypointUI(mission_h, waypoints);
-            updateMissionMap(mission_map, waypoints);
+                updateMissionMap(mission_map, waypoints);
         end
         setappdata(fig, 'alt_edit_request', []);
     end
@@ -450,7 +406,6 @@ while ishandle(fig) && getappdata(fig, 'running')
         setMissionAnchor(mission_map, load_plan.lat0, load_plan.lon0);
         waypoints = load_plan.waypoints;
         if isempty(waypoints), fmm.clearMission(); else, fmm.setMission(waypoints); end
-        updateWaypointUI(mission_h, waypoints);
         updateMissionMap(mission_map, waypoints);
         setappdata(fig, 'load_plan_request', []);
     end
@@ -466,8 +421,7 @@ while ishandle(fig) && getappdata(fig, 'running')
         if ~isempty(waypoints)
             waypoints(end, :) = [];
             if isempty(waypoints), fmm.clearMission(); else, fmm.setMission(waypoints); end
-            updateWaypointUI(mission_h, waypoints);
-            updateMissionMap(mission_map, waypoints);
+                updateMissionMap(mission_map, waypoints);
         end
         setappdata(fig, 'pop_request', false);
     end
@@ -476,7 +430,6 @@ while ishandle(fig) && getappdata(fig, 'running')
     if getappdata(fig, 'clear_request')
         waypoints = zeros(0, 3);
         fmm.clearMission();
-        updateWaypointUI(mission_h, waypoints);
         updateMissionMap(mission_map, waypoints);
         setappdata(fig, 'clear_request', false);
     end
@@ -678,22 +631,15 @@ while ishandle(fig) && getappdata(fig, 'running')
     end
     set(at_status_lbl, 'String', ['autotune: ' autotune_status]);
 
-    % --- Render ---
+    % --- State for the readout + bridges (no in-GUI 3D view; Unity renders) ---
     s = plant.state();
     eN = s.position_ned(1);
     eE = s.position_ned(2);
     eU = max(0, -s.position_ned(3));
-    addpoints(trail, eE, eN, eU);
-
-    % Setpoint marker (uses the mode's pos_sp).
     eN_sp = cmd.pos_sp(1); eE_sp = cmd.pos_sp(2); eU_sp = -cmd.pos_sp(3);
-    set(sp_dot,  'XData', eE_sp, 'YData', eN_sp, 'ZData', eU_sp);
-    set(sp_line, 'XData', [eE eE_sp], 'YData', [eN eN_sp], 'ZData', [eU eU_sp]);
-
-    drone = updateDrone(drone, s.position_ned, s.attitude_q);
 
     % --- Stream pose to Cesium/Unity (opt-in via the Cesium tab) ----------
-    % Same ground-truth pose the 3D view renders, converted NED/FRD->ENU/FLU
+    % Ground-truth pose, converted NED/FRD->ENU/FLU
     % and published as geometry_msgs/PoseArray. Failures disable the toggle
     % rather than killing the sim.
     if ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1
@@ -874,26 +820,6 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
-    % Wind arrow: anchored ~3 m above the drone in plot frame, direction
-    % is total NED wind mapped to (E, N, U). Length 0.4 m per m/s.
-    w_ned   = wind.last_wind_ned;
-    w_plot  = [w_ned(2); w_ned(1); -w_ned(3)];
-    w_scale = 0.4;
-    set(wind_arrow, ...
-        'XData', eE,        'YData', eN,        'ZData', eU + 3, ...
-        'UData', w_plot(1) * w_scale, ...
-        'VData', w_plot(2) * w_scale, ...
-        'WData', w_plot(3) * w_scale);
-
-    % Camera follow that brackets drone + setpoint.
-    half_xy = 8;
-    cx = (eE + eE_sp) / 2;
-    cy = (eN + eN_sp) / 2;
-    pad = max(half_xy, max(abs(eE - eE_sp), abs(eN - eN_sp)) / 2 + 4);
-    xlim(ax, [cx - pad, cx + pad]);
-    ylim(ax, [cy - pad, cy + pad]);
-    zlim(ax, [0, max(8, max(eU, eU_sp) + 4)]);
-
     rpy    = quat_to_euler(s.attitude_q);
     rpy_sp = quat_to_euler(q_sp);
 
@@ -992,9 +918,6 @@ end
 stopOpenvins(openvins_pid);
 % rosbridge_server is stopped by the onCleanup guard registered at start.
 
-% Close the detached 3D window if it was popped out (found by tag so it
-% is cleaned up even if the main window was closed first).
-delete(findobj(0, 'Type', 'figure', 'Tag', 'px4_float_viz'));
 if exist('ctrl_fig', 'var') && ishandle(ctrl_fig)
     delete(ctrl_fig);            % close the floating manual-control window
 end
@@ -1107,74 +1030,6 @@ end
 
 
 % =========================================================================
-% Update the 3D-view mission polyline from the current Nx3 waypoint list
-% (NED metres). The waypoint *list* now lives in the Mission-tab table.
-% =========================================================================
-function updateWaypointUI(mission_h, wps)
-if isempty(wps)
-    set(mission_h, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
-    return;
-end
-% 3D view: plot in (East, North, Up).
-set(mission_h, 'XData', wps(:, 2), 'YData', wps(:, 1), 'ZData', -wps(:, 3));
-end
-
-
-% =========================================================================
-% Drone visual: lightweight quad marker (hgtransform-based).
-% No STL mesh and no scene lighting -- an X-frame of arms with rotor disks and a
-% forward indicator, all under one hgtransform so updateDrone only sets a 4x4
-% Matrix per frame. Keeps position + attitude readable at near-zero render cost
-% (replaces the heavy ~12k-face STL body + 4 spinning-prop meshes).
-% =========================================================================
-function drone = makeDrone(ax)
-arm = 1.2;
-d   = arm / sqrt(2);                       % rotor offset along body X/Y (FRD)
-% Rotor tips in FRD body frame: front-right, front-left, rear-right, rear-left.
-tips = [ +d +d 0;
-         +d -d 0;
-         -d +d 0;
-         -d -d 0];
-
-drone.body_xform = hgtransform('Parent', ax);
-
-% Arms: centre -> each tip, as one NaN-separated line object.
-ax_x = []; ax_y = []; ax_z = [];
-for i = 1:4
-    ax_x = [ax_x, 0, tips(i, 1), NaN]; %#ok<AGROW>
-    ax_y = [ax_y, 0, tips(i, 2), NaN]; %#ok<AGROW>
-    ax_z = [ax_z, 0, tips(i, 3), NaN]; %#ok<AGROW>
-end
-line('Parent', drone.body_xform, 'XData', ax_x, 'YData', ax_y, 'ZData', ax_z, ...
-     'Color', [0.45 0.47 0.52], 'LineWidth', 2);
-
-% Rotor disks: front pair green, rear pair dark, so heading is readable.
-line('Parent', drone.body_xform, 'XData', tips(1:2, 1), 'YData', tips(1:2, 2), ...
-     'ZData', tips(1:2, 3), 'LineStyle', 'none', 'Marker', 'o', ...
-     'MarkerSize', 9, 'MarkerFaceColor', [0.20 0.70 0.30], 'MarkerEdgeColor', 'none');
-line('Parent', drone.body_xform, 'XData', tips(3:4, 1), 'YData', tips(3:4, 2), ...
-     'ZData', tips(3:4, 3), 'LineStyle', 'none', 'Marker', 'o', ...
-     'MarkerSize', 9, 'MarkerFaceColor', [0.15 0.15 0.18], 'MarkerEdgeColor', 'none');
-
-% Forward (+X body) indicator.
-drone.front = line('Parent', drone.body_xform, ...
-                   'XData', [0, 1.4*arm], 'YData', [0, 0], 'ZData', [0, 0], ...
-                   'Color', 'r', 'LineWidth', 3);
-end
-
-
-function drone = updateDrone(drone, pos_ned, q)
-% Cheap per-frame update: just place/orient the marker (no mesh, no props).
-ned_to_plot = [0 1 0; 1 0 0; 0 0 -1];
-R_b2n = quat_to_dcm(q);
-M_body = eye(4);
-M_body(1:3, 1:3) = ned_to_plot * R_b2n;
-M_body(1:3, 4)   = ned_to_plot * pos_ned;
-set(drone.body_xform, 'Matrix', M_body);
-end
-
-
-% =========================================================================
 % Live controller-gain tuning window.
 %
 % Builds a separate figure with one panel per controller (outer -> inner:
@@ -1195,33 +1050,6 @@ end
 % (default value in display units, from px4_params). lo/hi/def may be
 % scalar (broadcast to all components) or per-component vectors.
 % =========================================================================
-% =========================================================================
-% Pop the 3D scene out into a floating window when a non-3D tab is shown,
-% and dock it back when the "3D UAV" tab is selected.
-% =========================================================================
-function onTabSelected(src, fig, viz_panel, tab_viz, docked_pos)
-sel = src.SelectedTab;
-ff  = getappdata(fig, 'float_fig');
-if strcmp(get(sel, 'Title'), '3D UAV')
-    set(viz_panel, 'Parent', tab_viz, 'Position', docked_pos);
-    if ~isempty(ff) && ishandle(ff), set(ff, 'Visible', 'off'); end
-else
-    if isempty(ff) || ~ishandle(ff)
-        mp = get(fig, 'Position');
-        ff = figure('Name', '3D UAV (detached)', 'NumberTitle', 'off', ...
-                    'Color', 'w', 'MenuBar', 'none', 'ToolBar', 'none', ...
-                    'Tag', 'px4_float_viz', ...
-                    'Position', [mp(1)+mp(3)+14, mp(2)+max(0,mp(4)-600), 640, 600], ...
-                    'CloseRequestFcn', @(o,~) set(o, 'Visible', 'off'));
-        setappdata(fig, 'float_fig', ff);
-    end
-    set(viz_panel, 'Parent', ff, 'Position', [0 0 1 1]);
-    set(ff, 'Visible', 'on');
-    figure(fig);    % keep the main GUI active so parameter edits register
-end
-end
-
-
 % =========================================================================
 % Controller-gains tab. Returns a refresh() handle that re-reads the live
 % controller gains into the sliders/edits (used after autotuning).
@@ -1325,7 +1153,7 @@ rows = {
 buildGroup(parent, [0.03 0.18 0.94 0.80], 'EKF2 noise parameters (live)', rows);
 
 est_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.05 0.09 0.9 0.05], 'BackgroundColor', 'w', 'Value', 0, ...
+    'Position', [0.05 0.09 0.9 0.05], 'BackgroundColor', 'w', 'Value', 1, ...
     'FontWeight', 'bold', 'String', 'Use EKF2 estimator (sensor-driven state feed)');
 uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.05 0.02 0.9 0.06], 'BackgroundColor', 'w', ...
@@ -1906,17 +1734,20 @@ hEnd    = plot(axm, NaN, NaN, 'o', 'MarkerSize', 11, 'LineWidth', 1.0, ...
 % incremental, so per-frame appends stay cheap.
 % MaximumNumPoints caps the trail so the Mission map does not slow down over a
 % long flight (the full path still goes to the comparison plot via vio_log).
-gtTrail  = animatedline(axm, 'Color', [1 1 1],     'LineWidth', 2.0, ...
+gtTrail  = animatedline(axm, 'Color', [1 1 1],     'LineWidth', 3.0, ...
                         'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
-ekfTrail = animatedline(axm, 'Color', [0 1 1],     'LineWidth', 1.5, ...
+ekfTrail = animatedline(axm, 'Color', [0 1 1],     'LineWidth', 3.0, ...
                         'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
 vioTrail = animatedline(axm, 'Color', [1 0.2 0.2], 'LineStyle', '--', ...
-                        'MaximumNumPoints', 6000, 'LineWidth', 1.5, ...
+                        'MaximumNumPoints', 6000, 'LineWidth', 3.0, ...
                         'HitTest', 'off', 'PickableParts', 'none');
-text(axm, 0.02, 0.97, 'trails:  GT  EKF  VIO', 'Units', 'normalized', ...
-     'Color', 'k', 'FontSize', 8, 'FontWeight', 'bold', ...
-     'BackgroundColor', [1 1 1 0.6], 'VerticalAlignment', 'top', ...
-     'HitTest', 'off', 'PickableParts', 'none');
+% Clickable legend: click an entry to hide/show that trail (toggles its
+% Visible). AutoUpdate off so it does not pick up the basemap/markers.
+lgd = legend(axm, [gtTrail, ekfTrail, vioTrail], ...
+             {'Ground truth', 'EKF', 'VIO'}, ...
+             'Location', 'northeast', 'AutoUpdate', 'off', ...
+             'TextColor', 'k', 'Color', 'w', 'FontSize', 9, 'Box', 'on');
+lgd.ItemHitFcn = @legendToggleTrail;
 
 % --- controls (right column) ----------------------------------------------
 uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
@@ -1984,6 +1815,16 @@ mm = struct('ax', axm, 'path', hPath, 'launch', hLaunch, 'mid', hMid, ...
             'endp', hEnd, 'table', tbl, 'altEdit', altEdit, ...
             'mode_bg', mode_bg, 'state_lbl', state_lbl, ...
             'gt_trail', gtTrail, 'ekf_trail', ekfTrail, 'vio_trail', vioTrail);
+end
+
+% Legend click handler: toggle the clicked trail's visibility on/off.
+function legendToggleTrail(~, ev)
+h = ev.Peer;
+if strcmp(get(h, 'Visible'), 'on')
+    set(h, 'Visible', 'off');
+else
+    set(h, 'Visible', 'on');
+end
 end
 
 % Lay Esri 'satellite' tiles under the local-metre axes (best-effort).
