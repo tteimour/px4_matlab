@@ -44,8 +44,8 @@ classdef ImuIIM42652 < ImuSensor
 
             % Slightly noisier vibration response than the SPI1 IMU
             % because the SPI2 mount on V6X_6 is closer to the frame.
-            obj.gyro_vib_gain  = 0.18;
-            obj.accel_vib_gain = 4.0;
+            obj.gyro_vib_gain  = 0.0;   % off by default (was 0.18)
+            obj.accel_vib_gain = 0.0;   % off by default (was 4.0 -- starved VIO scale)
 
             obj.R_chip_to_body = px4_rotation(6);   % -R 6 (yaw 270)
             obj.initBias();

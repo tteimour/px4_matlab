@@ -48,8 +48,8 @@ classdef ImuADIS16470 < ImuSensor
             % is mounted on a soft-isolator on V6X_6 — vibration coupling
             % is markedly lower than the Invensense parts. Still nonzero
             % in flight: real PX4 logs show ~0.1 rad/s gyro RMS.
-            obj.gyro_vib_gain  = 0.12;
-            obj.accel_vib_gain = 2.5;
+            obj.gyro_vib_gain  = 0.0;   % off by default (was 0.12)
+            obj.accel_vib_gain = 0.0;   % off by default (was 2.5 -- starved VIO scale)
 
             obj.R_chip_to_body = px4_rotation(0);   % -R 0
             obj.initBias();
