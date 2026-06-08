@@ -152,6 +152,7 @@ buildWindTab(tab_wind, p, wind);
 cesium_cb = buildCesiumTab(tab_cesium);
 vio_ui = buildVioTab(tab_vio, fig);   % VIO control tab (enable, params, streams)
 vio_cb = vio_ui.vio_cb;               % the loop drives VIO off this checkbox
+fuse_cb = vio_ui.fuse_cb;             % "Fuse VIO -> EKF (replace GPS)" toggle
 
 % Mission tab: north-up satellite map at the Cesium origin (Baku); click to
 % drop waypoints, set per-waypoint altitude. Writes the same `waypoints`
@@ -282,6 +283,12 @@ vio_sub_trk    = [];      % lazy: /ov_msckf/trackhist (only while VIO tab open)
 openvins_pid   = [];      % OpenVINS launch PID (auto-started with the VIO toggle)
 vio_align_R    = [];      % frozen SE3 rotation OpenVINS-global -> NED (map trail)
 vio_align_t    = [];      % frozen SE3 translation (map trail)
+% VIO->EKF fusion anchor (separate from the map-trail alignment above: this
+% one anchors to the EKF estimate, NOT ground truth, so it is a legitimate
+% GNSS-denied aid). Set on the "Fuse VIO -> EKF" rising edge.
+vio_fuse_R     = [];      % yaw rotation OpenVINS-global -> EKF NED
+vio_fuse_p0    = [];      % VIO position at the anchor instant
+vio_fuse_pe0   = [];      % EKF position at the anchor instant
 vio_logging    = false;   % true while the VIO toggle is on
 prev_vio_on    = false;   % edge detection for the VIO toggle
 vio_idx        = 0;       % rows logged this VIO session
@@ -326,6 +333,10 @@ while ishandle(fig) && getappdata(fig, 'running')
             vio_node = []; vio_sub = []; vio_sub_raw = []; vio_sub_trk = [];
             stopOpenvins(openvins_pid); openvins_pid = [];
             vio_align_R = []; vio_align_t = [];
+            % Drop the VIO->EKF aid too (est_bus.reset already cleared the
+            % estimator side; clear the sim-loop anchor + the checkbox).
+            vio_fuse_R = []; vio_fuse_p0 = []; vio_fuse_pe0 = [];
+            set(fuse_cb, 'Value', 0);
             clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
             clearpoints(mission_map.vio_trail);
             fprintf('VIO logging stopped by Reset (sim clock restarted).\n');
@@ -806,6 +817,50 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
+    % --- VIO -> EKF fusion: replace GPS with OpenVINS odometry ------------
+    % Requires VIO logging on. On the rising edge, anchor the OpenVINS
+    % `global` frame (arbitrary yaw+origin) to the current EKF state, then
+    % feed NED-aligned VIO pos/vel to the estimator in place of GNSS. The
+    % twist is in the IMU body frame (ROS2Visualizer.cpp:300-303), so
+    % velocity is rotated body->global->NED before fusion.
+    fuse_on = vio_logging && ishandle(fuse_cb) && get(fuse_cb, 'Value') == 1;
+    if fuse_on
+        vmsg = getappdata(fig, 'vio_latest');
+        if ~isempty(vmsg)
+            vp = [vmsg.pose.pose.position.x; vmsg.pose.pose.position.y; ...
+                  vmsg.pose.pose.position.z];
+            vq = [vmsg.pose.pose.orientation.w; vmsg.pose.pose.orientation.x; ...
+                  vmsg.pose.pose.orientation.y; vmsg.pose.pose.orientation.z];
+            vv = [vmsg.twist.twist.linear.x; vmsg.twist.twist.linear.y; ...
+                  vmsg.twist.twist.linear.z];
+            vts = double(vmsg.header.stamp.sec) + ...
+                  double(vmsg.header.stamp.nanosec) * 1e-9;
+            if all(isfinite([vp; vq; vv; vts])) && norm(vq) > 0.5
+                if isempty(vio_fuse_R)
+                    est0  = est_bus.stateOut();
+                    rpy_e = quat_to_euler(est0.attitude_q);
+                    rpy_v = quat_to_euler(vq);
+                    dyaw  = rpy_e(3) - rpy_v(3);
+                    cy = cos(dyaw); sy = sin(dyaw);
+                    vio_fuse_R   = [cy -sy 0; sy cy 0; 0 0 1];
+                    vio_fuse_p0  = vp;
+                    vio_fuse_pe0 = est0.position_ned;
+                    est_bus.enableVio(true);
+                    fprintf(['VIO->EKF ON: anchored at EKF [%.1f %.1f %.1f] m, ' ...
+                             'dyaw=%.1f deg. GPS fusion suspended.\n'], ...
+                            vio_fuse_pe0(1), vio_fuse_pe0(2), vio_fuse_pe0(3), rad2deg(dyaw));
+                end
+                pos_ned = vio_fuse_R * (vp - vio_fuse_p0) + vio_fuse_pe0;
+                vel_ned = vio_fuse_R * (quat_to_dcm(vq) * vv);   % body->global->NED
+                est_bus.setVio(struct('pos_ned', pos_ned, 'vel_ned', vel_ned, 't', vts));
+            end
+        end
+    elseif ~isempty(vio_fuse_R)          % fuse turned off (or VIO session ended)
+        est_bus.enableVio(false);
+        vio_fuse_R = []; vio_fuse_p0 = []; vio_fuse_pe0 = [];
+        fprintf('VIO->EKF OFF: GPS fusion resumed.\n');
+    end
+
     % --- refresh the VIO tab (camera streams + live odom readout) ----------
     % Decoding two 512x512 frames every loop iteration starves MATLAB's single
     % thread and makes the joysticks lag. So only do it when the VIO tab is
@@ -1254,9 +1309,16 @@ function vio_ui = buildVioTab(parent, fig)
 [estCfg, camCfg] = vioCfgPaths();
 
 vio_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.02 0.945 0.6 0.04], 'BackgroundColor', 'w', 'Value', 0, ...
+    'Position', [0.02 0.945 0.46 0.04], 'BackgroundColor', 'w', 'Value', 0, ...
     'FontWeight', 'bold', 'FontSize', 11, ...
     'String', 'Enable VIO  (auto-launch OpenVINS + log + plot)');
+% Feed VIO into the EKF in place of GPS. Requires "Enable VIO" on; on the
+% rising edge the OpenVINS frame is anchored to the current EKF state, then
+% VIO pos/vel replace the GNSS aiding source (see EstimatorBus.enableVio).
+fuse_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.49 0.945 0.50 0.04], 'BackgroundColor', [1 0.97 0.90], ...
+    'Value', 0, 'FontWeight', 'bold', 'FontSize', 11, ...
+    'String', 'Fuse VIO -> EKF  (replace GPS)');
 uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.02 0.90 0.96 0.04], 'BackgroundColor', 'w', ...
     'HorizontalAlignment', 'left', 'FontSize', 8, ...
@@ -1316,7 +1378,7 @@ uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
         'features. If the right view has few/no points, the camera is feature-' ...
         'starved (fly higher, lower fast_threshold, or CLAHE).']);
 
-vio_ui = struct('vio_cb', vio_cb, 'ed', ed, 'readout', readout, ...
+vio_ui = struct('vio_cb', vio_cb, 'fuse_cb', fuse_cb, 'ed', ed, 'readout', readout, ...
     'axRaw', axRaw, 'imgRaw', imgRaw, 'axTrk', axTrk, 'imgTrk', imgTrk);
 end
 

@@ -31,6 +31,13 @@ classdef EstimatorBus < handle
         last_baro_t  = -inf
         last_mag_t   = -inf
         last_gps_t   = -inf
+
+        % External-vision (VIO) aiding. When vio_enabled, OpenVINS odometry
+        % (already NED-aligned by the caller) replaces GNSS as the pos/vel
+        % aid. vio_sample = struct('pos_ned',3x1,'vel_ned',3x1 or [],'t',s).
+        vio_enabled  = false
+        vio_sample   = []
+        last_vio_t   = -inf
     end
 
     methods
@@ -58,14 +65,28 @@ classdef EstimatorBus < handle
                 obj.last_baro_t = air.t;
             end
 
-            gps = obj.sensors.vehicleGpsPosition();
-            if ~isempty(gps) && isfield(gps, 't') && gps.t > obj.last_gps_t ...
-                    && bitand(obj.params.gps_ctrl, 1) ~= 0
-                obj.ekf.fuseGnssPos(gps);
-                if bitand(obj.params.gps_ctrl, 4) ~= 0
-                    obj.ekf.fuseGnssVel(gps);
+            if obj.vio_enabled
+                % VIO replaces GNSS as the horizontal position/velocity aid.
+                % Baro (height) and mag (heading) keep fusing as normal below.
+                vs = obj.vio_sample;
+                if ~isempty(vs) && isfield(vs, 't') && vs.t > obj.last_vio_t
+                    obj.ekf.fuseVioPos(vs.pos_ned);
+                    if isfield(vs, 'vel_ned') && ~isempty(vs.vel_ned) ...
+                            && bitand(obj.params.gps_ctrl, 4) ~= 0
+                        obj.ekf.fuseVioVel(vs.vel_ned);
+                    end
+                    obj.last_vio_t = vs.t;
                 end
-                obj.last_gps_t = gps.t;
+            else
+                gps = obj.sensors.vehicleGpsPosition();
+                if ~isempty(gps) && isfield(gps, 't') && gps.t > obj.last_gps_t ...
+                        && bitand(obj.params.gps_ctrl, 1) ~= 0
+                    obj.ekf.fuseGnssPos(gps);
+                    if bitand(obj.params.gps_ctrl, 4) ~= 0
+                        obj.ekf.fuseGnssVel(gps);
+                    end
+                    obj.last_gps_t = gps.t;
+                end
             end
 
             mag = obj.sensors.vehicleMagnetometer();
@@ -90,6 +111,24 @@ classdef EstimatorBus < handle
             end
         end
 
+        function setVio(obj, sample)
+            % Push the latest NED-aligned VIO measurement (consumed by step()
+            % on the next IMU tick while vio_enabled). sample fields:
+            % pos_ned (3x1), vel_ned (3x1 or []), t (sim seconds).
+            obj.vio_sample = sample;
+        end
+
+        function enableVio(obj, tf)
+            % Switch the pos/vel aiding source: true = VIO, false = GNSS.
+            obj.vio_enabled = logical(tf);
+            if ~obj.vio_enabled
+                obj.vio_sample = [];
+                obj.last_vio_t = -inf;
+            end
+            % Re-arm GNSS staleness so it resumes cleanly when VIO turns off.
+            obj.last_gps_t = -inf;
+        end
+
         function s = stateOut(obj)
             % Controller-facing state — output predictor's corrected state,
             % with gyro reading approximated from latest IMU minus EKF bias.
@@ -111,6 +150,9 @@ classdef EstimatorBus < handle
             obj.last_baro_t = -inf;
             obj.last_mag_t  = -inf;
             obj.last_gps_t  = -inf;
+            obj.vio_enabled = false;
+            obj.vio_sample  = [];
+            obj.last_vio_t  = -inf;
         end
     end
 end

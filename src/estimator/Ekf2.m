@@ -275,6 +275,59 @@ classdef Ekf2 < handle
         end
 
         % ============================================================
+        % External-vision (VIO) position fusion (3-axis, NED).
+        % Same sequential per-axis Kalman update as fuseGnssPos, but the
+        % measurement `z_ned` is already in the EKF NED frame -- the caller
+        % anchors the OpenVINS `global` frame to the EKF state when the VIO
+        % aid is enabled (yaw+origin are otherwise unobservable). Noise from
+        % EKF2_EVP_NOISE, gate from EKF2_EVP_GATE (params_external_vision.yaml).
+        % ============================================================
+        function out = fuseVioPos(obj, z_ned)
+            out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
+            if isempty(z_ned), return; end
+
+            R_pos = (obj.params.ev_p_noise^2) * eye(3);
+            for axis = 1:3
+                innov = z_ned(axis) - obj.pos(axis);
+                H = zeros(1, obj.N_ERR);
+                H(obj.IDX_POS(axis)) = 1.0;
+                S = H * obj.P * H' + R_pos(axis, axis);
+                tr = innov^2 / (S * obj.params.ev_pos_gate^2);
+                out.innov(axis)      = innov;
+                out.test_ratio(axis) = tr;
+                if tr <= 1.0
+                    obj.applyKalmanUpdate(H, innov, S, R_pos(axis, axis));
+                end
+            end
+            out.fused = true;
+        end
+
+        % ============================================================
+        % External-vision (VIO) velocity fusion (3-axis, NED).
+        % `v_ned` must already be rotated into the EKF NED frame by the
+        % caller. Noise EKF2_EVV_NOISE, gate EKF2_EVV_GATE.
+        % ============================================================
+        function out = fuseVioVel(obj, v_ned)
+            out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
+            if isempty(v_ned), return; end
+
+            R_vel = (obj.params.ev_v_noise^2) * eye(3);
+            for axis = 1:3
+                innov = v_ned(axis) - obj.vel(axis);
+                H = zeros(1, obj.N_ERR);
+                H(obj.IDX_VEL(axis)) = 1.0;
+                S = H * obj.P * H' + R_vel(axis, axis);
+                tr = innov^2 / (S * obj.params.ev_vel_gate^2);
+                out.innov(axis)      = innov;
+                out.test_ratio(axis) = tr;
+                if tr <= 1.0
+                    obj.applyKalmanUpdate(H, innov, S, R_vel(axis, axis));
+                end
+            end
+            out.fused = true;
+        end
+
+        % ============================================================
         % Mag 3D fusion — sequential per-axis update
         % mag_fusion.cpp:53-141
         % ============================================================

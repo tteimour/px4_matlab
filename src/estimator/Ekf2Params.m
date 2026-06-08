@@ -41,6 +41,14 @@ function p = Ekf2Params()
     p.req_sacc         = 0.5;
     p.req_nsats        = 6;
 
+    % --- External vision / VIO (params_external_vision.yaml) ---
+    % Used when the VIO-tab "Fuse VIO -> EKF" toggle replaces GNSS with
+    % OpenVINS odometry as the position/velocity aiding source.
+    p.ev_p_noise       = 0.1;        % m    (EKF2_EVP_NOISE default)
+    p.ev_v_noise       = 0.1;        % m/s  (EKF2_EVV_NOISE default)
+    p.ev_pos_gate      = 5.0;        % STD  (EKF2_EVP_GATE default)
+    p.ev_vel_gate      = 3.0;        % STD  (EKF2_EVV_GATE default)
+
     % --- Wind ---
     p.wind_nsd         = 1.0e-1;     % m/s/sqrt(s) wind process noise
 
