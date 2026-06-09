@@ -23,7 +23,10 @@ classdef ImuADIS16470 < ImuSensor
 
     methods
         function obj = ImuADIS16470(priority, instance, earth)
-            if nargin < 1 || isempty(priority), priority = 90; end  % highest
+            if nargin < 1 || isempty(priority), priority = 75; end  % backup (was 90/primary;
+                                                                     % ICM-45686 is now primary so
+                                                                     % the EKF+VIO use a realistic
+                                                                     % MEMS IMU, not tactical ADIS)
             if nargin < 2 || isempty(instance), instance = 2;  end
 
             rate_hz   = 1000;

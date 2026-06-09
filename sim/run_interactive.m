@@ -81,9 +81,9 @@ mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
                 'mission', 'rtl', 'land', 'takeoff'};
 default_mode_idx = 3;             % start in Position
 
-% Global bottom bar: flight-mode buttons + Set Home / Reset / Stop, usable
-% from any tab. The sim loop polls mode_bg's SelectedObject as before.
-mode_bg = buildModeBar(fig, mode_strings);
+% Global bottom bar: flight-mode buttons + Arm / Set Home / Reset / Stop,
+% usable from any tab. The sim loop polls mode_bg's SelectedObject as before.
+[mode_bg, arm_btn] = buildModeBar(fig, mode_strings);
 
 % =====================================================================
 % Manual control lives in a SEPARATE floating window (ctrl_fig) so you can
@@ -124,6 +124,18 @@ att_ctl  = AttitudeController(p);
 rate_ctl = RateController(p);
 alloc    = ControlAllocator(p);
 fmm      = FlightModeManager(p);
+
+% --- Arming + smooth takeoff (PX4 commander / mc_pos_control Takeoff) ---
+% The vehicle spawns DISARMED: motors stay stopped and the position
+% controller is held in reset until the pilot arms (ARM button, or
+% auto-arm on a Takeoff command). Thrust then ramps over MPC_TKO_RAMP_T
+% (Takeoff.cpp; MulticopterPositionControl.cpp:496-531).
+tko = TakeoffHandling(p);
+armed         = false;
+was_airborne  = false;  % true once actually flying; enables auto-disarm
+landed_latch  = true;   % landed state from the previous substep
+landed_since  = -1;     % t_sim when post-flight landing was first seen
+prev_armed_ui = [];     % ARM button / pill restyle guard
 
 % Lead-compensator pre-filters (non-PX4 augmentation; see p.lead.*).
 % Each filter is reset on Reset and on every mode change so that
@@ -166,7 +178,7 @@ fuse_cb = vio_ui.fuse_cb;             % "Fuse VIO -> EKF (replace GPS)" toggle
 % drop waypoints, set per-waypoint altitude. Writes the same `waypoints`
 % array (via map_add_request / alt_edit_request) the cockpit editor uses.
 % Also hosts the attitude/heading instruments (pfd), updated per frame.
-mission_map = buildMissionTab(tab_mission, fig);
+mission_map = buildMissionTab(tab_mission, fig, fmm);
 mission_map.mode_bg = mode_bg;       % setModeButton() selects + restyles via this
 state_lbl = mission_map.state_lbl;   % live telemetry text on the Flight tab
 pfd = mission_map.pfd;               % attitude indicator + heading tape updater
@@ -269,6 +281,7 @@ setappdata(fig, 'reset_request', false);
 setappdata(fig, 'clear_request', false);
 setappdata(fig, 'pop_request', false);
 setappdata(fig, 'set_home_request', false);
+setappdata(fig, 'arm_request', false);
 setappdata(fig, 'autotune_request', false);
 setappdata(fig, 'map_add_request', []);         % [N E D] from a Mission-map click
 setappdata(fig, 'alt_edit_request', []);        % [row alt_m] from the Mission table
@@ -279,6 +292,7 @@ sticks = struct('left_x', 0, 'left_y', 0, 'right_x', 0, 'right_y', 0);
 
 k     = 0;
 t_sim = 0;
+ui_tick = 0;           % strip/readout refresh decimation (every 2nd frame)
 vio_ui_tick = 0;       % throttles the (heavy) VIO image decode so joysticks stay snappy
 cesium_bridge  = [];   % lazily created when the Cesium toggle is first enabled
 imu_bridge     = [];   % lazily created with cesium_bridge; streams IMU to OpenVINS
@@ -354,6 +368,8 @@ while ishandle(fig) && getappdata(fig, 'running')
         log_idx = 0;
         fmm.setHome([0; 0; 0]);
         fmm.setMode(prev_mode, plant.state());
+        armed = false; was_airborne = false; landed_since = -1;
+        landed_latch = true; tko.reset();
         setappdata(fig, 'reset_request', false);
     end
 
@@ -361,6 +377,18 @@ while ishandle(fig) && getappdata(fig, 'running')
     if getappdata(fig, 'set_home_request')
         fmm.setHome(plant.pos_ned);
         setappdata(fig, 'set_home_request', false);
+    end
+
+    % --- Arm / Disarm toggle (bottom-bar button) ---
+    if getappdata(fig, 'arm_request')
+        setappdata(fig, 'arm_request', false);
+        armed = ~armed;
+        if armed
+            was_airborne = false; landed_since = -1;
+            fprintf('ARMED (spoolup %.1f s).\n', p.com.spoolup_time);
+        else
+            fprintf('DISARMED.\n');
+        end
     end
 
     % --- Autotune start/cancel (preconditions enforced here) ---
@@ -461,9 +489,15 @@ while ishandle(fig) && getappdata(fig, 'running')
     else,                     new_mode = get(sel_mode_btn, 'Tag'); end
     if ~strcmp(new_mode, prev_mode)
         fmm.setMode(new_mode, plant.state());
-        % Takeoff pins home to the takeoff point so RTL returns here.
+        % Takeoff pins home to the takeoff point so RTL returns here, and
+        % auto-arms (QGC sends an arm with the takeoff command).
         if strcmp(new_mode, 'takeoff')
             fmm.setHome(plant.pos_ned);
+            if ~armed
+                armed = true; was_airborne = false; landed_since = -1;
+                fprintf('Auto-armed by Takeoff (spoolup %.1f s).\n', ...
+                        p.com.spoolup_time);
+            end
         end
         pos_ctl.reset();
         rate_ctl.reset();
@@ -540,6 +574,43 @@ while ishandle(fig) && getappdata(fig, 'running')
                 att_lead.reset();
             end
 
+            % --- Smooth-takeoff state machine -------------------------------
+            % PX4 Takeoff.cpp + MulticopterPositionControl.cpp:463-531: the
+            % vehicle produces zero thrust until armed + spooled up + a climb
+            % is wanted; then the upward-speed limit ramps from the zero-
+            % thrust value to the configured climb limit over MPC_TKO_RAMP_T.
+            if strcmp(cmd.kind, 'position')
+                climb_cmd = (isfinite(cmd.pos_sp(3)) && ...
+                             cmd.pos_sp(3) < s.position_ned(3) - 0.1) || ...
+                            (~isempty(cmd.vel_sp_ff) && ...
+                             isfinite(cmd.vel_sp_ff(3)) && cmd.vel_sp_ff(3) < -0.05);
+            else
+                climb_cmd = sticks.left_y > 0.05;   % manual throttle raised
+            end
+            want_takeoff = armed && climb_cmd;
+            tko.generateInitialRampValue(pos_ctl.gain_vel_p(3));
+            tko.updateTakeoffState(armed, landed_latch, want_takeoff, dt_pos);
+            flying = tko.state >= TakeoffHandling.FLIGHT;
+            speed_up = tko.updateRamp(dt_pos, pos_ctl.lim_vel_up);
+            if flying
+                pos_ctl.setRuntimeLimits(speed_up, [], []);
+            else
+                % zero minimum thrust + landing tilt limit until airborne
+                % (MulticopterPositionControl.cpp:519-530)
+                pos_ctl.setRuntimeLimits(speed_up, 0.0, p.pos.tilt_max_lnd);
+            end
+            if tko.state < TakeoffHandling.RAMPUP
+                % Not flying yet: empty trajectory setpoint with a high
+                % downward acceleration so thrust is exactly zero, and the
+                % position-loop integrator held in reset
+                % (MulticopterPositionControl.cpp:509-517).
+                pos_ctl.reset();
+                cmd.kind      = 'position';
+                cmd.pos_sp    = nan(3, 1);
+                cmd.vel_sp_ff = nan(3, 1);
+                cmd.acc_sp_ff = [0; 0; 100];
+            end
+
             if strcmp(cmd.kind, 'attitude')
                 q_sp          = cmd.q_sp;
                 thrust_body_z = cmd.thrust_body_z;
@@ -588,16 +659,28 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
         rate_sp_cmd = rate_sp + inj;
 
-        % Landed: ground + slow + commanded altitude target near ground.
+        % Landed: ground + slow + commanded altitude target near ground (or
+        % pre-takeoff, where motors are stopped by construction).
         % Use ground truth so estimator noise doesn't cause hover flapping.
         landed = (s_truth.position_ned(3) > -0.05) && ...
                  (norm(s_truth.velocity_ned) < 0.3) && ...
-                 (cmd.pos_sp(3) > -0.10);
+                 ((isfinite(cmd.pos_sp(3)) && cmd.pos_sp(3) > -0.10) || ...
+                  tko.state < TakeoffHandling.RAMPUP);
+        landed_latch = landed;
+        if ~landed, was_airborne = true; end
         torque = rate_ctl.update(s.angular_vel_b, rate_sp_cmd, [0;0;0], dt_rate, landed);
         T_mag  = max(0, -thrust_body_z);
         [m, sat_pos, sat_neg] = alloc.allocate(torque, T_mag);
         rate_ctl.setSaturationStatus(sat_pos, sat_neg);
         m_last = m;
+
+        % Motors stopped while disarmed / spooling / waiting for takeoff
+        % (PX4: actuators disarmed below RAMPUP; ControlAllocator.cpp:
+        % 336-374, MulticopterPositionControl.cpp:530).
+        if tko.state < TakeoffHandling.RAMPUP
+            m = zeros(4, 1);
+            m_last = m;
+        end
 
         % Feed the tuner the torque it produced + a modeled (noisy) gyro;
         % a roll/pitch stick deflection aborts the run inside step().
@@ -624,6 +707,30 @@ while ishandle(fig) && getappdata(fig, 'running')
         % the actual render so this stays cheap.
         if mod(i, 4) == 0
             drawnow limitrate;
+        end
+    end
+
+    % --- Flight phase to the estimator + auto-disarm after landing -------
+    % in_air gates mag-3D tilt updates and gravity-fusion at-rest handling
+    % (PX4 commander/land detector -> ekf2 control flags). COM_DISARM_LAND
+    % auto-disarms a few seconds after a post-flight landing.
+    est_bus.setInAir(~landed_latch);
+    if armed && was_airborne && landed_latch
+        if landed_since < 0, landed_since = t_sim; end
+        if t_sim - landed_since > p.com.disarm_land
+            armed = false; was_airborne = false; landed_since = -1;
+            fprintf('Auto-disarmed %.1f s after landing (COM_DISARM_LAND).\n', ...
+                    p.com.disarm_land);
+        end
+    else
+        landed_since = -1;
+    end
+    if ~isequal(prev_armed_ui, armed)
+        prev_armed_ui = armed;
+        if armed
+            set(arm_btn, 'String', 'DISARM', 'ForegroundColor', T.warn);
+        else
+            set(arm_btn, 'String', 'ARM', 'ForegroundColor', T.good);
         end
     end
 
@@ -655,10 +762,14 @@ while ishandle(fig) && getappdata(fig, 'running')
     set(at_status_lbl, 'String', ['autotune: ' autotune_status]);
 
     % --- State for the readout + bridges (no in-GUI 3D view; Unity renders) ---
+    % The strip and instruments display the CONTROLLER-FEED state (the
+    % vehicle's own estimate when the EKF feed is on) — what a real GCS
+    % telemeters. The Cesium/Unity bridge keeps publishing ground truth.
+    s_disp = s;                       % last substep's controller-feed state
     s = plant.state();
-    eN = s.position_ned(1);
-    eE = s.position_ned(2);
-    eU = max(0, -s.position_ned(3));
+    eN = s_disp.position_ned(1);
+    eE = s_disp.position_ned(2);
+    eU = max(0, -s_disp.position_ned(3));
     eN_sp = cmd.pos_sp(1); eE_sp = cmd.pos_sp(2); eU_sp = -cmd.pos_sp(3);
 
     % --- Stream pose to Cesium/Unity (opt-in via the Cesium tab) ----------
@@ -887,7 +998,8 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
-    rpy    = quat_to_euler(s.attitude_q);
+    rpy    = quat_to_euler(s.attitude_q);        % ground truth (for logging)
+    rpy_d  = quat_to_euler(s_disp.attitude_q);   % displayed (estimate feed)
     rpy_sp = quat_to_euler(q_sp);
 
     t_sim = t_sim + dt_frame;
@@ -945,21 +1057,27 @@ while ishandle(fig) && getappdata(fig, 'running')
     end
 
     % --- Telemetry strip + instruments + Flight-tab readout ---------------
-    vs  = -s.velocity_ned(3);                 % climb rate, +up
-    gs  = norm(s.velocity_ned(1:2));          % ground speed
-    hdg = mod(rad2deg(rpy(3)), 360);
-    updateStatusStrip(strip, prev_mode, eU, vs, gs, hdg, eN, eE, t_sim, ...
-                      use_est, fuse_on, vio_logging, stream_on);
-    pfd.update(rpy(1), rpy(2), hdg);
-
-    set(state_lbl, 'String', sprintf( ...
-        ['TGT    N %+7.2f   E %+7.2f   ALT %6.2f\n' ...
-         'YAW    %+6.1f deg     CMD %+6.1f deg\n' ...
-         'STICKS L %+5.2f %+5.2f   R %+5.2f %+5.2f\n' ...
-         'TUNE   %s'], ...
-        eN_sp, eE_sp, eU_sp, rad2deg(rpy(3)), rad2deg(cmd.yaw_sp), ...
-        sticks.left_x, sticks.left_y, sticks.right_x, sticks.right_y, ...
-        autotune_status));
+    % The attitude instruments refresh every frame (cheap line/transform
+    % updates); the uicontrol text strip refreshes at half rate to keep the
+    % loop light (uicontrol String sets are the expensive part).
+    hdg = mod(rad2deg(rpy_d(3)), 360);
+    pfd.update(rpy_d(1), rpy_d(2), hdg);
+    ui_tick = ui_tick + 1;
+    if mod(ui_tick, 2) == 0
+        vs  = -s_disp.velocity_ned(3);            % climb rate, +up
+        gs  = norm(s_disp.velocity_ned(1:2));     % ground speed
+        updateStatusStrip(strip, prev_mode, eU, vs, gs, hdg, eN, eE, t_sim, ...
+                          armed, use_est, fuse_on, vio_logging, stream_on);
+        set(state_lbl, 'String', sprintf( ...
+            ['TGT    N %s   E %s   ALT %s\n' ...
+             'YAW    %+6.1f deg     CMD %+6.1f deg\n' ...
+             'STICKS L %+5.2f %+5.2f   R %+5.2f %+5.2f\n' ...
+             'TUNE   %s'], ...
+            n2s(eN_sp, '%+7.2f'), n2s(eE_sp, '%+7.2f'), n2s(eU_sp, '%6.2f'), ...
+            rad2deg(rpy_d(3)), rad2deg(cmd.yaw_sp), ...
+            sticks.left_x, sticks.left_y, sticks.right_x, sticks.right_y, ...
+            autotune_status));
+    end
 
     drawnow limitrate;
 
@@ -1801,7 +1919,7 @@ end
 % lon0), half-extent, basemap image, and label handles live in appdata on
 % the axes (mm is a value struct).
 % =========================================================================
-function mm = buildMissionTab(parent, fig)
+function mm = buildMissionTab(parent, fig, fmm)
 T = gcsTheme();
 lat0 = 40.32214266903304;   % Cesium origin (Baku), verified from Quba.unity
 lon0 = 49.59745;
@@ -1878,33 +1996,46 @@ plan_pan = uipanel(parent, 'Units', 'normalized', ...
     'Title', ' MISSION PLAN ', 'FontWeight', 'bold', 'FontSize', 8);
 
 uicontrol(plan_pan, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.04 0.860 0.58 0.105], 'ForegroundColor', T.sub, ...
+    'Position', [0.04 0.870 0.58 0.100], 'ForegroundColor', T.sub, ...
     'HorizontalAlignment', 'left', 'FontSize', 8, ...
     'String', 'NEXT WAYPOINT ALTITUDE (m, +up)');
 altEdit = uicontrol(plan_pan, 'Style', 'edit', 'Units', 'normalized', ...
-    'Position', [0.66 0.855 0.30 0.125], 'String', '10', ...
+    'Position', [0.66 0.865 0.30 0.115], 'String', '10', ...
     'BackgroundColor', T.field, 'ForegroundColor', T.text, ...
     'FontName', T.mono, 'FontWeight', 'bold');
 
+% Takeoff target altitude (MIS_TAKEOFF_ALT role): applied to the next
+% Takeoff command; the auto-transition to Hold happens at this height.
+uicontrol(plan_pan, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.04 0.745 0.58 0.100], 'ForegroundColor', T.sub, ...
+    'HorizontalAlignment', 'left', 'FontSize', 8, ...
+    'String', 'TAKEOFF ALTITUDE (m, +up)');
+uicontrol(plan_pan, 'Style', 'edit', 'Units', 'normalized', ...
+    'Position', [0.66 0.740 0.30 0.115], ...
+    'String', num2str(fmm.p.auto.takeoff_alt), ...
+    'BackgroundColor', T.field, 'ForegroundColor', T.text, ...
+    'FontName', T.mono, 'FontWeight', 'bold', ...
+    'Callback', @(src, ~) onTakeoffAltEdit(src, fmm));
+
 uicontrol(plan_pan, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.04 0.690 0.45 0.135], 'String', 'LOAD .PLAN', ...
+    'Position', [0.04 0.595 0.45 0.125], 'String', 'LOAD .PLAN', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, ...
     'Callback', @(~,~) onLoadPlan(fig));
 uicontrol(plan_pan, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.51 0.690 0.45 0.135], 'String', 'SAVE .PLAN', ...
+    'Position', [0.51 0.595 0.45 0.125], 'String', 'SAVE .PLAN', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, ...
     'Callback', @(~,~) setappdata(fig, 'save_plan_request', true));
 uicontrol(plan_pan, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.04 0.535 0.45 0.135], 'String', 'REMOVE LAST', ...
+    'Position', [0.04 0.455 0.45 0.125], 'String', 'REMOVE LAST', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, ...
     'Callback', @(~,~) setappdata(fig, 'pop_request', true));
 uicontrol(plan_pan, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.51 0.535 0.45 0.135], 'String', 'CLEAR ALL', ...
+    'Position', [0.51 0.455 0.45 0.125], 'String', 'CLEAR ALL', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, 'ForegroundColor', T.warn, ...
     'Callback', @(~,~) setappdata(fig, 'clear_request', true));
 
 tbl = uitable('Parent', plan_pan, 'Units', 'normalized', ...
-    'Position', [0.04 0.030 0.92 0.470], ...
+    'Position', [0.04 0.030 0.92 0.400], ...
     'ColumnName', {'N (m)', 'E (m)', 'Alt (m)'}, ...
     'ColumnEditable', [false false true], ...
     'ColumnWidth', {70 70 70}, 'RowName', 'numbered', ...
@@ -2088,13 +2219,14 @@ for i = 1:numel(caps)
     S.(flds{i}) = stripVal(pan, x, w - 0.004, T.text, 13);
 end
 
-S.p_ekf  = makePill(pan, 0.692);
-S.p_gps  = makePill(pan, 0.753);
-S.p_vio  = makePill(pan, 0.814);
-S.p_link = makePill(pan, 0.875);
+S.p_arm  = makePill(pan, 0.670);
+S.p_ekf  = makePill(pan, 0.724);
+S.p_gps  = makePill(pan, 0.778);
+S.p_vio  = makePill(pan, 0.832);
+S.p_link = makePill(pan, 0.886);
 
-stripCap(pan, 0.938, 0.058, 'MISSION TIME');
-S.clock = stripVal(pan, 0.938, 0.058, T.text, 13);
+stripCap(pan, 0.942, 0.055, 'MISSION TIME');
+S.clock = stripVal(pan, 0.942, 0.055, T.text, 13);
 end
 
 % Small caption above a strip value.
@@ -2119,14 +2251,14 @@ end
 function h = makePill(pan, x)
 T = gcsTheme();
 h = uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [x 0.28 0.056 0.44], 'BackgroundColor', T.panel, ...
+    'Position', [x 0.28 0.050 0.44], 'BackgroundColor', T.panel, ...
     'ForegroundColor', T.sub, 'FontSize', 8, 'FontWeight', 'bold', ...
     'String', '--');
 end
 
 % Per-frame strip refresh (called from the sim loop).
 function updateStatusStrip(S, mode, alt, vs, gs, hdg, N, E, t, ...
-                           use_est, fuse_on, vio_on, link_on)
+                           armed, use_est, fuse_on, vio_on, link_on)
 set(S.mode, 'String', upper(mode));
 set(S.alt, 'String', sprintf('%7.1f', alt));
 set(S.vs,  'String', sprintf('%+7.1f', vs));
@@ -2135,6 +2267,8 @@ set(S.hdg, 'String', sprintf('%03.0f', hdg));
 set(S.n,   'String', sprintf('%+8.1f', N));
 set(S.e,   'String', sprintf('%+8.1f', E));
 set(S.clock, 'String', sprintf('T+%02d:%02d', floor(t/60), floor(mod(t, 60))));
+if armed, setPill(S.p_arm, 'ARMED', 'bad');
+else,     setPill(S.p_arm, 'DISARMED', 'off'); end
 if use_est, setPill(S.p_ekf, 'EKF', 'good');
 else,       setPill(S.p_ekf, 'GT FEED', 'warn'); end
 if fuse_on, setPill(S.p_gps, 'GPS SUSP', 'warn');
@@ -2153,10 +2287,21 @@ T = gcsTheme();
 switch lvl
     case 'good', fg = T.good; bgc = T.goodbg;
     case 'warn', fg = T.warn; bgc = T.warnbg;
+    case 'bad',  fg = T.bad;  bgc = T.badbg;
     case 'nav',  fg = T.nav;  bgc = T.navbg;
     otherwise,   fg = T.sub;  bgc = T.panel;
 end
 set(h, 'String', str, 'ForegroundColor', fg, 'BackgroundColor', bgc);
+end
+
+% NaN-tolerant numeric formatting for setpoint readouts ('--' when the
+% axis has no position setpoint, e.g. velocity-only manual control).
+function s = n2s(v, fmt)
+if isfinite(v)
+    s = sprintf(fmt, v);
+else
+    s = '    -- ';
+end
 end
 
 
@@ -2165,7 +2310,7 @@ end
 % "engaged" color) + Set Home / Reset / Stop. Lives outside the tab group
 % so the pilot can change modes and stop from any tab.
 % =========================================================================
-function mode_bg = buildModeBar(fig, modes)
+function [mode_bg, arm_btn] = buildModeBar(fig, modes)
 T = gcsTheme();
 bar = uipanel(fig, 'Units', 'normalized', 'Position', [0 0 1 0.088], ...
     'BackgroundColor', T.bg, 'BorderType', 'line', 'HighlightColor', T.edge);
@@ -2187,16 +2332,21 @@ posBtn = findobj(mode_bg, 'Tag', 'position');   % default = Position
 if ~isempty(posBtn), set(mode_bg, 'SelectedObject', posBtn(1)); end
 restyleModeButtons(mode_bg);
 
+arm_btn = uicontrol(bar, 'Style', 'pushbutton', 'Units', 'normalized', ...
+    'Position', [0.640 0.14 0.072 0.72], 'String', 'ARM', ...
+    'FontWeight', 'bold', 'FontSize', 10, ...
+    'BackgroundColor', T.btn, 'ForegroundColor', T.good, ...
+    'Callback', @(~,~) setappdata(fig, 'arm_request', true));
 uicontrol(bar, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.648 0.14 0.085 0.72], 'String', 'SET HOME', ...
+    'Position', [0.720 0.14 0.082 0.72], 'String', 'SET HOME', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, ...
     'Callback', @(~,~) setappdata(fig, 'set_home_request', true));
 uicontrol(bar, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.790 0.14 0.095 0.72], 'String', 'RESET', ...
+    'Position', [0.810 0.14 0.082 0.72], 'String', 'RESET', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, 'ForegroundColor', T.warn, ...
     'Callback', @(~,~) setappdata(fig, 'reset_request', true));
 uicontrol(bar, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.893 0.14 0.101 0.72], 'String', 'STOP', ...
+    'Position', [0.900 0.14 0.094 0.72], 'String', 'STOP', ...
     'FontWeight', 'bold', 'FontSize', 10, ...
     'BackgroundColor', T.badbg, 'ForegroundColor', T.bad, ...
     'Callback', @(~,~) setappdata(fig, 'running', false));
@@ -2386,6 +2536,17 @@ if abs(E) > HALF || abs(N) > HALF, return; end   % ignore clicks outside box
 alt = str2double(get(altEdit, 'String'));
 if ~isfinite(alt), alt = 10; end
 setappdata(fig, 'map_add_request', [N, E, -alt]);   % NED, D = -altitude
+end
+
+% Takeoff-altitude edit: write straight onto the live FlightModeManager
+% params (used by the next Takeoff command). Invalid input reverts.
+function onTakeoffAltEdit(src, fmm)
+v = str2double(get(src, 'String'));
+if isfinite(v) && v >= 1 && v <= 500
+    fmm.p.auto.takeoff_alt = v;
+else
+    set(src, 'String', num2str(fmm.p.auto.takeoff_alt));
+end
 end
 
 % Table Alt-column edit -> stash a [row alt_m] request for the sim loop.

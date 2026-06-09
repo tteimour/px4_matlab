@@ -96,6 +96,16 @@ classdef Sensor < handle
             tf = obj.new_sample_;
         end
 
+        function tn = nextEventTime(obj)
+            % Earliest future time this sensor will generate or release a
+            % sample. Lets the voter skip whole group steps between events
+            % (the sim substep rate is much higher than slow-sensor ODRs).
+            tn = obj.next_sample_t_;
+            if ~isempty(obj.queue_publish_t_)
+                tn = min(tn, obj.queue_publish_t_(1));
+            end
+        end
+
         function s = latest(obj)
             s = obj.latest_;
         end

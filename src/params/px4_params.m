@@ -76,8 +76,19 @@ p.pos.vel_xy_max  = 12.0;
 p.pos.vel_z_up    = 3.0;
 p.pos.vel_z_down  = 1.5;
 
-% Tilt limit (rad). MPC_TILTMAX_AIR = 45 deg.
-p.pos.tilt_max = deg2rad(45);
+% Tilt limit (rad). MPC_TILTMAX_AIR = 45 deg. MPC_TILTMAX_LND = 12 deg
+% applies until the takeoff ramp completes
+% (multicopter_position_control_limits_params.c:110,
+%  MulticopterPositionControl.cpp:519-523).
+p.pos.tilt_max     = deg2rad(45);
+p.pos.tilt_max_lnd = deg2rad(12);
+
+% Velocity-derivative low-pass for the velocity-loop D term. MPC_VELD_LP
+% (multicopter_position_control_params.c:132, default 5 Hz); applied to
+% (vel - vel_prev)/dt in MulticopterPositionControl.cpp:341,361. The
+% velocity pre-filter MPC_VEL_LP and notch MPC_VEL_NF_FRQ default to 0
+% (off) and are not replicated.
+p.pos.veld_lp = 5.0;
 
 % Thrust limits/hover. MPC_THR_HOVER, MPC_THR_MIN, MPC_THR_MAX.
 p.pos.thr_hover = 0.5;
@@ -132,9 +143,21 @@ p.auto.land_crawl    = 0.3;         % MPC_LAND_CRWL (slow descent near ground)
 p.auto.land_alt1     = 5.0;         % MPC_LAND_ALT1: above this, land_speed
 p.auto.land_alt3     = 1.0;         % MPC_LAND_ALT3: below this, land_crawl
 p.auto.takeoff_speed = 1.5;         % MPC_TKO_SPEED
-p.auto.takeoff_alt   = 5.0;         % MIS_TAKEOFF_ALT (m above ground)
+p.auto.takeoff_alt   = 10.0;        % default takeoff altitude (m above ground),
+                                    % user-chosen sim default; adjustable in the
+                                    % GUI. (PX4 MIS_TAKEOFF_ALT default is 2.5 m,
+                                    % navigator/mission_params.c:58.)
+p.auto.tko_ramp_t    = 3.0;         % MPC_TKO_RAMP_T (s), takeoff thrust ramp
+                                    % (multicopter_takeoff_land_params.c:46)
 p.auto.rtl_alt       = 15.0;        % RTL_ALT (m above ground)
 p.auto.land_alt_ground = 0.10;      % altitude below which we treat as landed
+
+% =====================================================================
+% Commander (arming / disarm timing).
+% Source: src/modules/commander/commander_params.c
+% =====================================================================
+p.com.spoolup_time = 1.0;           % COM_SPOOLUP_TIME (s), commander_params.c:851
+p.com.disarm_land  = 2.0;           % COM_DISARM_LAND (s), commander_params.c:209
 
 % =====================================================================
 % Wind disturbance (NON-PX4 addition).

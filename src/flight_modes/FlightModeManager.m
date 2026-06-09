@@ -221,7 +221,11 @@ classdef FlightModeManager < handle
                   sin(obj.yaw_lock),  cos(obj.yaw_lock)];
             v_xy_ned = R2 * vbody;                          % NED x=N, y=E
 
-            % XY position lock (FlightTaskManualPosition.cpp:107-108).
+            % XY position lock (FlightTaskManualPosition.cpp:100-123,
+            % _updateXYlock): latch the setpoint once braked + stopped;
+            % while the stick commands velocity the position setpoint is
+            % NaN, so the position loop is fully disengaged on that axis
+            % (velocity-only control) instead of chasing a moving latch.
             if abs(sx) < obj.p.man.deadzone && abs(sy) < obj.p.man.deadzone && ...
                norm(state.velocity_ned(1:2)) < obj.p.man.hold_max_xy
                 if ~obj.xy_locked
@@ -229,8 +233,7 @@ classdef FlightModeManager < handle
                     obj.xy_locked = true;
                 end
             else
-                obj.xy_locked      = false;
-                obj.pos_lock(1:2)  = state.position_ned(1:2);  % no XY pos error
+                obj.xy_locked = false;
             end
 
             % Z velocity FF (same logic as Altitude).
@@ -240,7 +243,7 @@ classdef FlightModeManager < handle
                 vel_z_ff = -sthr * obj.p.pos.vel_z_down;
             end
 
-            % Z lock identical to Altitude.
+            % Z lock identical to Altitude (NaN setpoint while commanding).
             if abs(sthr) < obj.p.man.deadzone && ...
                abs(state.velocity_ned(3)) < obj.p.man.hold_max_z
                 if ~obj.z_locked
@@ -248,17 +251,22 @@ classdef FlightModeManager < handle
                     obj.z_locked = true;
                 end
             else
-                obj.z_locked    = false;
-                obj.pos_lock(3) = state.position_ned(3);
+                obj.z_locked = false;
             end
 
-            % Build command. vel_sp_ff is given on axes that are NOT locked.
+            % Build command. vel_sp_ff drives axes that are NOT locked;
+            % locked axes get the latched position setpoint, unlocked axes
+            % get NaN (no position control, velocity-only — PX4
+            % FlightTaskManualPosition.cpp:120-122).
             vel_sp_ff = nan(3, 1);
-            if ~obj.xy_locked, vel_sp_ff(1:2) = v_xy_ned; end
-            if ~obj.z_locked,  vel_sp_ff(3)   = vel_z_ff; end
+            pos_sp    = nan(3, 1);
+            if obj.xy_locked, pos_sp(1:2) = obj.pos_lock(1:2);
+            else,             vel_sp_ff(1:2) = v_xy_ned; end
+            if obj.z_locked,  pos_sp(3) = obj.pos_lock(3);
+            else,             vel_sp_ff(3) = vel_z_ff; end
 
             cmd.kind        = 'position';
-            cmd.pos_sp      = obj.pos_lock;
+            cmd.pos_sp      = pos_sp;
             cmd.vel_sp_ff   = vel_sp_ff;
             cmd.acc_sp_ff   = [];
             cmd.yaw_sp      = obj.yaw_lock;
@@ -380,7 +388,10 @@ classdef FlightModeManager < handle
             if abs(state.position_ned(3) - target_z) < obj.p.nav.alt_acc_rad
                 obj.takeoff_complete = true;
                 obj.mode = 'hold';
-                obj.pos_lock = state.position_ned;
+                % Loiter at the TAKEOFF TARGET, not where the acceptance
+                % radius triggered (PX4 navigator keeps the takeoff item's
+                % position/altitude as the loiter setpoint).
+                obj.pos_lock = [target_xy; target_z];
             end
         end
 

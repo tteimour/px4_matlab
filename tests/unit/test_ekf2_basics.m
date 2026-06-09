@@ -8,10 +8,21 @@ earth  = EarthModel(0, 0, 0);
 params = Ekf2Params();
 ekf    = Ekf2(params, earth);
 
-%% Case 1: Zero-input predict over 1 ms preserves state (apart from process noise).
-imu = make_imu_sample(0.001, [0;0;0], [0;0;-9.80665*0.001]);
-imu.t = 0.001;
-ekf.predict(imu);
+%% Case 1: Zero-input predict over one EKF window preserves state.
+% The raw 1 kHz IMU stream is downsampled into EKF2_PREDICT_US (10 ms)
+% windows (imu_down_sampler.cpp); predict() returns true only when a
+% window completes and the EKF actually stepped.
+n_win = round(params.predict_us * 1e-6 / 0.001);   % samples per window
+for k = 1:n_win
+    imu = make_imu_sample(0.001, [0;0;0], [0;0;-9.80665*0.001]);
+    imu.t = k * 0.001;
+    upd = ekf.predict(imu);
+    if k < n_win
+        assert(~upd, 'No EKF update before the downsample window completes');
+    else
+        assert(upd, 'EKF update fires when the window completes');
+    end
+end
 assert(norm(ekf.pos) < 1e-6, 'Position drift zero with gravity-balancing accel');
 assert(norm(ekf.vel) < 1e-6, 'Velocity drift zero with gravity-balancing accel');
 
@@ -20,12 +31,14 @@ ekf.reset();
 dt = 0.001;
 % Specific force = +1 m/s^2 in body x; in NED that's +1 (still no rotation).
 % Plus we must include the gravity offset since predict adds g.
-% sf_body = [1; 0; -9.80665]  -> integrate -> dvel = [1e-3; 0; -9.80665e-3]
-% Then vel += R*dvel + g*dt  =  [1e-3; 0; 0]
-imu = make_imu_sample(dt, [0;0;0], [1*dt; 0; -9.80665*dt]);
-imu.t = dt;
-ekf.predict(imu);
-assert(abs(ekf.vel(1) - 1e-3) < 1e-9, 'Forward accel integrates to +x velocity');
+% Per sample: sf_body = [1; 0; -9.80665] -> dvel = [1e-3; 0; -9.80665e-3];
+% over the full 10-sample window: vel += R*dvel_acc + g*dt_win = [0.01; 0; 0]
+for k = 1:n_win
+    imu = make_imu_sample(dt, [0;0;0], [1*dt; 0; -9.80665*dt]);
+    imu.t = k * dt;
+    ekf.predict(imu);
+end
+assert(abs(ekf.vel(1) - n_win*1e-3) < 1e-9, 'Forward accel integrates to +x velocity');
 assert(abs(ekf.vel(3)) < 1e-9, 'No vertical velocity with gravity-balanced accel');
 
 %% Case 3: Baro fusion pulls position-z toward measurement.

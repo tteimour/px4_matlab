@@ -23,7 +23,9 @@ classdef ImuICM45686 < ImuSensor
 
     methods
         function obj = ImuICM45686(priority, instance, earth)
-            if nargin < 1 || isempty(priority), priority = 75; end
+            if nargin < 1 || isempty(priority), priority = 90; end  % voted primary
+                                                                     % (realistic 6X MEMS;
+                                                                     % feeds EKF + VIO bridge)
             if nargin < 2 || isempty(instance), instance = 0;  end
 
             rate_hz   = 1000;          % effective integrated rate

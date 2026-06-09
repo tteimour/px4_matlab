@@ -23,6 +23,7 @@ classdef VotedSensors < handle
         selected_idx      = 0
         failover_count    = 0
         failover_state    = 'none'   % 'none' | 'no_data' | 'stale' | 'timeout' | 'high_errcount' | 'high_density'
+        next_event_t_     = -inf     % earliest pending sensor event in the group
     end
 
     methods
@@ -42,13 +43,25 @@ classdef VotedSensors < handle
         end
 
         function step(obj, t, ground_truth)
+            % Event-driven early-out: between sensor events nothing in the
+            % group can change, so skip the per-sensor stepping entirely.
+            % The sim substep runs at 1 kHz while baro/mag/GNSS sample at
+            % 10-100 Hz; this removes ~90-99% of their step overhead.
+            % (Selection updates then happen at sample events; a timed-out
+            % sensor is re-evaluated at the next event of any group member.)
+            if t < obj.next_event_t_ - 1e-12
+                return;
+            end
+            tn = inf;
             for i = 1:numel(obj.sensors)
                 obj.sensors{i}.step(t, ground_truth);
                 if obj.sensors{i}.newSampleAvailable()
                     s = obj.sensors{i}.latest();
                     obj.validators{i}.put(t, s, 0);
                 end
+                tn = min(tn, obj.sensors{i}.nextEventTime());
             end
+            obj.next_event_t_ = tn;
             obj.updateSelection(t);
         end
 
@@ -56,6 +69,17 @@ classdef VotedSensors < handle
             best_conf = -inf;
             best_prio = -inf;
             best_idx  = obj.selected_idx;
+
+            % Warmup guard: if the priority-selected primary has not produced
+            % its FIRST sample yet (last_t == -inf), it reads as "timed out"
+            % (confidence 0) only because it hasn't started. Do NOT fail over
+            % to a lower-latency peer and permanently demote the primary on this
+            % startup race -- keep the priority-based selection until it warms up.
+            % (PX4 demotes a *failed* sensor, not one that merely published a few
+            % hundred microseconds later at boot.)
+            if obj.selected_idx > 0 && ~isfinite(obj.validators{obj.selected_idx}.last_t)
+                return;
+            end
 
             % Confidence + priority of current selection.
             cur_conf = 0.0; cur_prio = 0;
@@ -125,6 +149,7 @@ classdef VotedSensors < handle
             obj.selected_idx   = idx;
             obj.failover_count = 0;
             obj.failover_state = 'none';
+            obj.next_event_t_  = -inf;
         end
     end
 

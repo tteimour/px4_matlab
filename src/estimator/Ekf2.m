@@ -59,8 +59,35 @@ classdef Ekf2 < handle
         initialized      = false
         last_imu_t       = 0.0
         gnss_origin_set  = false
-        baro_bias        = 0.0    % running baro bias (HeightBiasEstimator equivalent)
-        baro_bias_var    = 1.0
+        % Baro height-bias estimator — port of PX4 BiasEstimator
+        % (bias_estimator.{hpp,cpp}): constant-state KF with a small
+        % process PSD so the bias learns over minutes, an innovation gate,
+        % and variance limits. (The previous ad-hoc filter had a ~0.3 s
+        % learning time constant and no gate: on the ground it wound up
+        % ~14 m of phantom bias within seconds, then froze, leaving the
+        % baro permanently gate-rejected and the height channel adrift.)
+        baro_bias        = 0.0
+        baro_bias_var    = 0.1    % initial variance (bias_estimator.hpp:104)
+        last_baro_fuse_t = -inf
+
+        % IMU downsampler (imu_down_sampler.cpp): raw 1 kHz IMU samples are
+        % accumulated into one EKF2_PREDICT_US window (default 10 ms); the
+        % state + covariance prediction runs once per window, like PX4.
+        ds_dq            = [1; 0; 0; 0]   % accumulated delta-angle quaternion
+        ds_dvel          = zeros(3, 1)    % accumulated delta velocity (rotated frame)
+        ds_dt            = 0.0            % accumulated window time
+        ds_target_dt     = 0.010          % s, from params.predict_us
+        dt_ekf           = 0.010          % dt of the last completed EKF update
+        ds_sf_body       = zeros(3, 1)    % specific force of the last window (gravity fusion)
+
+        % Control-status flags fed by the vehicle layer (PX4 control.cpp):
+        % in_air gates mag-3D alignment; at_rest relaxes the gravity-fusion
+        % accel-magnitude window (gravity_fusion.cpp:61-63); ev_active marks
+        % external vision as the horizontal aid (isHorizontalAidingActive).
+        in_air               = false
+        at_rest              = true
+        ev_active            = false
+        mag_aligned_in_flight = false
     end
 
     properties (Constant)
@@ -94,9 +121,13 @@ classdef Ekf2 < handle
 
             obj.P = zeros(obj.N_ERR);
             p = obj.params;
+            % Per-axis structure follows Ekf::initialiseCovariance
+            % (covariance.cpp:52-104): vertical velocity gets 1.5^2x the
+            % horizontal variance, height variance comes from the baro.
             obj.P(obj.IDX_ATT,  obj.IDX_ATT)  = eye(3) * p.init_att_var;
-            obj.P(obj.IDX_VEL,  obj.IDX_VEL)  = eye(3) * p.init_vel_var;
-            obj.P(obj.IDX_POS,  obj.IDX_POS)  = eye(3) * p.init_pos_var;
+            obj.P(obj.IDX_VEL,  obj.IDX_VEL)  = diag([1, 1, 1.5^2] * p.init_vel_var);
+            obj.P(obj.IDX_POS,  obj.IDX_POS)  = diag([p.init_pos_var, p.init_pos_var, ...
+                                                      max(p.baro_noise, 0.01)^2]);
             obj.P(obj.IDX_GBI,  obj.IDX_GBI)  = eye(3) * p.init_gyro_b_var;
             obj.P(obj.IDX_ABI,  obj.IDX_ABI)  = eye(3) * p.init_accel_b_var;
             obj.P(obj.IDX_MI,   obj.IDX_MI)   = eye(3) * p.init_mag_I_var;
@@ -107,19 +138,73 @@ classdef Ekf2 < handle
             obj.last_imu_t      = 0.0;
             obj.gnss_origin_set = false;
             obj.baro_bias       = 0.0;
-            obj.baro_bias_var   = 1.0;
+            obj.baro_bias_var   = 0.1;
+            obj.last_baro_fuse_t = -inf;
+
+            obj.ds_dq         = [1; 0; 0; 0];
+            obj.ds_dvel       = zeros(3, 1);
+            obj.ds_dt         = 0.0;
+            obj.ds_target_dt  = double(obj.params.predict_us) * 1e-6;
+            obj.dt_ekf        = obj.ds_target_dt;
+            obj.ds_sf_body    = zeros(3, 1);
+            obj.in_air                = false;
+            obj.at_rest               = true;
+            obj.ev_active             = false;
+            obj.mag_aligned_in_flight = false;
         end
 
         % ============================================================
-        % Predict (called per IMU sample)
+        % Predict: accumulate raw IMU samples (imu_down_sampler.cpp:13-52)
+        % and run one state + covariance prediction per EKF2_PREDICT_US
+        % window (estimator_interface.cpp / ekf.cpp predictState). Returns
+        % true when an EKF update ran (callers gate fusions on this).
         % ============================================================
-        function predict(obj, imu)
-            % imu is a vehicle_imu sample with delta_ang, delta_vel, dt fields.
-            dt = max(imu.delta_ang_dt, 1e-6);
+        function updated = predict(obj, imu)
+            updated = false;
+            dt_s = max(imu.delta_ang_dt, 1e-6);
+
+            % --- accumulate (imu_down_sampler.cpp:25-39) ---------------
+            ang = norm(imu.delta_ang);
+            if ang > 1e-9
+                axn = imu.delta_ang / ang;
+                dq  = [cos(ang/2); axn * sin(ang/2)];
+            else
+                dq  = [1; 0.5 * imu.delta_ang];
+            end
+            obj.ds_dq = quat_multiply(obj.ds_dq, dq);
+            obj.ds_dq = obj.ds_dq / norm(obj.ds_dq);
+            % rotate accumulated delta-vel into the new frame, then add the
+            % new sample assuming it spans the rotation half-way
+            R_delta  = quat_to_dcm(dq)';                 % Dcm(delta_q.inversed())
+            obj.ds_dvel = R_delta * obj.ds_dvel ...
+                        + (imu.delta_vel + R_delta * imu.delta_vel) * 0.5;
+            obj.ds_dt = obj.ds_dt + dt_s;
+
+            obj.last_imu_t = imu.t;
+            if obj.ds_dt < obj.ds_target_dt - 0.5 * dt_s
+                return;                                  % window not full yet
+            end
+
+            % --- finalize window -> one EKF prediction -----------------
+            dt = obj.ds_dt;
+            qv = obj.ds_dq;
+            sang = norm(qv(2:4));
+            angw = 2 * atan2(sang, qv(1));
+            if sang > 1e-12
+                d_ang_w = qv(2:4) / sang * angw;         % axis-angle vector
+            else
+                d_ang_w = 2 * qv(2:4);
+            end
+            d_vel_w = obj.ds_dvel;
+            obj.ds_dq   = [1; 0; 0; 0];
+            obj.ds_dvel = zeros(3, 1);
+            obj.ds_dt   = 0.0;
+            obj.dt_ekf  = dt;
+            obj.ds_sf_body = d_vel_w / dt;               % for gravity fusion
 
             % Bias-corrected delta angle / velocity.
-            d_ang = imu.delta_ang - obj.gyro_b * dt;
-            d_vel = imu.delta_vel - obj.accel_b * dt;
+            d_ang = d_ang_w - obj.gyro_b * dt;
+            d_vel = d_vel_w - obj.accel_b * dt;
 
             % --- Quaternion propagation: q_new = q ⊗ exp(0.5 * d_ang) ---
             ang   = norm(d_ang);
@@ -141,9 +226,25 @@ classdef Ekf2 < handle
             obj.pos = obj.pos + 0.5 * (vel_old + obj.vel) * dt;
 
             obj.predictCovariance(d_ang, d_vel, dt, R_b2n);
+            obj.constrainStateVariances();
 
-            obj.last_imu_t = imu.t;
             obj.initialized = true;
+            updated = true;
+        end
+
+        % ============================================================
+        % Diagonal variance limiting (covariance.cpp:244-263, constants
+        % ekf.h:442-446). Last-resort guard against runaway Kalman gains.
+        % ============================================================
+        function constrainStateVariances(obj)
+            obj.clampDiag(obj.IDX_ATT,  1e-9, 1.0);
+            obj.clampDiag(obj.IDX_VEL,  1e-6, 1e6);
+            obj.clampDiag(obj.IDX_POS,  1e-6, 1e6);
+            obj.clampDiag(obj.IDX_GBI,  1e-9, 1.0);   % kGyroBiasVarianceMin
+            obj.clampDiag(obj.IDX_ABI,  1e-9, 1.0);   % kAccelBiasVarianceMin
+            obj.clampDiag(obj.IDX_MI,   1e-6, 1.0);   % kMagVarianceMin
+            obj.clampDiag(obj.IDX_MB,   1e-6, 1.0);
+            obj.clampDiag(obj.IDX_WIND, 1e-6, 1e6);
         end
 
         function predictCovariance(obj, d_ang, d_vel, dt, R_b2n)
@@ -203,10 +304,35 @@ classdef Ekf2 < handle
 
             obj.applyKalmanUpdate(H, innov, S, R);
 
-            % Slow bias estimator (matches PX4 HeightBiasEstimator).
-            K_b = obj.baro_bias_var / (obj.baro_bias_var + R);
-            obj.baro_bias     = obj.baro_bias + K_b * (-innov);
-            obj.baro_bias_var = (1 - K_b) * obj.baro_bias_var + 1e-4;
+            % Height-bias estimator (BiasEstimator, bias_estimator.cpp:
+            % 42-106): with GNSS as the height reference (EKF2_HGT_REF
+            % default) the baro carries the bias state. The innovation
+            % variance includes the filter's own height variance
+            % (gnss_height_control.cpp:45 pattern) so the bias learns
+            % slower while the height state is uncertain; the bias
+            % innovation is gated at 3 sigma (hpp:103) and the variance is
+            % constrained to [1e-8, 2] (cpp:67, hpp:106).
+            % Process noise: the BiasEstimator class default 1.25e-6
+            % m^2/s^2/Hz (hpp:105). PX4's faster baro_bias_nsd (0.13,
+            % common.h:304) belongs to the full dual-source reference
+            % architecture (reference switching + per-source estimators);
+            % in this single-filter port it makes the bias chase the height
+            % state and the pair random-walks away, so the conservative
+            % class default is used instead.
+            if isfinite(obj.last_baro_fuse_t)
+                dt_b = max(baro.t - obj.last_baro_fuse_t, 0);
+            else
+                dt_b = 0;
+            end
+            obj.last_baro_fuse_t = baro.t;
+            obj.baro_bias_var = min(max(obj.baro_bias_var + 1.25e-6 * dt_b, 1e-8), 2.0);
+            innov_var_b = obj.baro_bias_var + max(1e-4, R) + obj.P(obj.IDX_POS(3), obj.IDX_POS(3));
+            innov_b     = -innov;            % bias absorbs the residual offset
+            if innov_b^2 / (9 * innov_var_b) < 1.0
+                K_b = obj.baro_bias_var / innov_var_b;
+                obj.baro_bias     = obj.baro_bias + K_b * innov_b;
+                obj.baro_bias_var = max((1 - K_b) * obj.baro_bias_var, 1e-8);
+            end
             out.fused = true;
         end
 
@@ -229,9 +355,14 @@ classdef Ekf2 < handle
 
             z = obj.earth.llaToNed(gps.lat_deg, gps.lon_deg, gps.alt_m);
 
-            R_pos = diag([obj.params.gps_p_noise^2, ...
-                          obj.params.gps_p_noise^2, ...
-                          (obj.params.gps_p_noise * 1.5)^2]);
+            % Observation noise floored by the receiver-reported accuracy
+            % (gps_control.cpp:219 pattern: max(reported, param)). The M9N
+            % model reports eph/epv with each sample.
+            r_h = obj.params.gps_p_noise;
+            r_v = 1.5 * obj.params.gps_p_noise;
+            if isfield(gps, 'eph'), r_h = max(r_h, gps.eph); end
+            if isfield(gps, 'epv'), r_v = max(r_v, gps.epv); end
+            R_pos = diag([r_h^2, r_h^2, r_v^2]);
 
             for axis = 1:3
                 innov = z(axis) - obj.pos(axis);
@@ -255,9 +386,14 @@ classdef Ekf2 < handle
             out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
             if isempty(gps), return; end
 
-            R_vel = diag([obj.params.gps_v_noise^2, ...
-                          obj.params.gps_v_noise^2, ...
-                          (obj.params.gps_v_noise * 1.5)^2]);
+            % Observation noise floored by the reported speed accuracy
+            % (gps_control.cpp:219: max(gnss_sample.sacc, gps_vel_noise)).
+            % The GnssSensor sample carries sacc^2 as s_variance_mps2.
+            r_v = obj.params.gps_v_noise;
+            if isfield(gps, 's_variance_mps2')
+                r_v = max(r_v, sqrt(gps.s_variance_mps2));
+            end
+            R_vel = diag([r_v^2, r_v^2, (r_v * 1.5)^2]);
 
             for axis = 1:3
                 innov = gps.vel_ned(axis) - obj.vel(axis);
@@ -329,11 +465,23 @@ classdef Ekf2 < handle
 
         % ============================================================
         % Mag 3D fusion — sequential per-axis update
-        % mag_fusion.cpp:53-141
+        % mag_fusion.cpp:53-141. update_tilt mirrors fuseMag(...,
+        % update_all_states, update_tilt): when false the Kalman-gain rows
+        % of the roll/pitch attitude error are zeroed (mag_fusion.cpp:
+        % 107-111), so the mag cannot pull the tilt — PX4 only enables
+        % tilt updates from mag (mag_3D) after the in-flight alignment
+        % (mag_control.cpp:186-192).
         % ============================================================
-        function out = fuseMag3D(obj, mag_sample)
+        function out = fuseMag3D(obj, mag_sample, update_tilt)
             out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
             if isempty(mag_sample), return; end
+            if nargin < 3, update_tilt = true; end
+
+            if update_tilt
+                K_zero = [];
+            else
+                K_zero = obj.IDX_ATT(1:2);    % zero roll/pitch error gains
+            end
 
             R_b2n = quat_to_dcm(obj.quat);
             R_n2b = R_b2n';
@@ -361,7 +509,7 @@ classdef Ekf2 < handle
                 out.innov(axis)      = innov;
                 out.test_ratio(axis) = tr;
                 if tr <= 1.0
-                    obj.applyKalmanUpdate(H, innov, S, Rm_var);
+                    obj.applyKalmanUpdate(H, innov, S, Rm_var, K_zero);
                 end
             end
             out.fused = true;
@@ -398,28 +546,33 @@ classdef Ekf2 < handle
 
         % ============================================================
         % Gravity fusion — accel-as-gravity in low-acceleration flight
-        % gravity_fusion.cpp:49-115
+        % gravity_fusion.cpp:49-115. Gating per lines 54-63: needs the
+        % accel magnitude within [0.9 g, 1.1 g] OR vehicle at rest, and
+        % NO active horizontal aiding (GNSS or external vision) — with a
+        % biased accel, gravity fusion would otherwise pull the attitude
+        % to "absorb" the bias, locking in a tilt error.
+        % Uses the specific force of the last downsampled EKF window
+        % (ds_sf_body), so it runs once per EKF update like PX4.
         % ============================================================
-        function out = fuseGravity(obj, imu)
+        function out = fuseGravity(obj)
             out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
-            if isempty(imu), return; end
 
-            % Skip when GNSS is actively constraining horizontal state.
-            % With a biased accel, gravity fusion pulls the attitude to
-            % "absorb" the bias signal, locking in a tilt error that
-            % the bias estimate then has to chase forever. PX4's
-            % gravity_fusion.cpp disables itself under the same
-            % "no horizontal aiding" condition.
-            if obj.gnss_origin_set && bitand(obj.params.gps_ctrl, 1) ~= 0
+            % isHorizontalAidingActive() equivalent (gravity_fusion.cpp:63).
+            gnss_aiding = obj.gnss_origin_set && bitand(obj.params.gps_ctrl, 1) ~= 0;
+            if gnss_aiding || obj.ev_active
                 return;
             end
 
             R_b2n = quat_to_dcm(obj.quat);
             R_n2b = R_b2n';
 
-            % Reject if specific force not close to 1g.
-            sf = imu.accel_b - obj.accel_b;
-            if abs(norm(sf) - obj.earth.g_mps2) > 0.5 * obj.earth.g_mps2
+            % Accel-magnitude window (gravity_fusion.cpp:55-58): 0.9..1.1 g,
+            % bypassed when the vehicle is at rest.
+            sf = obj.ds_sf_body - obj.accel_b;
+            nsf = norm(sf);
+            accel_norm_good = (nsf > 0.9 * obj.earth.g_mps2) && ...
+                              (nsf < 1.1 * obj.earth.g_mps2);
+            if ~(accel_norm_good || obj.at_rest)
                 return;
             end
 
@@ -448,6 +601,23 @@ classdef Ekf2 < handle
         end
 
         % ============================================================
+        % Flight-phase flags from the vehicle layer (PX4 control.cpp gets
+        % these from commander / land detector). in_air enables mag-3D
+        % tilt updates: PX4 sets mag_aligned_in_flight at the first
+        % in-flight mag alignment (mag_control.cpp:186-192); the sim's mag
+        % prior is the exact earth field, so alignment is implicit when
+        % entering flight. at_rest = ~in_air is a sim simplification of
+        % PX4's dedicated at-rest detector.
+        % ============================================================
+        function setFlightPhase(obj, in_air)
+            obj.in_air  = logical(in_air);
+            obj.at_rest = ~obj.in_air;
+            if obj.in_air
+                obj.mag_aligned_in_flight = true;
+            end
+        end
+
+        % ============================================================
         % Output struct (controller-facing): same shape as the plant
         % ground-truth struct so the controller is unchanged.
         % ============================================================
@@ -466,9 +636,17 @@ classdef Ekf2 < handle
     end
 
     methods (Access = private)
-        function applyKalmanUpdate(obj, H, innov, S, R)
+        function applyKalmanUpdate(obj, H, innov, S, R, K_zero)
+            % K_zero (optional): error-state indices whose Kalman gain is
+            % forced to zero before the update — PX4 does this to keep a
+            % fusion from updating specific states (mag_fusion.cpp:107-122).
+            % The Joseph-form covariance update below stays consistent for
+            % any (suboptimal) gain.
             P_local = obj.P;
             K = (P_local * H') / S;
+            if nargin >= 6 && ~isempty(K_zero)
+                K(K_zero) = 0;
+            end
 
             dx = K * innov;        % 23x1 error-state correction
 
@@ -484,18 +662,40 @@ classdef Ekf2 < handle
             obj.quat = quat_multiply(obj.quat, dq);
             obj.quat = obj.quat / norm(obj.quat);
 
-            obj.vel     = obj.vel     + dx(obj.IDX_VEL);
-            obj.pos     = obj.pos     + dx(obj.IDX_POS);
-            obj.gyro_b  = obj.gyro_b  + dx(obj.IDX_GBI);
-            obj.accel_b = obj.accel_b + dx(obj.IDX_ABI);
-            obj.mag_I   = obj.mag_I   + dx(obj.IDX_MI);
-            obj.mag_B   = obj.mag_B   + dx(obj.IDX_MB);
-            obj.wind    = obj.wind    + dx(obj.IDX_WIND);
+            % State updates with PX4's hard limits (Ekf::fuse,
+            % ekf_helper.cpp:750-791). The bias clamps are essential: in
+            % static/hover flight {tilt, accel bias, mag states} share an
+            % unobservable subspace, and without the +/-0.4 m/s^2 accel
+            % bias limit (common.h:472) the filter can settle into a
+            % self-consistent wrong equilibrium (several degrees of tilt
+            % "explained" by a phantom bias).
+            pl = obj.params;
+            obj.vel     = clampv(obj.vel     + dx(obj.IDX_VEL), 1e3);
+            obj.pos     = obj.pos + dx(obj.IDX_POS);
+            obj.gyro_b  = clampv(obj.gyro_b  + dx(obj.IDX_GBI), pl.gyro_bias_lim);
+            obj.accel_b = clampv(obj.accel_b + dx(obj.IDX_ABI), pl.acc_bias_lim);
+            obj.mag_I   = clampv(obj.mag_I   + dx(obj.IDX_MI), 1.0);
+            obj.mag_B   = clampv(obj.mag_B   + dx(obj.IDX_MB), pl.mag_bias_lim);
+            obj.wind    = clampv(obj.wind    + dx(obj.IDX_WIND), 100);
 
             % Joseph-form covariance update (numerically stable).
             I_KH = eye(obj.N_ERR) - K * H;
             obj.P = I_KH * P_local * I_KH' + K * R * K';
             obj.P = 0.5 * (obj.P + obj.P');
         end
+
+        function clampDiag(obj, idx, lo, hi)
+            % Clamp P diagonal entries of one state group (covariance.cpp
+            % constrainStateVar).
+            for i = idx
+                obj.P(i, i) = min(max(obj.P(i, i), lo), hi);
+            end
+        end
     end
+end
+
+
+function v = clampv(v, lim)
+% Symmetric per-component clamp (matrix::constrain in Ekf::fuse).
+v = min(max(v, -lim), lim);
 end

@@ -7,8 +7,12 @@ classdef PositionController < handle
 % Inputs each tick:
 %   pos        : 3x1 NED position (m)
 %   vel        : 3x1 NED velocity (m/s)
-%   acc        : 3x1 NED acceleration (m/s^2), used for D term
-%   pos_sp     : 3x1 NED position setpoint
+%   acc        : 3x1 NED acceleration — UNUSED (kept for call-site
+%                compatibility). The D term uses an internal low-pass
+%                filtered derivative of `vel`, like PX4
+%                (MulticopterPositionControl.cpp:335-361).
+%   pos_sp     : 3x1 NED position setpoint (NaN axes = no position
+%                control on that axis, velocity-only)
 %   yaw_sp     : scalar yaw setpoint (rad)
 %   vel_sp_ff  : 3x1 feedforward velocity (NaN to ignore)
 %   acc_sp_ff  : 3x1 feedforward acceleration (NaN to ignore)
@@ -46,6 +50,26 @@ classdef PositionController < handle
 
         % Integrator state
         vel_int      % 3x1
+
+        % Velocity-derivative state for the D term. PX4 feeds the velocity
+        % loop a low-pass-filtered derivative of the (estimated) velocity,
+        % NOT a raw acceleration estimate: MulticopterPositionControl.cpp:
+        % 335-361 -> states.acceleration = AlphaFilter(MPC_VELD_LP).update(
+        % (vel - vel_prev)/dt), consumed as _vel_dot in the D term
+        % (PositionControl.cpp:96,147). MPC_VEL_LP and the optional notch
+        % default to 0 (off) in multicopter_position_control_params.c:89,104,
+        % so only the derivative filter is replicated here.
+        veld_lp_tau  % s, = 1/(2*pi*MPC_VELD_LP); AlphaFilter.hpp:92-99
+        vel_prev     % 3x1, [] until first update after reset
+        vel_dot      % 3x1 filtered velocity derivative
+
+        % Runtime limits set each cycle by the vehicle layer (PX4
+        % setVelocityLimits/setThrustLimits/setTiltLimit during takeoff,
+        % MulticopterPositionControl.cpp:496-531). Empty = use the base
+        % tunables.
+        rt_speed_up  = []   % ramped upward speed limit (may be negative)
+        rt_thr_min   = []   % 0 until flying, MPC_THR_MIN after
+        rt_tilt      = []   % MPC_TILTMAX_LND until flying
     end
 
     methods
@@ -62,12 +86,26 @@ classdef PositionController < handle
             obj.thr_max = p.pos.thr_max;
             obj.hover_thrust = p.pos.thr_hover;
             obj.g = p.g;
+            obj.veld_lp_tau = 1 / (2 * pi * p.pos.veld_lp);   % MPC_VELD_LP
 
             obj.vel_int = [0;0;0];
+            obj.vel_prev = [];
+            obj.vel_dot  = [0;0;0];
         end
 
         function reset(obj)
-            obj.vel_int = [0;0;0];
+            obj.vel_int  = [0;0;0];
+            obj.vel_prev = [];
+            obj.vel_dot  = [0;0;0];
+        end
+
+        function setRuntimeLimits(obj, speed_up, thr_min_eff, tilt_eff)
+            % Per-cycle limits from the takeoff state machine (PX4
+            % MulticopterPositionControl.cpp:519-531). Pass [] to fall back
+            % to the base tunables.
+            obj.rt_speed_up = speed_up;
+            obj.rt_thr_min  = thr_min_eff;
+            obj.rt_tilt     = tilt_eff;
         end
 
         function [q_sp, thrust_body_z, vel_sp, acc_sp, thr_sp] = update( ...
@@ -77,9 +115,21 @@ classdef PositionController < handle
             if nargin < 8 || isempty(vel_sp_ff), vel_sp_ff = nan(3,1); end
             if nargin < 9 || isempty(acc_sp_ff), acc_sp_ff = nan(3,1); end
 
+            % Effective runtime limits (takeoff ramp overrides; PX4
+            % MulticopterPositionControl.cpp:519-531).
+            up_lim = obj.lim_vel_up;
+            if ~isempty(obj.rt_speed_up), up_lim = obj.rt_speed_up; end
+            thr_min_eff = obj.thr_min;
+            if ~isempty(obj.rt_thr_min), thr_min_eff = obj.rt_thr_min; end
+            tilt_eff = obj.lim_tilt;
+            if ~isempty(obj.rt_tilt), tilt_eff = obj.rt_tilt; end
+
             % --- Position loop -> velocity setpoint ---
-            % vel_sp_position = (pos_sp - pos) .* gain_pos_p
+            % vel_sp_position = (pos_sp - pos) .* gain_pos_p. NaN setpoint
+            % axes contribute nothing (velocity-only control on that axis):
+            % PositionControl.cpp:131 setZeroIfNanVector3f(vel_sp_position).
             vel_sp_position = (pos_sp - pos) .* obj.gain_pos_p;
+            vel_sp_position(~isfinite(vel_sp_position)) = 0;
 
             % vel_sp = vel_sp_position + ff (NaN-safe addition)
             vel_sp = vel_sp_position;
@@ -92,17 +142,32 @@ classdef PositionController < handle
             v_ff_xy = vel_sp(1:2) - v_p_xy;
             vel_sp(1:2) = constrainXY(v_p_xy, v_ff_xy, obj.lim_vel_horizontal);
             % Constrain vertical: NED z+ down, so up-velocity (negative z) limited
-            % by lim_vel_up, down-velocity (positive z) by lim_vel_down.
-            vel_sp(3) = max(-obj.lim_vel_up, min(obj.lim_vel_down, vel_sp(3)));
+            % by the (possibly ramped) up limit, down-velocity by lim_vel_down.
+            % During the takeoff ramp up_lim starts negative (PX4 Takeoff.cpp:
+            % 45,113-135), forcing a descending setpoint and thus zero thrust.
+            vel_sp(3) = max(-up_lim, min(obj.lim_vel_down, vel_sp(3)));
 
             % --- Velocity loop -> acceleration setpoint ---
             % Vertical integrator pre-clamp (PositionControl.cpp:142)
             obj.vel_int(3) = max(-obj.g, min(obj.g, obj.vel_int(3)));
 
+            % D term: low-pass-filtered derivative of the velocity input
+            % (MulticopterPositionControl.cpp:335-361, MPC_VELD_LP = 5 Hz).
+            % The raw `acc` argument is intentionally NOT used — PX4 derives
+            % vel_dot from the same velocity signal the loop regulates.
+            if isempty(obj.vel_prev)
+                obj.vel_prev = vel;        % seed; vel_dot stays 0 this cycle
+            else
+                raw_dot = (vel - obj.vel_prev) / max(dt, 1e-6);
+                alpha = dt / (obj.veld_lp_tau + dt);
+                obj.vel_dot = obj.vel_dot + alpha * (raw_dot - obj.vel_dot);
+                obj.vel_prev = vel;
+            end
+
             vel_error = vel_sp - vel;
             acc_sp_velocity = vel_error .* obj.gain_vel_p ...
                             + obj.vel_int ...
-                            - acc .* obj.gain_vel_d;
+                            - obj.vel_dot .* obj.gain_vel_d;
 
             % Acc setpoint = acc_sp_velocity + acc_ff (NaN-safe)
             acc_sp = acc_sp_velocity;
@@ -110,10 +175,10 @@ classdef PositionController < handle
             acc_sp(mask) = acc_sp(mask) + acc_sp_ff(mask);
 
             % --- Acceleration -> body_z + collective thrust ---
-            [thr_sp, body_z] = obj.accelerationToThrust(acc_sp);
+            [thr_sp, body_z] = obj.accelerationToThrust(acc_sp, thr_min_eff, tilt_eff);
 
             % --- Vertical anti-windup: hold integrator when saturated ---
-            if (thr_sp(3) >= -obj.thr_min && vel_error(3) >= 0) || ...
+            if (thr_sp(3) >= -thr_min_eff && vel_error(3) >= 0) || ...
                (thr_sp(3) <= -obj.thr_max && vel_error(3) <= 0)
                 vel_error(3) = 0;
             end
@@ -155,7 +220,7 @@ classdef PositionController < handle
     end
 
     methods (Access = private)
-        function [thr_sp, body_z] = accelerationToThrust(obj, acc_sp)
+        function [thr_sp, body_z] = accelerationToThrust(obj, acc_sp, thr_min_eff, tilt_eff)
         % PositionControl.cpp:204-222 (_accelerationControl)
             z_specific_force = -obj.g + acc_sp(3);
             body_z = [-acc_sp(1); -acc_sp(2); -z_specific_force];
@@ -165,7 +230,7 @@ classdef PositionController < handle
             else
                 body_z = [0; 0; 1];
             end
-            body_z = limit_tilt(body_z, [0;0;1], obj.lim_tilt);
+            body_z = limit_tilt(body_z, [0;0;1], tilt_eff);
 
             % Hover-thrust scaling: T_hover delivers exactly 1 g, so the
             % "thrust per unit acceleration" is hover/g.
@@ -173,8 +238,9 @@ classdef PositionController < handle
             cos_ned_body = body_z(3);  % dot([0;0;1], body_z)
             % Collective thrust along body z (negative because body z down):
             % T_proj = thrust_ned_z / cos_ned_body, but capped by -thr_min
-            % so the cap (thrust must be at least obj.thr_min upward).
-            collective_thrust = min(thrust_ned_z / max(cos_ned_body, 1e-3), -obj.thr_min);
+            % (thrust at least thr_min upward; 0 while not flying, PX4
+            % MulticopterPositionControl.cpp:530).
+            collective_thrust = min(thrust_ned_z / max(cos_ned_body, 1e-3), -thr_min_eff);
             thr_sp = body_z * collective_thrust;
         end
     end

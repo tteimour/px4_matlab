@@ -21,16 +21,25 @@ classdef OutputPredictor < handle
         earth
         tau_vel
         tau_pos
-        att_gain
+        time_delay      % output_predictor time horizon (params.out_time_delay)
         last_t
+
+        % Correction state (output_predictor.cpp:259-348). delta_ang_corr is
+        % computed once per EKF update and applied to EVERY subsequent IMU
+        % strapdown step (calculateOutputStates adds _delta_angle_corr each
+        % sample); vel/pos PI corrections apply once per EKF update.
+        delta_ang_corr = zeros(3, 1)
+        vel_err_integ  = zeros(3, 1)
+        pos_err_integ  = zeros(3, 1)
+        dt_update_avg  = 1e-3       % average IMU strapdown dt
     end
 
     methods
         function obj = OutputPredictor(params, earth)
-            obj.earth    = earth;
-            obj.tau_vel  = params.tau_vel;
-            obj.tau_pos  = params.tau_pos;
-            obj.att_gain = 0.5;     % PX4 uses 0.5 * dt_imu / time_delay
+            obj.earth      = earth;
+            obj.tau_vel    = params.tau_vel;
+            obj.tau_pos    = params.tau_pos;
+            obj.time_delay = params.out_time_delay;
             obj.reset();
         end
 
@@ -41,12 +50,21 @@ classdef OutputPredictor < handle
             obj.gyro_b = zeros(3, 1);
             obj.accel_b= zeros(3, 1);
             obj.last_t = 0.0;
+            obj.delta_ang_corr = zeros(3, 1);
+            obj.vel_err_integ  = zeros(3, 1);
+            obj.pos_err_integ  = zeros(3, 1);
+            obj.dt_update_avg  = 1e-3;
         end
 
         function update(obj, imu)
             dt = max(imu.delta_ang_dt, 1e-6);
+            obj.dt_update_avg = 0.8 * obj.dt_update_avg + 0.2 * dt;
 
-            d_ang = imu.delta_ang - obj.gyro_b * dt;
+            % Attitude correction feed: the per-EKF-update delta-angle
+            % correction is folded into each strapdown step
+            % (output_predictor.cpp calculateOutputStates: delta_angle +=
+            % _delta_angle_corr).
+            d_ang = imu.delta_ang - obj.gyro_b * dt + obj.delta_ang_corr;
             d_vel = imu.delta_vel - obj.accel_b * dt;
 
             ang = norm(d_ang);
@@ -70,37 +88,46 @@ classdef OutputPredictor < handle
             obj.last_t = imu.t;
         end
 
-        function correctTo(obj, ekf, dt_imu)
-            % Pull toward the EKF state with PI-style gains.
+        function correctTo(obj, ekf, dt_correct)
+            % Called once per EKF update (PX4 correctOutputStates,
+            % output_predictor.cpp:259-348). dt_correct = EKF update dt.
             obj.gyro_b  = ekf.gyro_b;
             obj.accel_b = ekf.accel_b;
+            dt_correct = min(max(dt_correct, 1e-4), 0.03);   % cpp:265
 
-            % Attitude correction: small-angle representation of q_ekf * q_out^-1.
+            % Attitude: q_error = q_ekf * q_out^-1; the small-angle error
+            % times att_gain becomes the per-IMU-sample delta-angle
+            % correction (cpp:283-302), which update() then applies on
+            % every strapdown step until the next correction. att_gain =
+            % 0.5 * dt_imu / time_delay. Because the correction is applied
+            % (dt_correct / dt_imu) times per cycle, time_delay must be
+            % floored at the CORRECTION interval — otherwise the total
+            % per-cycle correction exceeds 100% of the error and the
+            % output attitude oscillates. (On PX4 hardware the real
+            % delayed-horizon depth is always >= the update interval, so
+            % its fmaxf(..., dt_update) floor never binds; this floor is
+            % the zero-latency-sim generalization of the same guard.)
             q_err = quat_multiply(ekf.quat, quat_inverse(obj.quat));
             q_err = q_err / norm(q_err);
             if q_err(1) < 0, q_err = -q_err; end
-            ang   = 2 * atan2(norm(q_err(2:4)), q_err(1));
-            if ang > 1e-6
-                axis = q_err(2:4) / norm(q_err(2:4));
-            else
-                axis = [0; 0; 0];
-            end
-            dtheta = axis * ang * obj.att_gain;
-            ang_c  = norm(dtheta);
-            if ang_c > 1e-9
-                ax = dtheta / ang_c;
-                dq = [cos(ang_c/2); ax * sin(ang_c/2)];
-            else
-                dq = [1; 0.5 * dtheta];
-            end
-            obj.quat = quat_multiply(dq, obj.quat);
-            obj.quat = obj.quat / norm(obj.quat);
+            delta_ang_err = 2 * q_err(2:4);                  % small-angle
+            td = max(obj.time_delay, dt_correct);
+            att_gain = 0.5 * obj.dt_update_avg / td;
+            obj.delta_ang_corr = delta_ang_err * att_gain;
 
-            % Velocity / position complementary filter.
-            k_v = min(dt_imu / max(obj.tau_vel, 1e-3), 1.0);
-            k_p = min(dt_imu / max(obj.tau_pos, 1e-3), 1.0);
-            obj.vel = obj.vel + k_v * (ekf.vel - obj.vel);
-            obj.pos = obj.pos + k_p * (ekf.pos - obj.pos);
+            % Velocity / position: proportional + weak integral tracker
+            % (cpp:305-341). Gains from the correction interval and the
+            % vel/pos time constants.
+            vel_gain = dt_correct / min(max(obj.tau_vel, dt_correct), 10.0);
+            pos_gain = dt_correct / min(max(obj.tau_pos, dt_correct), 10.0);
+            vel_err = ekf.vel - obj.vel;
+            pos_err = ekf.pos - obj.pos;
+            obj.vel_err_integ = obj.vel_err_integ + vel_err;
+            obj.pos_err_integ = obj.pos_err_integ + pos_err;
+            obj.vel = obj.vel + vel_err * vel_gain ...
+                    + obj.vel_err_integ * (vel_gain^2) * 0.1;
+            obj.pos = obj.pos + pos_err * pos_gain ...
+                    + obj.pos_err_integ * (pos_gain^2) * 0.1;
         end
 
         function s = stateOut(obj, omega_meas)
