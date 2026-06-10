@@ -28,9 +28,13 @@
 
 cam0:
   T_imu_cam: # rotation R_CtoI (camera optical -> IMU/body FRD), position p_CinI
+    # NavCamera local position in Quba.unity: y=-10 (Unity Y-up, metres).
+    # Vehicle.cs places the vehicle root at the drone's ENU altitude in metres,
+    # so the camera is 10 m below the IMU in world space.
+    # In body FRD (Z = down): p_CinI = [0, 0, +10].
     - [ 0.0,  1.0,  0.0,  0.0]
     - [-1.0,  0.0,  0.0,  0.0]
-    - [ 0.0,  0.0,  1.0,  0.0]
+    - [ 0.0,  0.0,  1.0, 10.0]
     - [ 0.0,  0.0,  0.0,  1.0]
   cam_overlaps: []
   camera_model: pinhole

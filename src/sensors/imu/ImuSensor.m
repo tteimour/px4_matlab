@@ -54,6 +54,10 @@ classdef ImuSensor < Sensor
         accel_vib_gain = 0.0  % m/s^2 std per unit gt.vib_level
         R_chip_to_body
         earth                % EarthModel handle (for gravity)
+        % Diagnostic noise scale: 0 = all stochastic noise off, 1 = nominal.
+        % Applies to bias random walk, thermal noise, vibration, and turn-on
+        % biases. Set via SensorHub.setImuNoiseScale() for VIO diagnostics.
+        noise_scale = 1.0
     end
 
     properties (Access = protected)
@@ -76,8 +80,8 @@ classdef ImuSensor < Sensor
         function initBias(obj)
             % Sample turn-on biases. Call after subclass constructor sets
             % the sigma values.
-            obj.gyro_bias_  = obj.gyro_turn_on  * randn(obj.rng, 3, 1);
-            obj.accel_bias_ = obj.accel_turn_on * randn(obj.rng, 3, 1);
+            obj.gyro_bias_  = obj.noise_scale * obj.gyro_turn_on  * randn(obj.rng, 3, 1);
+            obj.accel_bias_ = obj.noise_scale * obj.accel_turn_on * randn(obj.rng, 3, 1);
         end
 
         function reset(obj)
@@ -115,8 +119,9 @@ classdef ImuSensor < Sensor
             obj.last_t_ = t_sample;
 
             % Bias random walk update.
-            obj.gyro_bias_  = obj.gyro_bias_  + obj.gyro_brw  * sqrt(dt) * randn(obj.rng, 3, 1);
-            obj.accel_bias_ = obj.accel_bias_ + obj.accel_brw * sqrt(dt) * randn(obj.rng, 3, 1);
+            ns = obj.noise_scale;
+            obj.gyro_bias_  = obj.gyro_bias_  + ns * obj.gyro_brw  * sqrt(dt) * randn(obj.rng, 3, 1);
+            obj.accel_bias_ = obj.accel_bias_ + ns * obj.accel_brw * sqrt(dt) * randn(obj.rng, 3, 1);
 
             % Motor / prop vibration component, applied in chip frame.
             % gt.vib_level is roughly norm(m_last) so it spans 0..~1.8.
@@ -126,8 +131,8 @@ classdef ImuSensor < Sensor
             % --- Gyro: body angular rate in chip frame, biased + noisy + quantised.
             omega_body  = gt.angular_vel_b;
             omega_chip  = obj.R_chip_to_body' * omega_body;
-            gyro_noise  = obj.gyro_nd / sqrt(dt) * randn(obj.rng, 3, 1);
-            gyro_vib    = obj.gyro_vib_gain * vib * randn(obj.rng, 3, 1);
+            gyro_noise  = ns * obj.gyro_nd / sqrt(dt) * randn(obj.rng, 3, 1);
+            gyro_vib    = ns * obj.gyro_vib_gain * vib * randn(obj.rng, 3, 1);
             gyro_chip   = omega_chip + obj.R_chip_to_body' * obj.gyro_bias_ + gyro_noise + gyro_vib;
             gyro_chip   = obj.quantise(gyro_chip, deg2rad(obj.gyro_quant_dps));
             gyro_chip   = obj.clipFs(gyro_chip, deg2rad(obj.gyro_fs_dps));
@@ -139,8 +144,8 @@ classdef ImuSensor < Sensor
             g_ned   = obj.earth.gravityNed();
             sf_body = R_n2b * (gt.acceleration_ned - g_ned);
             sf_chip = obj.R_chip_to_body' * sf_body;
-            sf_noise = obj.accel_nd / sqrt(dt) * randn(obj.rng, 3, 1);
-            sf_vib   = obj.accel_vib_gain * vib * randn(obj.rng, 3, 1);
+            sf_noise = ns * obj.accel_nd / sqrt(dt) * randn(obj.rng, 3, 1);
+            sf_vib   = ns * obj.accel_vib_gain * vib * randn(obj.rng, 3, 1);
             sf_chip  = sf_chip + obj.R_chip_to_body' * obj.accel_bias_ + sf_noise + sf_vib;
             sf_chip  = obj.quantise(sf_chip, obj.accel_quant_g * obj.earth.g_mps2);
             sf_chip  = obj.clipFs(sf_chip, obj.accel_fs_g * obj.earth.g_mps2);

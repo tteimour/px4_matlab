@@ -82,20 +82,18 @@ filepath_gt: "/tmp/ov_groundtruth.txt"
 # ==================================================================
 
 use_klt: true
-num_pts: 200
-fast_threshold: 15
+num_pts: 300        # more features (was 200) -- robustness vs feature starvation
+fast_threshold: 10  # detect more corners on low-contrast aerial imagery (was 15)
 grid_x: 16 # 512 px width
 grid_y: 16 # 512 px height (square render)
-min_px_dist: 12
+min_px_dist: 10     # allow slightly denser features (was 12)
 knn_ratio: 0.70
-# NOTE: the Unity NavCamera currently publishes only 5 fps (Quba.unity streams
-# fps:5). track_frequency caps tracking at 30 Hz but the EFFECTIVE camera rate is
-# the input rate (~5 Hz) — too low for robust VIO. Raise the NavCamera fps in
-# Quba.unity (and switch Vehicle.cs capture to AsyncGPUReadback) to ~20-30 fps.
+# Unity NavCamera streams at 30 fps (Quba.unity streams fps:30). Actual delivery
+# rate depends on rosbridge throughput; expect 10-30 Hz depending on system load.
 track_frequency: 30.0
 downsample_cameras: false
 num_opencv_threads: 4
-histogram_method: "HISTOGRAM" # NONE, HISTOGRAM, CLAHE
+histogram_method: "CLAHE" # CLAHE: contrast-equalize low-contrast aerial imagery (was HISTOGRAM)
 
 # aruco tag tracker — disabled
 use_aruco: false

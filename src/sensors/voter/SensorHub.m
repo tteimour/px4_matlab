@@ -90,6 +90,16 @@ classdef SensorHub < handle
             end
         end
 
+        function setImuNoiseScale(obj, scale)
+            % Scale all stochastic IMU noise (0 = off, 1 = nominal).
+            % Applies to bias random walk, thermal noise, vibration, and
+            % turn-on biases on the NEXT reset/initBias call. Use 0 to
+            % feed VIO near-perfect IMU for drift diagnostics.
+            for i = 1:numel(obj.imu.sensors)
+                obj.imu.sensors{i}.noise_scale = scale;
+            end
+        end
+
         function [g, a] = primaryImuTrueBias(obj)
             % Live body-frame bias of the currently-voted primary IMU
             % (includes any bias-random-walk drift accumulated since

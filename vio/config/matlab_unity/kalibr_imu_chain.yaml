@@ -1,31 +1,26 @@
 %YAML:1.0
 
-# IMU calibration for the MATLAB-sim VIO IMU (ImuBridge -> /vio_imu/data).
+# IMU calibration for the MATLAB-sim VIO IMU (ImuBridge, topic /vio_imu/data).
 #
-# Source sensor: px4_matlab primary IMU = Invensense ICM-45686
-#   (px4_matlab/src/sensors/imu/ImuICM45686.m), published in body FRD as
-#   specific force + angular rate, decimated from 1 kHz to 200 Hz.
+# Source sensor: px4_matlab VOTED PRIMARY IMU is the Invensense ICM-45686
+#   (px4_matlab/src/sensors/imu/ImuICM45686.m, priority 90 = primary),
+#   published in body FRD as specific force plus angular rate, decimated from
+#   1 kHz to 200 Hz. These values MATCH the sensor model datasheet noise
+#   (no vibration: gyro_vib_gain and accel_vib_gain are 0 in every IMU chip).
 #
-# Datasheet chip noise (from ImuICM45686.m):
+# Datasheet chip noise (equals ImuICM45686.m gyro_nd accel_nd gyro_brw accel_brw):
 #   gyro  noise density  = 6.63e-5 rad/s/sqrt(Hz)
 #   accel noise density  = 6.87e-4 m/s^2/sqrt(Hz)
 #   gyro  bias RW        = 2.18e-5 rad/s/sqrt(s)
 #   accel bias RW        = 9.81e-4 m/s^2/sqrt(s)
+# (kalibr random_walk units m/s^3/sqrt(Hz) equal m/s^2/sqrt(s), so they map 1:1.)
 #
-# BUT the sim adds motor/prop vibration that DOMINATES in flight
-# (ImuICM45686.m: gyro_vib_gain=0.20 rad/s, accel_vib_gain=4.5 m/s^2 per unit
-# vib_level; vib ~= 1 at hover). As a continuous-time density at the 1 kHz
-# internal rate:
-#   accel vib ND ~= 4.5  / sqrt(1000) = 0.142  m/s^2/sqrt(Hz)
-#   gyro  vib ND ~= 0.20 / sqrt(1000) = 0.0063 rad/s/sqrt(Hz)
-# The 200 Hz stream is decimated by taking 1-of-5 samples (no averaging), so the
-# per-sample vibration std is preserved -> the values below are set near the
-# vibration-dominated bound, well above the datasheet chip noise.
-#
-# >>> THESE ARE UN-TUNED STARTING VALUES <<< Tune them against the ACTUAL
-# /vio_imu/data stream (Allan variance, or trial-and-error on init/consistency).
-# If VIO is noisy, the better fix is to average-downsample in ImuBridge (sum
-# delta_ang/delta_vel over the 5 substeps) which cuts vibration noise by ~sqrt(5).
+# CAVEAT (decimation): /vio_imu/data is 1-of-5 decimation (NO averaging), so the
+# per-sample noise at 200 Hz equals the 1 kHz per-sample noise. To be statistically
+# exact, the OpenVINS continuous density should be about sqrt(1000/200)=2.24x these.
+# We keep the datasheet values (sensor equals VIO, as requested); if OpenVINS is
+# overconfident or inconsistent, either scale these up about 2.2x OR average-downsample
+# in ImuBridge (sum delta_ang and delta_vel over the 5 substeps) to make datasheet exact.
 
 imu0:
   T_i_b:
@@ -33,10 +28,10 @@ imu0:
     - [0.0, 1.0, 0.0, 0.0]
     - [0.0, 0.0, 1.0, 0.0]
     - [0.0, 0.0, 0.0, 1.0]
-  accelerometer_noise_density: 2.0000e-3  # [ m / s^2 / sqrt(Hz) ] Gazebo-matched (was 1.5e-1)
-  accelerometer_random_walk: 3.0000e-4    # [ m / s^3 / sqrt(Hz) ] Gazebo-matched
-  gyroscope_noise_density: 2.0000e-4      # [ rad / s / sqrt(Hz) ] Gazebo-matched (was 1.0e-2)
-  gyroscope_random_walk: 1.0000e-5        # [ rad / s^2 / sqrt(Hz) ] Gazebo-matched
+  accelerometer_noise_density: 6.8700e-4  # [ m / s^2 / sqrt(Hz) ] ICM-45686 datasheet (was 2.0e-3 Gazebo)
+  accelerometer_random_walk: 9.8100e-4    # [ m / s^3 / sqrt(Hz) ] ICM-45686 accel bias RW
+  gyroscope_noise_density: 6.6300e-5      # [ rad / s / sqrt(Hz) ] ICM-45686 datasheet (was 2.0e-4 Gazebo)
+  gyroscope_random_walk: 2.1800e-5        # [ rad / s^2 / sqrt(Hz) ] ICM-45686 gyro bias RW
   rostopic: /vio_imu/data
   time_offset: 0.0
   update_rate: 200.0

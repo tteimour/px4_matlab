@@ -95,8 +95,9 @@ default_mode_idx = 3;             % start in Position
 % =====================================================================
 ctrl_fig = figure('Name', 'Stick console — flies from any tab', ...
     'NumberTitle', 'off', 'MenuBar', 'none', 'ToolBar', 'none', ...
-    'Color', T.bg, 'Position', [60 90 520 330], ...
-    'CloseRequestFcn', @(~,~) ctrl_fig_close(fig, ctrl_fig));
+    'Color', T.bg, 'Position', [60 90 520 330]);
+% Set CloseRequestFcn AFTER assignment so the closure captures the live handle.
+set(ctrl_fig, 'CloseRequestFcn', @(~,~) ctrl_fig_close(fig, ctrl_fig));
 applyThemeDefaults(ctrl_fig, T);
 ax_left = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
                'Position', [0.06 0.30 0.40 0.64]);
@@ -348,10 +349,14 @@ while ishandle(fig) && getappdata(fig, 'running')
         % output predictor, and the staleness trackers — so post-Reset sim time
         % restarts cleanly at 0 and fresh IMU samples flow again (required for
         % the VIO IMU bridge, and fixes the pre-existing estimator stall on Reset).
+        % Apply IMU noise scale before reset so initBias() sees it.
+        imu_ns = 1.0;
+        if logical(get(vio_ui.imu_noise_cb, 'Value')), imu_ns = 0.0; end
+        est_bus.sensors.setImuNoiseScale(imu_ns);
         est_bus.reset();
         % Re-inject the known bias after reset so post-Reset runs
         % have the same truth bias to estimate.
-        est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
+        est_bus.sensors.applyImuBias(true_gyro_bias * imu_ns, true_accel_bias * imu_ns);
         t_sim   = 0;
         last_imu_pub_t    = -inf;  % sim time restarts at 0; re-arm IMU decimation
         imu_acc_g = [0;0;0]; imu_acc_a = [0;0;0]; imu_acc_n = 0; imu_acc_t = -inf;
@@ -368,6 +373,10 @@ while ishandle(fig) && getappdata(fig, 'running')
             set(fuse_cb, 'Value', 0);
             clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
             clearpoints(mission_map.vio_trail);
+            for ha = [mission_map.gt_arrow, mission_map.ekf_arrow, mission_map.vio_arrow]
+                set(ha, 'XData', NaN, 'YData', NaN);
+                ud = get(ha, 'UserData'); ud.hdg = NaN; set(ha, 'UserData', ud);
+            end
             fprintf('VIO logging stopped by Reset (sim clock restarted).\n');
         end
         log_idx = 0;
@@ -869,12 +878,13 @@ while ishandle(fig) && getappdata(fig, 'running')
             vio_idx = 0; vio_last_stamp = -inf; vio_overflow_warned = false;
             vio_logging = true;
             vio_align_R = []; vio_align_t = [];  % fresh map-trail alignment
-            clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
-            clearpoints(mission_map.vio_trail);
+            clearpoints(mission_map.vio_trail);  % GT/EKF trails keep their history
             fprintf('VIO logging started at t=%.2f s (anchored at ground truth).\n', t_sim);
         end
     elseif ~vio_on && prev_vio_on             % falling edge: stop, plot, free
         vio_logging = false;
+        set(mission_map.vio_arrow, 'XData', NaN, 'YData', NaN);
+        ud = get(mission_map.vio_arrow, 'UserData'); ud.hdg = NaN; set(mission_map.vio_arrow, 'UserData', ud);
         plotVioComparison(vio_log, vio_idx);
         if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
         vio_node = []; vio_sub = [];          % so re-enable rebuilds cleanly
@@ -935,15 +945,18 @@ while ishandle(fig) && getappdata(fig, 'running')
                     vio_log.vio_vel(vio_idx, :) = vv;
                     vio_last_stamp = vstamp;
 
-                    % --- live 2D map trails (Mission tab) ------------------
-                    % GT (white) + EKF (cyan) appended every sample; VIO (red)
-                    % once a frozen GT alignment exists -- so VIO divergence
-                    % shows as the red trail drifting off GT.
-                    addpoints(mission_map.gt_trail,  gtn.position_ned(2),  gtn.position_ned(1));
-                    addpoints(mission_map.ekf_trail, estn.position_ned(2), estn.position_ned(1));
+                    % --- live VIO trail (Mission tab) ----------------------
+                    % GT and EKF trails are updated unconditionally every
+                    % frame (below the VIO block), so only add the VIO trail
+                    % here, once a frozen GT alignment exists.
                     if ~isempty(vio_align_R)
                         a = vio_align_R * vp.' + vio_align_t;
                         addpoints(mission_map.vio_trail, a(2), a(1));
+                        % heading from delta between last two aligned VIO positions
+                        if vio_idx >= 2
+                            a_prev = vio_align_R * vio_log.vio_pos(vio_idx-1,:).' + vio_align_t;
+                            updateHeadingArrow(mission_map.vio_arrow, a(2), a(1), a(2)-a_prev(2), a(1)-a_prev(1));
+                        end
                     elseif vio_idx >= 80 && mod(vio_idx, 10) == 0
                         gn = vio_log.gt_pos(1:vio_idx, 1:2);
                         if max(max(gn, [], 1) - min(gn, [], 1)) > 2   % moved enough to fix yaw
@@ -958,6 +971,15 @@ while ishandle(fig) && getappdata(fig, 'running')
             end
         end
     end
+
+    % --- Always-on GT and EKF map trails ----------------------------------
+    % Updated every outer-loop frame (~20-30 Hz) independent of VIO state.
+    gtn_map  = plant.state();
+    estn_map = est_bus.stateOut();
+    addpoints(mission_map.gt_trail,  gtn_map.position_ned(2),  gtn_map.position_ned(1));
+    addpoints(mission_map.ekf_trail, estn_map.position_ned(2), estn_map.position_ned(1));
+    updateHeadingArrow(mission_map.gt_arrow,  gtn_map.position_ned(2),  gtn_map.position_ned(1),  gtn_map.velocity_ned(2),  gtn_map.velocity_ned(1));
+    updateHeadingArrow(mission_map.ekf_arrow, estn_map.position_ned(2), estn_map.position_ned(1), estn_map.velocity_ned(2), estn_map.velocity_ned(1));
 
     % --- VIO -> EKF fusion: replace GPS with OpenVINS odometry ------------
     % Requires VIO logging on. On the rising edge, anchor the OpenVINS
@@ -979,18 +1001,28 @@ while ishandle(fig) && getappdata(fig, 'running')
                   double(vmsg.header.stamp.nanosec) * 1e-9;
             if all(isfinite([vp; vq; vv; vts])) && norm(vq) > 0.5
                 if isempty(vio_fuse_R)
-                    est0  = est_bus.stateOut();
-                    rpy_e = quat_to_euler(est0.attitude_q);
-                    rpy_v = quat_to_euler(vq);
-                    dyaw  = rpy_e(3) - rpy_v(3);
-                    cy = cos(dyaw); sy = sin(dyaw);
-                    vio_fuse_R   = [cy -sy 0; sy cy 0; 0 0 1];
+                    % Use ground truth when EKF feed is off so the anchor
+                    % position/attitude is reliable regardless of EKF state.
+                    if use_est
+                        anchor0 = est_bus.stateOut();
+                    else
+                        anchor0 = plant.state();
+                    end
+                    % Full 3D rotation: OpenVINS-global frame -> NED.
+                    % OpenVINS publishes JPL q_GtoI stored as [x,y,z,w].
+                    % MATLAB reads it as Hamilton [w;x;y;z], so
+                    %   quat_to_dcm(vq) = R_ItoG (body->global)
+                    %   quat_to_dcm(vq)' = R_GtoI (global->body)
+                    % R_G2NED = R_b2n_anchor * R_GtoI_anchor
+                    % This accounts for the Y/Z axis inversion between the
+                    % ENU-like OpenVINS world frame and NED.
+                    vio_fuse_R   = quat_to_dcm(anchor0.attitude_q) * quat_to_dcm(vq)';
                     vio_fuse_p0  = vp;
-                    vio_fuse_pe0 = est0.position_ned;
+                    vio_fuse_pe0 = anchor0.position_ned;
                     est_bus.enableVio(true);
-                    fprintf(['VIO->EKF ON: anchored at EKF [%.1f %.1f %.1f] m, ' ...
-                             'dyaw=%.1f deg. GPS fusion suspended.\n'], ...
-                            vio_fuse_pe0(1), vio_fuse_pe0(2), vio_fuse_pe0(3), rad2deg(dyaw));
+                    fprintf(['VIO->EKF ON: anchored at [%.1f %.1f %.1f] m. ' ...
+                             'GPS fusion suspended.\n'], ...
+                            vio_fuse_pe0(1), vio_fuse_pe0(2), vio_fuse_pe0(3));
                 end
                 pos_ned = vio_fuse_R * (vp - vio_fuse_p0) + vio_fuse_pe0;
                 vel_ned = vio_fuse_R * (quat_to_dcm(vq) * vv);   % body->global->NED
@@ -1500,8 +1532,15 @@ fuse_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
     'Position', [0.49 0.945 0.50 0.04], 'ForegroundColor', T.nav, ...
     'Value', 0, 'FontWeight', 'bold', 'FontSize', 11, ...
     'String', 'Fuse VIO -> EKF  (replace GPS)');
+% Diagnostic: zero all stochastic IMU noise going to VIO (bias random walk,
+% thermal noise, vibration, turn-on biases). Lets you isolate whether drift
+% is caused by IMU noise vs. a frame/convention bug.
+imu_noise_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
+    'Position', [0.02 0.905 0.96 0.035], 'ForegroundColor', [1.0 0.6 0.2], ...
+    'Value', 0, 'FontSize', 9, ...
+    'String', 'DIAG: zero IMU noise to VIO  (bias RW, thermal, vib off — takes effect on next Reset)');
 uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.02 0.90 0.96 0.04], 'ForegroundColor', T.sub, ...
+    'Position', [0.02 0.87 0.96 0.04], 'ForegroundColor', T.sub, ...
     'HorizontalAlignment', 'left', 'FontSize', 8, ...
     'String', ['Params are written to the OpenVINS config and applied on Enable ' ...
         '(OpenVINS relaunches). Tip: fly up to ~30 m, THEN enable -- a wider ground ' ...
@@ -1562,7 +1601,7 @@ uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
         'features. If the right view has few/no points, the camera is feature-' ...
         'starved (fly higher, lower fast_threshold, or CLAHE).']);
 
-vio_ui = struct('vio_cb', vio_cb, 'fuse_cb', fuse_cb, 'ed', ed, 'readout', readout, ...
+vio_ui = struct('vio_cb', vio_cb, 'fuse_cb', fuse_cb, 'imu_noise_cb', imu_noise_cb, 'ed', ed, 'readout', readout, ...
     'axRaw', axRaw, 'imgRaw', imgRaw, 'axTrk', axTrk, 'imgTrk', imgTrk);
 end
 
@@ -1942,7 +1981,7 @@ function mm = buildMissionTab(parent, fig, fmm)
 T = gcsTheme();
 lat0 = 40.32214266903304;   % Cesium origin (Baku), verified from Quba.unity
 lon0 = 49.59745;
-HALF = 350;                 % half-extent -> 700 m x 700 m map
+HALF = 1000;                % half-extent -> 2 km x 2 km map
 
 % --- map axes (left), north-up local metres -------------------------------
 axm = axes('Parent', parent, 'Units', 'normalized', ...
@@ -1984,16 +2023,15 @@ hEnd    = plot(axm, NaN, NaN, 'o', 'MarkerSize', 11, 'LineWidth', 1.0, ...
                'MarkerFaceColor', T.bad, 'MarkerEdgeColor', 'k', ...
                'HitTest', 'off', 'PickableParts', 'none');
 
-% Live 2D flown-path trails (filled by the sim loop while VIO logging is on):
-% ground truth (white), EKF (cyan), VIO aligned to GT (red). animatedline is
-% incremental, so per-frame appends stay cheap.
+% Live 2D flown-path trails (always active, not gated on VIO):
+% ground truth (green), EKF (red), VIO aligned to GT (orange, dashed).
 % MaximumNumPoints caps the trail so the Mission map does not slow down over a
 % long flight (the full path still goes to the comparison plot via vio_log).
-gtTrail  = animatedline(axm, 'Color', [1 1 1],     'LineWidth', 3.0, ...
+gtTrail  = animatedline(axm, 'Color', [0.20 0.90 0.00], 'LineWidth', 3.0, ...
                         'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
-ekfTrail = animatedline(axm, 'Color', T.data,      'LineWidth', 3.0, ...
+ekfTrail = animatedline(axm, 'Color', [0.95 0.10 0.10], 'LineWidth', 3.0, ...
                         'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
-vioTrail = animatedline(axm, 'Color', [1 0.35 0.35], 'LineStyle', '--', ...
+vioTrail = animatedline(axm, 'Color', [1.00 0.55 0.00], 'LineStyle', '--', ...
                         'MaximumNumPoints', 6000, 'LineWidth', 3.0, ...
                         'HitTest', 'off', 'PickableParts', 'none');
 % Clickable legend: click an entry to hide/show that trail (toggles its
@@ -2067,13 +2105,38 @@ state_lbl = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
     'ForegroundColor', T.text, 'HorizontalAlignment', 'left', ...
     'FontName', T.mono, 'FontSize', 9, 'String', '');
 
-% click handler: axes children have HitTest off, so the axes gets the click.
-set(axm, 'ButtonDownFcn', @(src, ~) onMapClick(src, fig, altEdit, HALF));
+% click handler: left-click adds waypoint, right-click starts pan drag.
+% Scroll-wheel zooms around the cursor; double-click resets the view.
+set(axm, 'ButtonDownFcn', @(src, ~) onMapButton(src, fig, altEdit, HALF));
+set(fig, 'WindowScrollWheelFcn',  @(~, ev) onMapScroll(axm, ev));
+set(fig, 'WindowButtonMotionFcn', @(~, ~)  onMapPanMotion(fig, axm));
+set(fig, 'WindowButtonUpFcn',     @(~, ~)  onMapPanEnd(fig));
+setappdata(fig, 'map_pan_start', []);
+
+% Heading arrows: filled triangle at the tip of each trail showing flight
+% direction. Drawn on top of trails; UserData caches the last valid heading
+% so the arrow holds direction when the vehicle is stationary.
+ARROW_SZ = 28;   % arrow length in map metres
+gtArrow  = patch(axm, NaN, NaN, [0.20 0.90 0.00], 'EdgeColor', 'none', ...
+                 'HitTest', 'off', 'PickableParts', 'none', ...
+                 'UserData', struct('hdg', NaN, 'sz', ARROW_SZ));
+ekfArrow = patch(axm, NaN, NaN, [0.95 0.10 0.10], 'EdgeColor', 'none', ...
+                 'HitTest', 'off', 'PickableParts', 'none', ...
+                 'UserData', struct('hdg', NaN, 'sz', ARROW_SZ));
+vioArrow = patch(axm, NaN, NaN, [1.00 0.55 0.00], 'EdgeColor', 'none', ...
+                 'HitTest', 'off', 'PickableParts', 'none', ...
+                 'UserData', struct('hdg', NaN, 'sz', ARROW_SZ));
+
+% Link each trail to its arrow via AppData so legendToggleTrail can sync visibility.
+setappdata(gtTrail,  'arrow', gtArrow);
+setappdata(ekfTrail, 'arrow', ekfArrow);
+setappdata(vioTrail, 'arrow', vioArrow);
 
 mm = struct('ax', axm, 'path', hPath, 'launch', hLaunch, 'mid', hMid, ...
             'endp', hEnd, 'table', tbl, 'altEdit', altEdit, ...
             'state_lbl', state_lbl, 'pfd', pfd, ...
-            'gt_trail', gtTrail, 'ekf_trail', ekfTrail, 'vio_trail', vioTrail);
+            'gt_trail', gtTrail, 'ekf_trail', ekfTrail, 'vio_trail', vioTrail, ...
+            'gt_arrow', gtArrow, 'ekf_arrow', ekfArrow, 'vio_arrow', vioArrow);
 end
 
 % =========================================================================
@@ -2480,10 +2543,12 @@ end
 % Legend click handler: toggle the clicked trail's visibility on/off.
 function legendToggleTrail(~, ev)
 h = ev.Peer;
-if strcmp(get(h, 'Visible'), 'on')
-    set(h, 'Visible', 'off');
-else
-    set(h, 'Visible', 'on');
+newVis = 'off';
+if strcmp(get(h, 'Visible'), 'on'), newVis = 'off'; else, newVis = 'on'; end
+set(h, 'Visible', newVis);
+arrow = getappdata(h, 'arrow');
+if ~isempty(arrow) && ishandle(arrow)
+    set(arrow, 'Visible', newVis);
 end
 end
 
@@ -2547,14 +2612,53 @@ if ~isempty(btn)
 end
 end
 
-% Map click -> stash an [N E D] add request for the sim loop.
-function onMapClick(axm, fig, altEdit, HALF)
+% Left-click: add waypoint. Right-click: start pan drag. Double-click: reset view.
+function onMapButton(axm, fig, altEdit, HALF)
 cp = get(axm, 'CurrentPoint');
-E = cp(1, 1); N = cp(1, 2);
-if abs(E) > HALF || abs(N) > HALF, return; end   % ignore clicks outside box
-alt = str2double(get(altEdit, 'String'));
-if ~isfinite(alt), alt = 10; end
-setappdata(fig, 'map_add_request', [N, E, -alt]);   % NED, D = -altitude
+E = cp(1,1); N = cp(1,2);
+switch get(ancestor(axm,'figure'), 'SelectionType')
+    case 'normal'   % left single-click -> add waypoint
+        if abs(E) > HALF || abs(N) > HALF, return; end
+        alt = str2double(get(altEdit, 'String'));
+        if ~isfinite(alt), alt = 10; end
+        setappdata(fig, 'map_add_request', [N, E, -alt]);
+    case 'alt'      % right-click -> start pan; store click position + current limits
+        setappdata(fig, 'map_pan_start', [E, N, xlim(axm), ylim(axm)]);
+    case 'open'     % double-click -> reset to full extent
+        HALF2 = getappdata(axm, 'HALF');
+        xlim(axm, [-HALF2 HALF2]); ylim(axm, [-HALF2 HALF2]);
+end
+end
+
+% Scroll-wheel zoom centred on the cursor, only when over the map axes.
+function onMapScroll(axm, ev)
+if ~ishandle(axm), return; end
+hfig = ancestor(axm, 'figure');
+fp = get(hfig, 'CurrentPoint');
+ap = getpixelposition(axm, true);
+if fp(1) < ap(1) || fp(1) > ap(1)+ap(3) || fp(2) < ap(2) || fp(2) > ap(2)+ap(4)
+    return;
+end
+factor = 1.15 ^ (-ev.VerticalScrollCount);   % scroll up = zoom in
+cp = get(axm, 'CurrentPoint');
+cx = cp(1,1); cy = cp(1,2);
+xlim(axm, cx + (xlim(axm) - cx) * factor);
+ylim(axm, cy + (ylim(axm) - cy) * factor);
+end
+
+% Pan drag: called on every mouse move; acts only while a right-click is held.
+function onMapPanMotion(fig, axm)
+ps = getappdata(fig, 'map_pan_start');
+if isempty(ps) || ~ishandle(axm), return; end
+cp = get(axm, 'CurrentPoint');
+dx = cp(1,1) - ps(1);  dy = cp(1,2) - ps(2);
+xlim(axm, ps(3:4) - dx);
+ylim(axm, ps(5:6) - dy);
+end
+
+% Clear pan state when any mouse button is released.
+function onMapPanEnd(fig)
+setappdata(fig, 'map_pan_start', []);
 end
 
 % Takeoff-altitude edit: write straight onto the live FlightModeManager
@@ -3009,4 +3113,34 @@ if ishandle(fig)
     setappdata(fig, 'running', false);
 end
 delete(ctrl_fig);
+end
+
+function updateHeadingArrow(h, E, N, vE, vN)
+% Update a filled triangle at (E,N) pointing in the direction (vE,vN).
+% Heading is only updated when ground speed >= 0.5 m/s to ignore hover
+% jitter near waypoints. Exponential smoothing (complex-number mean,
+% handles wrap) prevents sudden flips during turns.
+if ~ishandle(h), return; end
+ud = get(h, 'UserData');
+if norm([vE, vN]) >= 0.5
+    new_hdg = atan2(vE, vN);   % 0 = North, pi/2 = East (map x=E, y=N)
+    if isnan(ud.hdg)
+        ud.hdg = new_hdg;
+    else
+        alpha = 0.18;           % ~3-4 frame time constant at 20-30 Hz
+        z = (1-alpha)*exp(1j*ud.hdg) + alpha*exp(1j*new_hdg);
+        ud.hdg = angle(z);
+    end
+    set(h, 'UserData', ud);
+end
+if isnan(ud.hdg), return; end
+sz = ud.sz;
+% Unit direction vector in map coords [E, N]
+dx = sin(ud.hdg); dy = cos(ud.hdg);
+% Perpendicular (left side of arrow)
+px = -dy; py = dx;
+W = sz * 0.40;   % half-width of arrow base
+% Triangle: tip, base-left, base-right
+set(h, 'XData', [E,               E - sz*dx + W*px,  E - sz*dx - W*px], ...
+       'YData', [N,               N - sz*dy + W*py,  N - sz*dy - W*py]);
 end

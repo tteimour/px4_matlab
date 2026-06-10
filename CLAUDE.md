@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # PX4 Quadcopter Controller — MATLAB Replication
 
 ## Project goal
@@ -7,6 +11,47 @@ auto-mode down to actuator outputs, plus the sensor stack and EKF2
 estimator that PX4 normally feeds the controller from. The simulation
 targets the **Holybro Pixhawk 6X (V6X_6 hardware revision)** sensor
 suite paired with a **u-blox NEO-M9N** GNSS module.
+
+## Running the simulation
+
+All entry points are in `sim/`. They self-add paths via `addpath`, so they
+can be invoked from any working directory in MATLAB.
+
+```matlab
+% Interactive GCS flight deck (dark theme, tabbed UI, manual sticks)
+run_interactive          % sim/run_interactive.m
+
+% Non-interactive 500 m-square mission (saves mission_result.png, tracking_errors.png)
+run_mission              % sim/run_mission.m
+
+% Drive the attitude autotune state machine end-to-end against the plant
+run_autotune             % sim/run_autotune.m
+
+% Compare OpenVINS VIO against MATLAB EKF2 (requires sim_log in base workspace
+% and a recorded ROS 2 bag from /ov_msckf/odomimu)
+compare_vio_ekf('vio_run')   % sim/compare_vio_ekf.m
+```
+
+`run_interactive` has a **SENSORS tab** (estimator feed ON/OFF toggle). When
+ON, the full sensor→voter→EKF2→OutputPredictor chain replaces ground-truth
+state. Both modes produce the same controller-facing state struct shape.
+
+## Running tests
+
+From the MATLAB command window:
+
+```matlab
+cd tests/unit
+run_all_tests           % runs all test_*.m in alphabetical order
+
+% Run a single test
+test_ekf2_basics
+test_rate_controller
+% etc.
+```
+
+Each test calls `error()` on failure, so `run_all_tests` catches and counts
+failures. No test framework dependency.
 
 ## Scope
 
@@ -174,6 +219,57 @@ sim step.
 - Each module gets a unit test in `tests/unit/` that verifies behavior
   against a hand-computed case.
 
+## VIO / OpenVINS integration
+
+The `vio/` directory holds the OpenVINS observer pipeline. See
+`vio/README.md` for full details. Summary:
+
+```
+vio/
+  open_vins/          git submodule (rpng/open_vins, unmodified upstream)
+  openvins_ws/src/
+    openvins_matlab_bridge/   Unity NavCamera → /down_cam/image_raw + launch
+    openvins_px4_bridge/      PX4 SITL bridge (needs px4_msgs)
+  config/
+    matlab_unity/   estimator_config.yaml, kalibr_imu_chain.yaml, kalibr_imucam_chain.yaml
+    px4_sitl/       equivalent configs for SITL
+```
+
+**First-time build** (after `git submodule update --init vio/open_vins`):
+
+```bash
+cd vio/open_vins
+colcon build --packages-select ov_core ov_init ov_msckf ov_eval \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+cd ../openvins_ws
+colcon build
+```
+
+**Run (MATLAB + Unity path)** — source order: `/opt/ros/humble` → `vio/open_vins/install` → `vio/openvins_ws/install`:
+
+1. `ros2 launch rosbridge_server rosbridge_websocket_launch.xml`
+2. In MATLAB: `run_interactive` → enable **Stream pose to Cesium/Unity**
+3. Unity: Play the Quba scene
+4. `ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py`
+
+Output: `/ov_msckf/odomimu` (`nav_msgs/Odometry`, ~125 Hz).
+
+**Compare VIO vs EKF2**: record a bag during flight
+(`ros2 bag record -o vio_run /ov_msckf/odomimu`), then in MATLAB with
+`sim_log` in the base workspace: `compare_vio_ekf('vio_run')`. Uses
+SE3 Umeyama alignment (`src/math/umeyama_align.m`) before computing ATE
+because OpenVINS' gauge yaw and origin are unobservable.
+
+## Unity/Cesium bridge
+
+`src/bridge/CesiumBridge.m` publishes `geometry_msgs/PoseArray` on
+`/world/default/pose/info` as a ROS 2 node. Frame convention: Gazebo
+ENU/FLU (converted from NED/FRD by `ned_frd_to_enu_flu()`). ROS quaternion
+order is `(x,y,z,w)`; px4_matlab uses `[w;x;y;z]` — the bridge handles
+the swap. Only `rosbridge_server` is needed on the Unity side; PX4 SITL
+and Gazebo are not required.
+
 ## Current status
 
 - [x] Plant model (QuadrotorDynamics.m)
@@ -181,7 +277,7 @@ sim step.
 - [x] Attitude controller
 - [x] Position controller
 - [x] Mission/navigator
-- [x] End-to-end mission sim
+- [x] End-to-end mission sim (500 m-square, `sim/run_mission.m`)
 - [x] Sensor models (IMU x3, baro x2, mag x2, GNSS)
 - [x] Sensor voter / selection
 - [x] EKF2 24-state subset (predict + baro + GNSS + mag + gravity)
@@ -190,7 +286,5 @@ sim step.
 - [x] System-identification autotune (ArxRls + SystemIdentification +
       GMVC pid_design + McAutotuneAttitudeControl state machine);
       demo in sim/run_autotune.m, unit tests vs PX4 reference values
+- [x] VIO/OpenVINS integration (observer path, compare_vio_ekf)
 - [ ] Estimator validation (unit + bench tests)
-
-## Mission Plan
-- Create a mission for multicopter in a 3d world like around 500 meter squared mission and visualize it using matlab tools.
