@@ -81,7 +81,7 @@ classdef LowPassFilter2p < handle
             if abs(1 + obj.a1 + obj.a2) > eps('single')   % FLT_EPSILON
                 obj.d1 = sample / (1 + obj.a1 + obj.a2);
                 obj.d2 = obj.d1;
-                if ~isfinite(obj.d1) || ~isfinite(obj.d2)
+                if any(~isfinite(obj.d1(:))) || any(~isfinite(obj.d2(:)))
                     obj.d1 = sample;
                     obj.d2 = sample;
                 end

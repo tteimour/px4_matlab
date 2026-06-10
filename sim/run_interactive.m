@@ -96,7 +96,7 @@ default_mode_idx = 3;             % start in Position
 ctrl_fig = figure('Name', 'Stick console — flies from any tab', ...
     'NumberTitle', 'off', 'MenuBar', 'none', 'ToolBar', 'none', ...
     'Color', T.bg, 'Position', [60 90 520 330], ...
-    'CloseRequestFcn', @(~,~) setappdata(fig, 'running', false));
+    'CloseRequestFcn', @(~,~) ctrl_fig_close(fig, ctrl_fig));
 applyThemeDefaults(ctrl_fig, T);
 ax_left = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
                'Position', [0.06 0.30 0.40 0.64]);
@@ -3022,4 +3022,11 @@ end
 
 function attYawSet(att_ctl, w)
 att_ctl.setProportionalGain(attPGet(att_ctl), w);
+end
+
+function ctrl_fig_close(fig, ctrl_fig)
+if ishandle(fig)
+    setappdata(fig, 'running', false);
+end
+delete(ctrl_fig);
 end
