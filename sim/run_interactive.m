@@ -798,7 +798,14 @@ while ishandle(fig) && getappdata(fig, 'running')
         % up together; the substep loop above does the 200 Hz publishing.
         if isempty(imu_bridge) && ~imu_stream_failed
             try
-                imu_bridge = ImuBridge();
+                % Windows: MATLAB cannot join the WSL2 DDS domain, so the
+                % IMU goes through rosbridge (WebSocket) like the pose;
+                % native DDS on Linux.
+                if ispc
+                    imu_bridge = ImuBridgeWs();
+                else
+                    imu_bridge = ImuBridge();
+                end
                 last_imu_pub_t = -inf;
                 fprintf('IMU bridge: publishing to %s @ %d Hz\n', ...
                         imu_bridge.Topic, imu_pub_hz);
@@ -831,11 +838,19 @@ while ishandle(fig) && getappdata(fig, 'running')
             writeVioParams(vio_ui);           % apply the VIO-tab params to the config
             openvins_pid = startOpenvins();
         end
-        if isempty(vio_node)                  % gate on node (sub may be stale)
+        if isempty(vio_sub)                   % (re)build the odom subscription
             try
-                vio_node = ros2node('/px4_matlab_vio', 0);
-                vio_sub  = ros2subscriber(vio_node, '/ov_msckf/odomimu', ...
-                    'nav_msgs/Odometry', @(m) onVioMessage(fig, m));
+                if ispc
+                    % Windows: poll OpenVINS odometry over the rosbridge
+                    % WebSocket (no DDS across the WSL2 boundary). The sim
+                    % loop polls vio_sub.latest() each frame; vio_node and
+                    % the in-GUI image streams stay disabled.
+                    vio_sub = VioOdomSubWs();
+                else
+                    vio_node = ros2node('/px4_matlab_vio', 0);
+                    vio_sub  = ros2subscriber(vio_node, '/ov_msckf/odomimu', ...
+                        'nav_msgs/Odometry', @(m) onVioMessage(fig, m));
+                end
                 % Image subscribers are created lazily below, only while the VIO
                 % tab is open -- deserializing ~60 frames/s on MATLAB's single
                 % thread is what froze the GUI when flying on other tabs.
@@ -886,6 +901,12 @@ while ishandle(fig) && getappdata(fig, 'running')
     end
 
     if vio_logging && ~isempty(vio_sub)
+        % Windows WS transport has no async callback: poll the newest odom
+        % into the same appdata slot the Linux subscriber callback fills.
+        if ispc
+            vmsg_ws = vio_sub.latest();
+            if ~isempty(vmsg_ws), setappdata(fig, 'vio_latest', vmsg_ws); end
+        end
         vmsg = getappdata(fig, 'vio_latest');
         if ~isempty(vmsg)
             vstamp = double(vmsg.header.stamp.sec) + ...
@@ -1558,8 +1579,15 @@ h = uicontrol(pan, 'Style', 'edit', 'Units', 'normalized', 'Position', [0.50 y+0
 end
 
 % Absolute paths of the two OpenVINS config files the launch reads.
+% On Windows the configs live INSIDE WSL and are edited through the \\wsl$
+% UNC share — adjust the distro name ('Ubuntu-22.04'), user, or path below
+% to match your WSL install (see README.md).
 function [estCfg, camCfg] = vioCfgPaths()
-base = '/home/teymur/ytu_thesis/simulation/open_vins/config/matlab_unity';
+if ispc
+    base = '\\wsl$\Ubuntu-22.04\home\teymur\ytu_thesis\simulation\open_vins\config\matlab_unity';
+else
+    base = '/home/teymur/ytu_thesis/simulation/open_vins/config/matlab_unity';
+end
 estCfg = fullfile(base, 'estimator_config.yaml');
 camCfg = fullfile(base, 'kalibr_imucam_chain.yaml');
 end
@@ -1704,7 +1732,11 @@ end
 function pid = startRosbridge()
 pid = [];
 if ~isunix
-    warning('rosbridge auto-launch is wired for Linux only; start it manually.');
+    % Windows: everything Ubuntu-side runs manually in a WSL terminal
+    % (see README.md). MATLAB only connects to ws://localhost:9090.
+    fprintf(['rosbridge is started manually on Windows. In a WSL terminal:\n' ...
+             '  source /opt/ros/humble/setup.bash && ' ...
+             'ros2 launch rosbridge_server rosbridge_websocket_launch.xml\n']);
     return;
 end
 [~, running] = system('pgrep -f rosbridge_websocket');
@@ -1754,7 +1786,14 @@ end
 function pid = startOpenvins()
 pid = [];
 if ~isunix
-    warning('OpenVINS auto-launch is wired for Linux only; launch it manually.');
+    % Windows: launch OpenVINS manually in a WSL terminal (see README.md).
+    % The VIO-tab parameters were just written through the \\wsl$ share, so
+    % (re)starting it now picks them up.
+    fprintf(['OpenVINS is started manually on Windows. In a WSL terminal:\n' ...
+             '  source /opt/ros/humble/setup.bash && ' ...
+             'source ~/ytu_thesis/simulation/open_vins/install/setup.bash && ' ...
+             'source ~/ytu_thesis/simulation/openvins_ws/install/setup.bash && ' ...
+             'ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py\n']);
     return;
 end
 % clean slate: drop any prior pipeline (strays block the relaunch + image bridge)

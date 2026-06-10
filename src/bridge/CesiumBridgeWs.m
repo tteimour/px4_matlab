@@ -57,7 +57,7 @@ classdef CesiumBridgeWs < handle
             end
 
             obj.Topic    = topic;
-            ros          = cesium_ws_ros(host, port);   % shared, session-persistent
+            ros          = ws_ros_shared(host, port);   % shared, session-persistent
             obj.topicObj = py.roslibpy.Topic(ros, topic, 'geometry_msgs/PoseArray');
             obj.topicObj.advertise();
         end
@@ -103,42 +103,5 @@ classdef CesiumBridgeWs < handle
 end
 
 
-function ros = cesium_ws_ros(host, port)
-%CESIUM_WS_ROS  Session-persistent roslibpy Ros connection.
-% Twisted's reactor can be started only once per process, so create + run()
-% the Ros object once and reuse it for every bridge/run in this MATLAB session.
-persistent ROS
-
-% Reuse an existing, still-connected session.
-if ~isempty(ROS)
-    try
-        if logical(ROS.is_connected)
-            ros = ROS;
-            return;
-        end
-    catch
-        ROS = [];   % stale handle -> rebuild below
-    end
-end
-
-ROS = py.roslibpy.Ros(host, int32(port));
-try
-    ROS.run();                      % start the reactor (first time in process)
-catch ME
-    if contains(ME.message, 'ReactorNotRestartable')
-        ROS.connect();              % reactor already running -> just connect
-    else
-        rethrow(ME);
-    end
-end
-
-t0 = tic;
-while ~logical(ROS.is_connected) && toc(t0) < 5
-    pause(0.1);
-end
-if ~logical(ROS.is_connected)
-    error('CesiumBridgeWs:connect', ...
-        'Could not connect to ws://%s:%d (is rosbridge running?).', host, port);
-end
-ros = ROS;
-end
+% The session-persistent rosbridge connection lives in ws_ros_shared.m,
+% shared by all WebSocket bridges (CesiumBridgeWs, ImuBridgeWs, VioOdomSubWs).
