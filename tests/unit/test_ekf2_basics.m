@@ -8,14 +8,22 @@ earth  = EarthModel(0, 0, 0);
 params = Ekf2Params();
 ekf    = Ekf2(params, earth);
 
+%% Case 0: Filter initialisation (Ekf::initialiseFilter): no updates until
+% the static checks pass over 3 downsampled windows and a baro seed exists.
+n_win = round(params.predict_us * 1e-6 / 0.001);   % samples per window
+t0 = initFilter(ekf, earth, n_win, 0);
+assert(ekf.filter_init, 'Filter initialises from static IMU + baro');
+assert(norm(ekf.pos) < 1e-6, 'Init at origin with baro = alt0');
+assert(abs(norm(ekf.quat) - 1) < 1e-9 && abs(ekf.quat(1) - 1) < 1e-6, ...
+       'Level specific force initialises an identity tilt');
+
 %% Case 1: Zero-input predict over one EKF window preserves state.
 % The raw 1 kHz IMU stream is downsampled into EKF2_PREDICT_US (10 ms)
 % windows (imu_down_sampler.cpp); predict() returns true only when a
 % window completes and the EKF actually stepped.
-n_win = round(params.predict_us * 1e-6 / 0.001);   % samples per window
 for k = 1:n_win
     imu = make_imu_sample(0.001, [0;0;0], [0;0;-9.80665*0.001]);
-    imu.t = k * 0.001;
+    imu.t = t0 + k * 0.001;
     upd = ekf.predict(imu);
     if k < n_win
         assert(~upd, 'No EKF update before the downsample window completes');
@@ -23,11 +31,13 @@ for k = 1:n_win
         assert(upd, 'EKF update fires when the window completes');
     end
 end
+t0 = t0 + n_win * 0.001;
 assert(norm(ekf.pos) < 1e-6, 'Position drift zero with gravity-balancing accel');
 assert(norm(ekf.vel) < 1e-6, 'Velocity drift zero with gravity-balancing accel');
 
 %% Case 2: Constant +x specific force drives velocity in body+x (=NED+x at q=identity).
 ekf.reset();
+t0 = initFilter(ekf, earth, n_win, 0);
 dt = 0.001;
 % Specific force = +1 m/s^2 in body x; in NED that's +1 (still no rotation).
 % Plus we must include the gravity offset since predict adds g.
@@ -35,7 +45,7 @@ dt = 0.001;
 % over the full 10-sample window: vel += R*dvel_acc + g*dt_win = [0.01; 0; 0]
 for k = 1:n_win
     imu = make_imu_sample(dt, [0;0;0], [1*dt; 0; -9.80665*dt]);
-    imu.t = k * dt;
+    imu.t = t0 + k * dt;
     ekf.predict(imu);
 end
 assert(abs(ekf.vel(1) - n_win*1e-3) < 1e-9, 'Forward accel integrates to +x velocity');
@@ -68,10 +78,11 @@ assert(ekf.pos(1) < 1.0 && ekf.pos(1) > 0, ...
 
 %% Case 5: Covariance stays positive-definite after random predicts + fusions.
 ekf.reset();
+t0 = initFilter(ekf, earth, n_win, 0);
 rng_old = rng(42);
 for k = 1:50
     imu = make_imu_sample(0.001, 0.01*randn(3,1), 1e-3*randn(3,1) + [0;0;-9.80665*0.001]);
-    imu.t = k*0.001;
+    imu.t = t0 + k*0.001;
     ekf.predict(imu);
 end
 rng(rng_old);
@@ -79,6 +90,23 @@ P_min_eig = min(eig(ekf.P));
 assert(P_min_eig > -1e-9, sprintf('Covariance stays PSD (min eig = %g)', P_min_eig));
 
 fprintf('test_ekf2_basics: PASS\n');
+end
+
+
+% Drive the filter through Ekf::initialiseFilter: static gravity-balanced
+% windows + a baro seed at alt0. Returns the sim time reached.
+function t = initFilter(ekf, earth, n_win, t_start)
+ekf.setInitBaro(earth.alt0_m);
+t = t_start;
+k = 0;
+while ~ekf.filter_init && k < 5 * 3 * n_win
+    k = k + 1;
+    t = t + 0.001;
+    imu = make_imu_sample(0.001, [0;0;0], [0;0;-9.80665*0.001]);
+    imu.t = t;
+    ekf.predict(imu);
+end
+assert(ekf.filter_init, 'filter initialises within a few windows');
 end
 
 

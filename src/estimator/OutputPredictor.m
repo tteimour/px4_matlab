@@ -56,6 +56,20 @@ classdef OutputPredictor < handle
             obj.dt_update_avg  = 1e-3;
         end
 
+        function alignTo(obj, ekf)
+            % Match the EKF state at filter initialisation
+            % (OutputPredictor::alignOutputFilter, called from
+            % Ekf::initialiseFilter, ekf.cpp:208).
+            obj.quat    = ekf.quat;
+            obj.vel     = ekf.vel;
+            obj.pos     = ekf.pos;
+            obj.gyro_b  = ekf.gyro_b;
+            obj.accel_b = ekf.accel_b;
+            obj.delta_ang_corr = zeros(3, 1);
+            obj.vel_err_integ  = zeros(3, 1);
+            obj.pos_err_integ  = zeros(3, 1);
+        end
+
         function update(obj, imu)
             dt = max(imu.delta_ang_dt, 1e-6);
             obj.dt_update_avg = 0.8 * obj.dt_update_avg + 0.2 * dt;

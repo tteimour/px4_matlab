@@ -88,6 +88,16 @@ classdef Ekf2 < handle
         at_rest              = true
         ev_active            = false
         mag_aligned_in_flight = false
+
+        % Filter initialisation (Ekf::initialiseFilter, ekf.cpp:180-229):
+        % the EKF refuses to predict or fuse until the smoothed specific
+        % force is within [0.8 g, 1.2 g] and the gyro below 15 deg/s; tilt
+        % is then initialised from the measured gravity direction and the
+        % height state from the first baro sample, so the first fusions
+        % see small innovations instead of a violent cold-start transient.
+        filter_init      = false
+        init_windows_ok  = 0      % consecutive downsampled windows passing checks
+        init_baro_alt    = []     % latest baro altitude (set by EstimatorBus)
     end
 
     properties (Constant)
@@ -119,20 +129,7 @@ classdef Ekf2 < handle
             obj.mag_B   = zeros(3, 1);
             obj.wind    = zeros(2, 1);
 
-            obj.P = zeros(obj.N_ERR);
-            p = obj.params;
-            % Per-axis structure follows Ekf::initialiseCovariance
-            % (covariance.cpp:52-104): vertical velocity gets 1.5^2x the
-            % horizontal variance, height variance comes from the baro.
-            obj.P(obj.IDX_ATT,  obj.IDX_ATT)  = eye(3) * p.init_att_var;
-            obj.P(obj.IDX_VEL,  obj.IDX_VEL)  = diag([1, 1, 1.5^2] * p.init_vel_var);
-            obj.P(obj.IDX_POS,  obj.IDX_POS)  = diag([p.init_pos_var, p.init_pos_var, ...
-                                                      max(p.baro_noise, 0.01)^2]);
-            obj.P(obj.IDX_GBI,  obj.IDX_GBI)  = eye(3) * p.init_gyro_b_var;
-            obj.P(obj.IDX_ABI,  obj.IDX_ABI)  = eye(3) * p.init_accel_b_var;
-            obj.P(obj.IDX_MI,   obj.IDX_MI)   = eye(3) * p.init_mag_I_var;
-            obj.P(obj.IDX_MB,   obj.IDX_MB)   = eye(3) * p.init_mag_B_var;
-            obj.P(obj.IDX_WIND, obj.IDX_WIND) = eye(2) * p.init_wind_var;
+            obj.initCovariance();
 
             obj.initialized     = false;
             obj.last_imu_t      = 0.0;
@@ -151,6 +148,16 @@ classdef Ekf2 < handle
             obj.at_rest               = true;
             obj.ev_active             = false;
             obj.mag_aligned_in_flight = false;
+
+            obj.filter_init     = false;
+            obj.init_windows_ok = 0;
+            obj.init_baro_alt   = [];
+        end
+
+        function setInitBaro(obj, altitude_m)
+            % Latest baro altitude for height initialisation (EstimatorBus
+            % feeds this until the filter initialises).
+            obj.init_baro_alt = altitude_m;
         end
 
         % ============================================================
@@ -202,6 +209,13 @@ classdef Ekf2 < handle
             obj.dt_ekf  = dt;
             obj.ds_sf_body = d_vel_w / dt;               % for gravity fusion
 
+            % No prediction or fusion until the filter has initialised
+            % (Ekf::initialiseFilter, ekf.cpp:180-211).
+            if ~obj.filter_init
+                obj.tryInitFilter(d_ang_w / dt, d_vel_w / dt);
+                return;
+            end
+
             % Bias-corrected delta angle / velocity.
             d_ang = d_ang_w - obj.gyro_b * dt;
             d_vel = d_vel_w - obj.accel_b * dt;
@@ -230,6 +244,26 @@ classdef Ekf2 < handle
 
             obj.initialized = true;
             updated = true;
+        end
+
+        % ============================================================
+        % Initial covariance (Ekf::initialiseCovariance,
+        % covariance.cpp:52-104): vertical velocity gets 1.5^2x the
+        % horizontal variance, height variance comes from the baro.
+        % Called on reset and again when the filter initialises.
+        % ============================================================
+        function initCovariance(obj)
+            obj.P = zeros(obj.N_ERR);
+            p = obj.params;
+            obj.P(obj.IDX_ATT,  obj.IDX_ATT)  = eye(3) * p.init_att_var;
+            obj.P(obj.IDX_VEL,  obj.IDX_VEL)  = diag([1, 1, 1.5^2] * p.init_vel_var);
+            obj.P(obj.IDX_POS,  obj.IDX_POS)  = diag([p.init_pos_var, p.init_pos_var, ...
+                                                      max(p.baro_noise, 0.01)^2]);
+            obj.P(obj.IDX_GBI,  obj.IDX_GBI)  = eye(3) * p.init_gyro_b_var;
+            obj.P(obj.IDX_ABI,  obj.IDX_ABI)  = eye(3) * p.init_accel_b_var;
+            obj.P(obj.IDX_MI,   obj.IDX_MI)   = eye(3) * p.init_mag_I_var;
+            obj.P(obj.IDX_MB,   obj.IDX_MB)   = eye(3) * p.init_mag_B_var;
+            obj.P(obj.IDX_WIND, obj.IDX_WIND) = eye(2) * p.init_wind_var;
         end
 
         % ============================================================
@@ -288,14 +322,30 @@ classdef Ekf2 < handle
             out.fused = false; out.innov = 0; out.test_ratio = 0;
             if isempty(baro), return; end
 
+            % Predict the height-bias variance first (BiasEstimator::predict,
+            % bias_estimator.cpp:42-63): PSD = baro_bias_nsd^2 = 0.13^2
+            % (common.h:304), variance constrained to [1e-8, 2].
+            if isfinite(obj.last_baro_fuse_t)
+                dt_b = max(baro.t - obj.last_baro_fuse_t, 0);
+            else
+                dt_b = 0;
+            end
+            obj.last_baro_fuse_t = baro.t;
+            obj.baro_bias_var = min(max(obj.baro_bias_var + 0.13^2 * dt_b, 1e-8), 2.0);
+
             % Measurement: altitude (positive up). Predicted altitude = alt0 - pos_z.
+            % The observation variance includes the bias-estimator variance
+            % (baro_height_control.cpp:84-86) — as the bias uncertainty grows
+            % the baro is de-weighted in the main fusion, so the (unbiased)
+            % GNSS height anchors the DC level while the bias state absorbs
+            % the baro's turn-on offset and drift.
             pred_alt = obj.earth.alt0_m - obj.pos(3);
             innov    = baro.altitude_m - pred_alt - obj.baro_bias;
 
             H = zeros(1, obj.N_ERR);
             H(obj.IDX_POS(3)) = -1.0;     % d(alt)/d(pos_z) = -1
 
-            R = obj.params.baro_noise^2;
+            R = obj.params.baro_noise^2 + obj.baro_bias_var;
             S = H * obj.P * H' + R;
             test_ratio = innov^2 / (S * obj.params.baro_innov_gate^2);
 
@@ -304,30 +354,21 @@ classdef Ekf2 < handle
 
             obj.applyKalmanUpdate(H, innov, S, R);
 
-            % Height-bias estimator (BiasEstimator, bias_estimator.cpp:
-            % 42-106): with GNSS as the height reference (EKF2_HGT_REF
-            % default) the baro carries the bias state. The innovation
-            % variance includes the filter's own height variance
-            % (gnss_height_control.cpp:45 pattern) so the bias learns
-            % slower while the height state is uncertain; the bias
-            % innovation is gated at 3 sigma (hpp:103) and the variance is
-            % constrained to [1e-8, 2] (cpp:67, hpp:106).
-            % Process noise: the BiasEstimator class default 1.25e-6
-            % m^2/s^2/Hz (hpp:105). PX4's faster baro_bias_nsd (0.13,
-            % common.h:304) belongs to the full dual-source reference
-            % architecture (reference switching + per-source estimators);
-            % in this single-filter port it makes the bias chase the height
-            % state and the pair random-walks away, so the conservative
-            % class default is used instead.
-            if isfinite(obj.last_baro_fuse_t)
-                dt_b = max(baro.t - obj.last_baro_fuse_t, 0);
-            else
-                dt_b = 0;
-            end
-            obj.last_baro_fuse_t = baro.t;
-            obj.baro_bias_var = min(max(obj.baro_bias_var + 1.25e-6 * dt_b, 1e-8), 2.0);
-            innov_var_b = obj.baro_bias_var + max(1e-4, R) + obj.P(obj.IDX_POS(3), obj.IDX_POS(3));
-            innov_b     = -innov;            % bias absorbs the residual offset
+            % Height-bias state update (BiasEstimator::fuseBias,
+            % bias_estimator.cpp:70-86): the bias innovation is
+            % (baro_alt - est_alt) - bias = the SAME residual as the main
+            % fusion innovation above (PX4 fuseBias(measurement -
+            % gpos.altitude()) with the state subtracted internally).
+            % Sign matters: bias += K*innov closes the residual (negative
+            % feedback). The previous filter used -innov, which drives the
+            % bias AWAY from the residual; the main fusion then drags the
+            % height state after it — a positive-feedback pair that ran
+            % the altitude estimate away at ~2 m/s. Innovation variance
+            % includes the filter's own height variance
+            % (gnss_height_control.cpp:45 pattern), 3-sigma gate (hpp:103).
+            innov_var_b = obj.baro_bias_var + max(1e-4, obj.params.baro_noise^2) ...
+                        + obj.P(obj.IDX_POS(3), obj.IDX_POS(3));
+            innov_b     = innov;
             if innov_b^2 / (9 * innov_var_b) < 1.0
                 K_b = obj.baro_bias_var / innov_var_b;
                 obj.baro_bias     = obj.baro_bias + K_b * innov_b;
@@ -691,7 +732,53 @@ classdef Ekf2 < handle
                 obj.P(i, i) = min(max(obj.P(i, i), lo), hi);
             end
         end
+
+        function tryInitFilter(obj, omega, sf)
+            % Ekf::initialiseFilter / initialiseTilt (ekf.cpp:180-229):
+            % static checks on the downsampled window (its 10 ms average
+            % stands in for PX4's accel/gyro low-pass; three consecutive
+            % windows required), then tilt from the measured gravity
+            % direction and height from the latest baro sample.
+            g = obj.earth.g_mps2;
+            ok = (norm(sf) > 0.8 * g) && (norm(sf) < 1.2 * g) && ...
+                 (norm(omega) < deg2rad(15));                  % ekf.cpp:218-220
+            if ~ok
+                obj.init_windows_ok = 0;
+                return;
+            end
+            obj.init_windows_ok = obj.init_windows_ok + 1;
+            if obj.init_windows_ok < 3 || isempty(obj.init_baro_alt)
+                return;
+            end
+            % Tilt: quaternion rotating the measured specific force onto
+            % [0 0 -1] (initialiseTilt, ekf.cpp:224-226).
+            obj.quat = quat_from_two_vectors(sf, [0; 0; -1]);
+            % Height from baro (pred_alt = alt0 - pos_z); horizontal stays
+            % at the origin until the first GNSS fix seeds it.
+            obj.pos = [0; 0; obj.earth.alt0_m - obj.init_baro_alt];
+            obj.vel = zeros(3, 1);
+            obj.initCovariance();                              % ekf.cpp:205
+            obj.filter_init = true;
+        end
     end
+end
+
+
+function q = quat_from_two_vectors(v1, v2)
+% Quaternion rotating v1 onto v2 (matrix::Quaternion(v1, v2), used by
+% Ekf::initialiseTilt). Handles the antiparallel case explicitly.
+v1 = v1 / max(norm(v1), 1e-9);
+v2 = v2 / max(norm(v2), 1e-9);
+d = dot(v1, v2);
+if d < -1 + 1e-9
+    [~, i] = min(abs(v1));
+    e = zeros(3, 1); e(i) = 1;
+    ax = cross(v1, e); ax = ax / norm(ax);
+    q = [0; ax];
+else
+    q = [1 + d; cross(v1, v2)];
+    q = q / norm(q);
+end
 end
 
 

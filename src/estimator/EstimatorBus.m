@@ -76,8 +76,25 @@ classdef EstimatorBus < handle
             imu = obj.sensors.vehicleImu();
             new_imu = false; ekf_updated = false;
             if ~isempty(imu) && isfield(imu, 't') && imu.t > obj.last_imu_t
+                % Until the filter initialises (Ekf::initialiseFilter),
+                % feed it the latest baro altitude for the height seed and
+                % hold the output predictor; align the output predictor to
+                % the EKF state at the moment of initialisation
+                % (alignOutputFilter, ekf.cpp:208).
+                was_init = obj.ekf.filter_init;
+                if ~was_init
+                    air0 = obj.sensors.vehicleAirData();
+                    if ~isempty(air0) && isfield(air0, 'altitude_m')
+                        obj.ekf.setInitBaro(air0.altitude_m);
+                    end
+                end
                 ekf_updated = obj.ekf.predict(imu);
-                obj.output_pred.update(imu);
+                if obj.ekf.filter_init
+                    if ~was_init
+                        obj.output_pred.alignTo(obj.ekf);
+                    end
+                    obj.output_pred.update(imu);
+                end
                 obj.last_imu_t = imu.t;
                 new_imu = true;
             end
