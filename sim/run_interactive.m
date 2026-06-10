@@ -96,7 +96,7 @@ default_mode_idx = 3;             % start in Position
 ctrl_fig = figure('Name', 'Stick console — flies from any tab', ...
     'NumberTitle', 'off', 'MenuBar', 'none', 'ToolBar', 'none', ...
     'Color', T.bg, 'Position', [60 90 520 330], ...
-    'CloseRequestFcn', @(~,~) setappdata(fig, 'running', false));
+    'CloseRequestFcn', @(~,~) ctrl_fig_close(fig, ctrl_fig));
 applyThemeDefaults(ctrl_fig, T);
 ax_left = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
                'Position', [0.06 0.30 0.40 0.64]);
@@ -297,6 +297,10 @@ vio_ui_tick = 0;       % throttles the (heavy) VIO image decode so joysticks sta
 cesium_bridge  = [];   % lazily created when the Cesium toggle is first enabled
 imu_bridge     = [];   % lazily created with cesium_bridge; streams IMU to OpenVINS
 last_imu_pub_t = -inf; % sim-time of last published IMU sample (200 Hz decimation)
+imu_acc_g = [0;0;0];   % gyro accumulator for average-downsample to imu_pub_hz
+imu_acc_a = [0;0;0];   % accel accumulator
+imu_acc_n = 0;         % samples accumulated since last publish
+imu_acc_t = -inf;      % sim-time of last accumulated voted IMU sample
 imu_stream_failed = false; % latched on IMU publish failure to stop recreate churn
 
 % --- VIO comparison logging (Cesium-tab toggle) -----------------------
@@ -350,6 +354,7 @@ while ishandle(fig) && getappdata(fig, 'running')
         est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
         t_sim   = 0;
         last_imu_pub_t    = -inf;  % sim time restarts at 0; re-arm IMU decimation
+        imu_acc_g = [0;0;0]; imu_acc_a = [0;0;0]; imu_acc_n = 0; imu_acc_t = -inf;
         imu_stream_failed = false; % re-arm IMU bridge after a Reset
         if vio_logging             % sim clock restarts -> VIO can't span Reset
             vio_logging = false; set(vio_cb, 'Value', 0); prev_vio_on = false;
@@ -537,21 +542,34 @@ while ishandle(fig) && getappdata(fig, 'running')
         est_bus.step(t_sim + (i-1)*dt_rate, s_truth);
 
         % --- Stream IMU to OpenVINS at imu_pub_hz (sim-time stamped) --------
-        % Decimate the 1 kHz voted IMU to ~200 Hz. imu.t is the sample's sim
-        % time -- the same clock the Cesium pose (and thus the Unity camera)
-        % carry -- so camera and IMU stay in one clock domain for VIO.
+        % AVERAGE-downsample the 1 kHz voted IMU to ~200 Hz: accumulate every
+        % NEW voted sample and publish the MEAN over each interval (not 1-of-5
+        % decimation). Averaging removes the aliasing of dropped samples and
+        % cuts per-sample noise by ~sqrt(5), so the OpenVINS kalibr noise (ICM
+        % datasheet) is statistically correct -- the raw 1-of-5 stream was
+        % ~sqrt(5)x noisier than the config claimed, making the filter
+        % overconfident in the IMU and prone to drift (worst in hover, where
+        % vision is degenerate and OpenVINS leans on IMU propagation).
+        % imu.t is sim time -- same clock as the Cesium pose / Unity camera.
         if stream_on && ~isempty(imu_bridge)
             imu = est_bus.sensors.vehicleImu();
-            if ~isempty(imu) && isfield(imu, 't') && ...
-                    imu.t >= last_imu_pub_t + imu_pub_dt - 1e-9
-                try
-                    imu_bridge.publish(imu.gyro_b, imu.accel_b, imu.t);
-                    last_imu_pub_t = imu.t;
-                catch ME
-                    warning('IMU bridge publish failed (%s). Disabling.', ME.message);
-                    delete(imu_bridge);
-                    imu_bridge = [];
-                    imu_stream_failed = true;  % stop per-frame recreate churn
+            if ~isempty(imu) && isfield(imu, 't') && imu.t > imu_acc_t
+                imu_acc_g = imu_acc_g + imu.gyro_b;
+                imu_acc_a = imu_acc_a + imu.accel_b;
+                imu_acc_n = imu_acc_n + 1;
+                imu_acc_t = imu.t;
+                if imu.t >= last_imu_pub_t + imu_pub_dt - 1e-9
+                    try
+                        imu_bridge.publish(imu_acc_g / imu_acc_n, ...
+                                           imu_acc_a / imu_acc_n, imu.t);
+                        last_imu_pub_t = imu.t;
+                    catch ME
+                        warning('IMU bridge publish failed (%s). Disabling.', ME.message);
+                        delete(imu_bridge);
+                        imu_bridge = [];
+                        imu_stream_failed = true;  % stop per-frame recreate churn
+                    end
+                    imu_acc_g = [0;0;0]; imu_acc_a = [0;0;0]; imu_acc_n = 0;
                 end
             end
         end
@@ -800,7 +818,8 @@ while ishandle(fig) && getappdata(fig, 'running')
             try
                 imu_bridge = ImuBridge();
                 last_imu_pub_t = -inf;
-                fprintf('IMU bridge: publishing to %s @ %d Hz\n', ...
+                imu_acc_g = [0;0;0]; imu_acc_a = [0;0;0]; imu_acc_n = 0; imu_acc_t = -inf;
+                fprintf('IMU bridge: publishing to %s @ %d Hz (avg-downsampled)\n', ...
                         imu_bridge.Topic, imu_pub_hz);
             catch ME
                 warning('IMU bridge failed to start (%s). Disabling.', ME.message);
@@ -2983,4 +3002,11 @@ end
 
 function attYawSet(att_ctl, w)
 att_ctl.setProportionalGain(attPGet(att_ctl), w);
+end
+
+function ctrl_fig_close(fig, ctrl_fig)
+if ishandle(fig)
+    setappdata(fig, 'running', false);
+end
+delete(ctrl_fig);
 end
