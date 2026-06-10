@@ -50,11 +50,11 @@ Windows).
   ```bash
   sudo apt install ros-humble-desktop ros-humble-rosbridge-suite
   ```
-- The OpenVINS pipeline built inside WSL at `~/ytu_thesis/simulation/`
+- The OpenVINS pipeline built inside WSL at `~/git/openVins/`
   (copy the two workspaces from the Linux machine or rebuild them):
   ```bash
-  cd ~/ytu_thesis/simulation/open_vins   && colcon build
-  cd ~/ytu_thesis/simulation/openvins_ws && colcon build
+  cd ~/git/openVins/open_vins   && colcon build
+  cd ~/git/openVins/openvins_ws && colcon build
   ```
 
 ## 2. One-time MATLAB configuration
@@ -69,7 +69,7 @@ Windows).
 2. If your WSL distro name or Linux username differ from the defaults,
    adjust the config path in `sim/run_interactive.m` → `vioCfgPaths()`:
    ```
-   \\wsl$\Ubuntu-22.04\home\teymur\ytu_thesis\simulation\open_vins\config\matlab_unity
+   \\wsl$\Ubuntu-22.04\home\synapgnc\git\openVins\open_vins\config\matlab_unity
    ```
    (You can check the right UNC path in Explorer under `\\wsl$\`.)
 
@@ -97,8 +97,8 @@ Do the three steps above first, then:
 2. **WSL terminal 2** — launch OpenVINS:
    ```bash
    source /opt/ros/humble/setup.bash && \
-   source ~/ytu_thesis/simulation/open_vins/install/setup.bash && \
-   source ~/ytu_thesis/simulation/openvins_ws/install/setup.bash && \
+   source ~/git/openVins/open_vins/install/setup.bash && \
+   source ~/git/openVins/openvins_ws/install/setup.bash && \
    ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py
    ```
 3. Fly up to ~30 m before/while enabling — a wider ground footprint gives the
