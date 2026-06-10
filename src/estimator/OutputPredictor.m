@@ -109,22 +109,28 @@ classdef OutputPredictor < handle
             obj.accel_b = ekf.accel_b;
             dt_correct = min(max(dt_correct, 1e-4), 0.03);   % cpp:265
 
-            % Attitude: q_error = q_ekf * q_out^-1; the small-angle error
-            % times att_gain becomes the per-IMU-sample delta-angle
-            % correction (cpp:283-302), which update() then applies on
-            % every strapdown step until the next correction. att_gain =
-            % 0.5 * dt_imu / time_delay. Because the correction is applied
-            % (dt_correct / dt_imu) times per cycle, time_delay must be
-            % floored at the CORRECTION interval — otherwise the total
+            % Attitude (output_predictor.cpp:287-302): q_error =
+            % q_state^-1 * q_out is the BODY-frame error of the output
+            % w.r.t. the EKF; delta_ang_error = -2*imag(q_error) (sign-
+            % normalized) is the body-frame rotation that pulls the output
+            % onto the EKF attitude, applied by update() on every
+            % strapdown step until the next correction. The error MUST be
+            % composed in the body frame because it is applied through
+            % the body delta-angle path — a world-frame error here works
+            % at yaw ~ 0 but mixes the roll/pitch axes at large yaw and
+            % destabilizes the correction loop.
+            % att_gain = 0.5 * dt_imu / time_delay; because the correction
+            % is applied (dt_correct / dt_imu) times per cycle, time_delay
+            % is floored at the CORRECTION interval — otherwise the total
             % per-cycle correction exceeds 100% of the error and the
             % output attitude oscillates. (On PX4 hardware the real
             % delayed-horizon depth is always >= the update interval, so
             % its fmaxf(..., dt_update) floor never binds; this floor is
             % the zero-latency-sim generalization of the same guard.)
-            q_err = quat_multiply(ekf.quat, quat_inverse(obj.quat));
+            q_err = quat_multiply(quat_inverse(ekf.quat), obj.quat);
             q_err = q_err / norm(q_err);
-            if q_err(1) < 0, q_err = -q_err; end
-            delta_ang_err = 2 * q_err(2:4);                  % small-angle
+            if q_err(1) >= 0, scalar = -2; else, scalar = 2; end   % cpp:290
+            delta_ang_err = scalar * q_err(2:4);
             td = max(obj.time_delay, dt_correct);
             att_gain = 0.5 * obj.dt_update_avg / td;
             obj.delta_ang_corr = delta_ang_err * att_gain;
