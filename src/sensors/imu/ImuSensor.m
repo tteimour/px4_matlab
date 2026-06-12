@@ -54,9 +54,11 @@ classdef ImuSensor < Sensor
         accel_vib_gain = 0.0  % m/s^2 std per unit gt.vib_level
         R_chip_to_body
         earth                % EarthModel handle (for gravity)
-        % Diagnostic noise scale: 0 = all stochastic noise off, 1 = nominal.
-        % Applies to bias random walk, thermal noise, vibration, and turn-on
-        % biases. Set via SensorHub.setImuNoiseScale() for VIO diagnostics.
+        % Diagnostic noise scale: 0 = ideal IMU, 1 = nominal. Applies to
+        % bias random walk, thermal noise, vibration, turn-on biases, and
+        % the quantisation step (so 0 disables quantisation too; full-scale
+        % clipping stays — it is a physical limit, not an error source).
+        % Set via SensorHub.setImuNoiseScale() for VIO diagnostics.
         noise_scale = 1.0
     end
 
@@ -134,7 +136,7 @@ classdef ImuSensor < Sensor
             gyro_noise  = ns * obj.gyro_nd / sqrt(dt) * randn(obj.rng, 3, 1);
             gyro_vib    = ns * obj.gyro_vib_gain * vib * randn(obj.rng, 3, 1);
             gyro_chip   = omega_chip + obj.R_chip_to_body' * obj.gyro_bias_ + gyro_noise + gyro_vib;
-            gyro_chip   = obj.quantise(gyro_chip, deg2rad(obj.gyro_quant_dps));
+            gyro_chip   = obj.quantise(gyro_chip, ns * deg2rad(obj.gyro_quant_dps));
             gyro_chip   = obj.clipFs(gyro_chip, deg2rad(obj.gyro_fs_dps));
             gyro_b      = obj.R_chip_to_body * gyro_chip;
 
@@ -147,7 +149,7 @@ classdef ImuSensor < Sensor
             sf_noise = ns * obj.accel_nd / sqrt(dt) * randn(obj.rng, 3, 1);
             sf_vib   = ns * obj.accel_vib_gain * vib * randn(obj.rng, 3, 1);
             sf_chip  = sf_chip + obj.R_chip_to_body' * obj.accel_bias_ + sf_noise + sf_vib;
-            sf_chip  = obj.quantise(sf_chip, obj.accel_quant_g * obj.earth.g_mps2);
+            sf_chip  = obj.quantise(sf_chip, ns * obj.accel_quant_g * obj.earth.g_mps2);
             sf_chip  = obj.clipFs(sf_chip, obj.accel_fs_g * obj.earth.g_mps2);
             accel_b  = obj.R_chip_to_body * sf_chip;
 

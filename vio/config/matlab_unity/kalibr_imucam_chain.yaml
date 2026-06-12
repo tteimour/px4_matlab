@@ -40,6 +40,6 @@ cam0:
   camera_model: pinhole
   distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
   distortion_model: radtan
-  intrinsics: [394.2, 394.2, 256.0, 256.0] # fu, fv, cu, cv  (Unity NavCamera, 66 deg FOV)
+  intrinsics: [394.2, 394.2, 256, 256] # fu, fv, cu, cv  (Unity NavCamera, 66 deg FOV)
   resolution: [512, 512]
   rostopic: /down_cam/image_raw

@@ -32,9 +32,21 @@ feat_rep_slam: "GLOBAL_3D"
 feat_rep_aruco: "GLOBAL_3D"
 
 # zero velocity update parameters
-try_zupt: true # enable ZUPT for better handling of stationary startup
-zupt_chi2_multipler: 1
-zupt_max_velocity: 0.1
+# ZUPT band widened 0.1 to 1.5 m/s (2026-06-11): the EKF-fed hold-mode hover
+# wanders at 0.4-1.0 m/s (measured, init log |v|=0.43) chasing the noisy
+# estimate. That sits in the mono VIO dead zone: above the old ZUPT gate,
+# below usable triangulation baseline (0.2 m baseline on a 40 m deep scene),
+# so zero vision updates fire and the filter dead-reckons off the init
+# gravity tilt. With 1.5 the hover is pinned (position error bounded by the
+# wander envelope); stick input exceeds the gate and hands back to MSCKF.
+try_zupt: true
+# 1.5 was outrun: init velocity in the EKF hover measured 1.36 m/s and the
+# dead-reckon crossed the gate within a second; the gate check is silent and
+# never re-engages. 3.0 latches at init and clamps before escape. CAVEAT: a
+# steady manual creep at 1-3 m/s with zero accel would also be clamped --
+# operate VIO as init-at-hover then fly at mission speed, no slow creeping.
+zupt_chi2_multipler: 2
+zupt_max_velocity: 3.0
 zupt_noise_multiplier: 1
 zupt_max_disparity: 0 # imu-based ZUPT
 zupt_only_at_beginning: false
@@ -48,7 +60,14 @@ init_imu_thresh: 1.0
 init_max_disparity: 1.5
 init_max_features: 15
 
-init_dyn_use: true # dynamic init (matches the working Gazebo config); needs healthy camera fps
+# NOTE: the run_interactive VIO tab REWRITES init_dyn_use from its dropdown on
+# every Enable, so the GUI governs this value. Evidence so far (2026-06-11):
+# static init works in a truly still GT-feed hover; dynamic init works in the
+# wobbly EKF-feed hover (its 0.4-1.0 m/s wander provides the excitation; init
+# came out clean: ba 0.005, v matching the true wander). Either way enable VIO
+# ONLY at altitude (camera is underground below 12 m AGL) and check the
+# "[init]: bias accel" log line is near zero before trusting the run.
+init_dyn_use: true
 init_dyn_mle_opt_calib: false
 init_dyn_mle_max_iter: 50
 init_dyn_mle_max_time: 0.5

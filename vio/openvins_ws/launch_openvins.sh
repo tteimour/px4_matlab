@@ -36,6 +36,9 @@ if ! pgrep -x MicroXRCEAgent > /dev/null 2>&1; then
     echo ""
 fi
 
+# Keep DDS on loopback (all pipeline participants run on this machine)
+export ROS_LOCALHOST_ONLY=1
+
 # Source workspaces in correct order
 source /opt/ros/humble/setup.bash
 source "$REPO_DIR/open_vins/install/setup.bash"

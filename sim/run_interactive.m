@@ -326,7 +326,21 @@ vio_overflow_warned = false;  % warn-once when the VIO buffer fills
 vio_log = struct('t', nan(max_log, 1), 'vt', nan(max_log, 1), ...
     'gt_pos',  nan(max_log, 3), 'gt_vel',  nan(max_log, 3), ...
     'ekf_pos', nan(max_log, 3), 'ekf_vel', nan(max_log, 3), ...
-    'vio_pos', nan(max_log, 3), 'vio_vel', nan(max_log, 3));
+    'vio_pos', nan(max_log, 3), 'vio_vel', nan(max_log, 3), ...
+    'vio_q',   nan(max_log, 4), ...   % odom orientation [w x y z] (body->global)
+    'fused',   nan(max_log, 1), ...   % 1 = VIO fused into EKF (GNSS off), 0 = observer
+    'ctl_pos_sp', nan(max_log, 3), 'ctl_pos_fb', nan(max_log, 3), ... % outer-loop sp + feedback (NED)
+    'ctl_vel_sp', nan(max_log, 3), 'ctl_vel_fb', nan(max_log, 3), ... % velocity-loop sp + feedback
+    'fus_pos', nan(max_log, 3), 'fus_vel', nan(max_log, 3));  % anchored VIO fed to the EKF (NaN unless fused)
+
+% Keep all ROS 2 traffic on loopback: every participant in this pipeline
+% (MATLAB DDS nodes, rosbridge, OpenVINS, Unity via rosbridge WebSocket)
+% runs on this machine. rmw reads ROS_LOCALHOST_ONLY at participant
+% creation, so set it BEFORE any ros2node / bridge is constructed. The
+% launched subprocesses get their own export in startRosbridge /
+% startOpenvins (bash -lc re-reads the profile, so inheritance alone is
+% not guaranteed).
+setenv('ROS_LOCALHOST_ONLY', '1');
 
 % Auto-launch rosbridge_server for the Unity/Cesium path. onCleanup guarantees
 % it is stopped on any exit (Stop, window close, or an error in the loop).
@@ -880,6 +894,16 @@ while ishandle(fig) && getappdata(fig, 'running')
             vio_align_R = []; vio_align_t = [];  % fresh map-trail alignment
             clearpoints(mission_map.vio_trail);  % GT/EKF trails keep their history
             fprintf('VIO logging started at t=%.2f s (anchored at ground truth).\n', t_sim);
+            % The Unity NavCamera sits 10 m below the body: underground below
+            % ~12 m AGL, where it tracks frame-fixed compression artifacts as
+            % "features" -> static init passes on garbage and the filter
+            % diverges on takeoff (vision pins pose while the IMU feels thrust).
+            s0_vio = plant.state();
+            if -s0_vio.position_ned(3) < 15
+                warning(['VIO enabled below 15 m AGL: the down-camera is ' ...
+                         'underground and OpenVINS will init on garbage. ' ...
+                         'Climb to altitude first, then enable (or re-enable) VIO.']);
+            end
         end
     elseif ~vio_on && prev_vio_on             % falling edge: stop, plot, free
         vio_logging = false;
@@ -943,6 +967,25 @@ while ishandle(fig) && getappdata(fig, 'running')
                     vio_log.ekf_vel(vio_idx, :) = estn.velocity_ned';
                     vio_log.vio_pos(vio_idx, :) = vp;
                     vio_log.vio_vel(vio_idx, :) = vv;
+                    vio_log.vio_q(vio_idx, :)   = [vmsg.pose.pose.orientation.w, ...
+                                                   vmsg.pose.pose.orientation.x, ...
+                                                   vmsg.pose.pose.orientation.y, ...
+                                                   vmsg.pose.pose.orientation.z];
+                    % Aiding mode at this sample: VIO fused (GNSS suspended)
+                    % vs observer-only. est_bus.vio_enabled is authoritative
+                    % (set when the fuse anchor latches, cleared on un-fuse).
+                    vio_log.fused(vio_idx) = double(est_bus.vio_enabled);
+                    % Controller setpoints + feedbacks for the outer loops,
+                    % sampled at this frame. Feedback = the controller-feed
+                    % state (s_disp). Position setpoint only exists in
+                    % position-setpoint mode; vel_sp_used is NaN in attitude
+                    % modes, which self-gates that row.
+                    if strcmp(cmd.kind, 'position')
+                        vio_log.ctl_pos_sp(vio_idx, :) = cmd.pos_sp';
+                    end
+                    vio_log.ctl_pos_fb(vio_idx, :) = s_disp.position_ned';
+                    vio_log.ctl_vel_sp(vio_idx, :) = vel_sp_used';
+                    vio_log.ctl_vel_fb(vio_idx, :) = s_disp.velocity_ned';
                     vio_last_stamp = vstamp;
 
                     % --- live VIO trail (Mission tab) ----------------------
@@ -1027,6 +1070,14 @@ while ishandle(fig) && getappdata(fig, 'running')
                 pos_ned = vio_fuse_R * (vp - vio_fuse_p0) + vio_fuse_pe0;
                 vel_ned = vio_fuse_R * (quat_to_dcm(vq) * vv);   % body->global->NED
                 est_bus.setVio(struct('pos_ned', pos_ned, 'vel_ned', vel_ned, 't', vts));
+                % Record the anchored measurement actually fed to the EKF.
+                % The comparison plots align VIO to GT with a full-trajectory
+                % SE3 fit, which silently removes any live anchor yaw error;
+                % this line is the one that shows it.
+                if vio_idx > 0 && vio_log.t(vio_idx) == t_sim
+                    vio_log.fus_pos(vio_idx, :) = pos_ned';
+                    vio_log.fus_vel(vio_idx, :) = vel_ned';
+                end
             end
         end
     elseif ~isempty(vio_fuse_R)          % fuse turned off (or VIO session ended)
@@ -1616,8 +1667,10 @@ h = uicontrol(pan, 'Style', 'edit', 'Units', 'normalized', 'Position', [0.50 y+0
 end
 
 % Absolute paths of the two OpenVINS config files the launch reads.
+% Single source of truth: the git-tracked copy in this repo (the launch
+% DEFAULT_CONFIG is repointed here too). The ~/ytu_thesis copy is dormant.
 function [estCfg, camCfg] = vioCfgPaths()
-base = '/home/teymur/ytu_thesis/simulation/open_vins/config/matlab_unity';
+base = '/home/teymur/git/px4_matlab/vio/config/matlab_unity';
 estCfg = fullfile(base, 'estimator_config.yaml');
 camCfg = fullfile(base, 'kalibr_imucam_chain.yaml');
 end
@@ -1767,14 +1820,19 @@ if ~isunix
 end
 [~, running] = system('pgrep -f rosbridge_websocket');
 if ~isempty(strtrim(running))
-    fprintf('rosbridge_server already running; leaving it as-is.\n');
+    fprintf(['rosbridge_server already running; leaving it as-is.\n' ...
+             '  NOTE: if it was started before the localhost-only change, it is\n' ...
+             '  still bound to all interfaces — kill it and rerun to apply.\n']);
     return;   % pid stays [] -> stopRosbridge() will not touch it
 end
 % `exec` makes the backgrounded subshell BECOME ros2 launch, so $! is the
 % ros2-launch PID (not a throwaway subshell) and SIGINT later reaches it.
-cmd = ['bash -lc ''unset LD_LIBRARY_PATH; ' ...
+% Loopback only: ROS_LOCALHOST_ONLY pins DDS to lo; address:=127.0.0.1 pins
+% the WebSocket listener (default '' = all interfaces) so Unity must be local.
+cmd = ['bash -lc ''unset LD_LIBRARY_PATH; export ROS_LOCALHOST_ONLY=1; ' ...
        'source /opt/ros/humble/setup.bash && ' ...
        'exec ros2 launch rosbridge_server rosbridge_websocket_launch.xml ' ...
+       'address:=127.0.0.1 ' ...
        '>/tmp/px4_rosbridge.log 2>&1 & echo $!'''];
 [st, out] = system(cmd);
 pidnum = str2double(strtrim(out));
@@ -1821,7 +1879,7 @@ system(['pkill -KILL -f run_subscribe_msckf 2>/dev/null; ' ...
         'pkill -KILL -f "ros2 launch openvins" 2>/dev/null; true']);
 ws1 = '/home/teymur/ytu_thesis/simulation/open_vins/install/setup.bash';
 ws2 = '/home/teymur/ytu_thesis/simulation/openvins_ws/install/setup.bash';
-cmd = ['bash -lc ''unset LD_LIBRARY_PATH; ' ...
+cmd = ['bash -lc ''unset LD_LIBRARY_PATH; export ROS_LOCALHOST_ONLY=1; ' ...
        'source /opt/ros/humble/setup.bash && source ' ws1 ' && source ' ws2 ' && ' ...
        'exec ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py ' ...
        '>/tmp/px4_openvins.log 2>&1 & echo $!'''];
@@ -1855,18 +1913,6 @@ if ishandle(fig)
 end
 end
 
-% Reuse (or create) a tagged figure so repeated VIO sessions don't pile up
-% windows.
-function f = namedFigure(tag, name)
-f = findobj(0, 'Type', 'figure', 'Tag', tag);
-if isempty(f)
-    f = figure('Name', name, 'Tag', tag);
-else
-    f = f(1); clf(f); set(f, 'Name', name); figure(f);
-end
-end
-
-
 % =========================================================================
 % Plot the live VIO session: ground truth vs EKF vs VIO. The VIO trajectory
 % (OpenVINS `global` frame, arbitrary yaw+origin) is rigidly SE3-aligned to
@@ -1875,90 +1921,15 @@ end
 % twist is body-frame). L is the vio_log struct, n the row count.
 % =========================================================================
 function plotVioComparison(L, n)
-if n < 10
-    fprintf('VIO comparison: only %d sample(s) logged; nothing to plot.\n', max(n, 0));
-    return;
-end
-t   = L.t(1:n);          vt   = L.vt(1:n);     % GT/EKF time, VIO message time
-gt  = L.gt_pos(1:n, :);  gtv  = L.gt_vel(1:n, :);
-ekf = L.ekf_pos(1:n, :); ekfv = L.ekf_vel(1:n, :);
-vio = L.vio_pos(1:n, :); viov = L.vio_vel(1:n, :);
-ok  = ~isnan(t) & ~isnan(vt) & all(~isnan(vio), 2) & ...
-      all(~isnan(gt), 2) & all(~isnan(ekf), 2);
-t = t(ok); vt = vt(ok); gt = gt(ok, :); gtv = gtv(ok, :);
-ekf = ekf(ok, :); ekfv = ekfv(ok, :); vio = vio(ok, :); viov = viov(ok, :);
-if size(vio, 1) < 10
-    fprintf(['VIO comparison: <10 valid VIO samples (OpenVINS not ' ...
-             'publishing /ov_msckf/odomimu?). Skipping plot.\n']);
-    return;
+% Tez şekilleri (Bölüm 8) sim/replot_vio_figures.m içinde üretilir:
+% lejantlar sağ üst köşede (üst ylim büyütülerek çizgilerle çakışmaz),
+% üstten yörünge şeklinde gözlemci fazında uçulan kesim gözlemci faz
+% rengiyle arkadan vurgulanır. Script veriyi sim/vio_log_son.mat olarak da
+% saklar; şekiller simülasyon yeniden koşturulmadan güncellenebilir.
+addpath(fileparts(mfilename('fullpath')));
+replot_vio_figures(L, n);
 end
 
-% GT/EKF were sampled at frame time t; the VIO sample carries its own (lagged)
-% sim-time vt. Interpolate GT/EKF onto vt so each VIO sample is compared to GT
-% at the SAME instant, then plot against vt.
-gt   = interp1(t, gt,   vt, 'linear', 'extrap');
-ekf  = interp1(t, ekf,  vt, 'linear', 'extrap');
-gtv  = interp1(t, gtv,  vt, 'linear', 'extrap');
-ekfv = interp1(t, ekfv, vt, 'linear', 'extrap');
-
-% SE3-align VIO -> ground truth (no scale; metric VIO).
-[R, tt, ate] = umeyama_align(vio.', gt.');
-vio_a = (R * vio.' + tt).';
-err_ekf = vecnorm(ekf - gt, 2, 2);
-err_vio = vecnorm(vio_a - gt, 2, 2);
-% speed |v| is rotation-invariant, so VIO body-frame velocity norm == NED speed.
-sp_gt = vecnorm(gtv, 2, 2); sp_ekf = vecnorm(ekfv, 2, 2); sp_vio = vecnorm(viov, 2, 2);
-rmse_ekf = sqrt(mean(err_ekf.^2));
-
-fprintf('\n=== VIO vs EKF vs ground truth (%d samples, %.1f s) ===\n', ...
-        size(vio, 1), vt(end) - vt(1));
-fprintf('EKF position RMSE: %.3f m  (mean %.3f, max %.3f)\n', ...
-        rmse_ekf, mean(err_ekf), max(err_ekf));
-fprintf('VIO position ATE : %.3f m  (mean %.3f, max %.3f) after SE3 align\n', ...
-        ate, mean(err_vio), max(err_vio));
-
-% Downsample for PLOTTING only (the metrics above use every sample). Rendering
-% 8 line plots of every sample across 3 figures is what freezes the GUI on long
-% flights; ~3000 points per line is visually identical and renders instantly.
-np = numel(vt); ds = max(1, ceil(np / 3000)); di = 1:ds:np;
-vt = vt(di); gt = gt(di, :); ekf = ekf(di, :); vio_a = vio_a(di, :);
-err_ekf = err_ekf(di); err_vio = err_vio(di);
-sp_gt = sp_gt(di); sp_ekf = sp_ekf(di); sp_vio = sp_vio(di);
-
-lbl = {'North', 'East', 'Down'};
-namedFigure('vio_cmp_pos', 'VIO/EKF/GT: position (NED)');
-for i = 1:3
-    subplot(3, 1, i); hold on; grid on;
-    plot(vt, gt(:, i),    'k',   'LineWidth', 1.3);
-    plot(vt, ekf(:, i),   'b',   'LineWidth', 1.0);
-    plot(vt, vio_a(:, i), 'r--', 'LineWidth', 1.2);
-    ylabel([lbl{i} ' [m]']);
-    if i == 1, legend('ground truth', 'EKF', 'VIO (aligned)', 'Location', 'best'); end
-end
-xlabel('sim time [s]');
-
-namedFigure('vio_cmp_err', 'VIO/EKF/GT: error + speed');
-subplot(2, 1, 1); hold on; grid on;
-plot(vt, err_ekf, 'b', 'LineWidth', 1.2);
-plot(vt, err_vio, 'r', 'LineWidth', 1.2);
-ylabel('position error vs GT [m]');
-legend('EKF', 'VIO', 'Location', 'best');
-title(sprintf('EKF RMSE %.3f m   |   VIO ATE %.3f m', rmse_ekf, ate));
-subplot(2, 1, 2); hold on; grid on;
-plot(vt, sp_gt,  'k',   'LineWidth', 1.3);
-plot(vt, sp_ekf, 'b',   'LineWidth', 1.0);
-plot(vt, sp_vio, 'r--', 'LineWidth', 1.2);
-ylabel('speed [m/s]'); xlabel('sim time [s]');
-legend('ground truth', 'EKF', 'VIO', 'Location', 'best');
-
-namedFigure('vio_cmp_traj', 'VIO/EKF/GT: trajectory (top-down)');
-hold on; grid on; axis equal;
-plot(gt(:, 2),    gt(:, 1),    'k',   'LineWidth', 1.3);
-plot(ekf(:, 2),   ekf(:, 1),   'b',   'LineWidth', 1.0);
-plot(vio_a(:, 2), vio_a(:, 1), 'r--', 'LineWidth', 1.2);
-xlabel('East [m]'); ylabel('North [m]'); title('Trajectory (top-down)');
-legend('ground truth', 'EKF', 'VIO', 'Location', 'best');
-end
 
 
 % =========================================================================
