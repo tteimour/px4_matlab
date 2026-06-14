@@ -1,8 +1,8 @@
 function ros = ws_ros_shared(host, port)
 %WS_ROS_SHARED  Session-persistent roslibpy Ros connection (rosbridge WS).
 %
-% Shared by every WebSocket bridge (CesiumBridgeWs, ImuBridgeWs,
-% VioOdomSubWs). Twisted's reactor can be started only ONCE per process and
+% Used by the WebSocket Cesium bridge (CesiumBridgeWs). Twisted's reactor
+% can be started only ONCE per process and
 % MATLAB keeps Python alive for the whole session, so the Ros object is
 % created + run() once and reused for every bridge/run. delete() of the
 % bridges never stops the reactor. If you ever hit ReactorNotRestartable,

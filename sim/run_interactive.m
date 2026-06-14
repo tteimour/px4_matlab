@@ -13,7 +13,7 @@ function run_interactive()
 %
 % UI ("flight deck", dark night-ops theme):
 %   * Top telemetry strip: flight-mode badge, ALT / V/S / GS / HDG / N / E
-%     readouts, EKF-GPS-VIO-LINK health pills, mission clock.
+%     readouts, EKF-GPS-LINK health pills, mission clock.
 %   * FLIGHT tab: satellite mission map (click to add waypoints) + an
 %     attitude indicator with pitch ladder and a heading tape, waypoint
 %     table, .plan save/load.
@@ -53,7 +53,7 @@ p = px4_params();
 % Tabbed GCS GUI ("flight deck"). The 3D scene was removed -- Unity/Cesium
 % now provides the visualization, so the tabs are parameter editors plus
 % the FLIGHT tab (mission map, live 2D trails, attitude/heading
-% instruments) and the VIO control tab. A telemetry strip (top) and the
+% instruments). A telemetry strip (top) and the
 % flight-mode bar (bottom) are global, outside the tabs. Manual control
 % lives in a separate floating window so you can fly from any tab.
 % =====================================================================
@@ -75,7 +75,6 @@ tab_sens = uitab(tg, 'Title', '  SENSORS  ',       'BackgroundColor', T.panel);
 tab_wind = uitab(tg, 'Title', '  WIND  ',          'BackgroundColor', T.panel);
 tab_auto = uitab(tg, 'Title', '  AUTOTUNE  ',      'BackgroundColor', T.panel);
 tab_cesium = uitab(tg, 'Title', '  CESIUM  ',      'BackgroundColor', T.panel);
-tab_vio = uitab(tg, 'Title', '  VIO  ',            'BackgroundColor', T.panel);
 
 mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
                 'mission', 'rtl', 'land', 'takeoff'};
@@ -170,9 +169,6 @@ est_cb       = buildEkfTab(tab_ekf, est_bus);
 buildSensorTab(tab_sens, est_bus);
 buildWindTab(tab_wind, p, wind);
 cesium_cb = buildCesiumTab(tab_cesium);
-vio_ui = buildVioTab(tab_vio, fig);   % VIO control tab (enable, params, streams)
-vio_cb = vio_ui.vio_cb;               % the loop drives VIO off this checkbox
-fuse_cb = vio_ui.fuse_cb;             % "Fuse VIO -> EKF (replace GPS)" toggle
 
 % Flight tab: north-up satellite map at the Cesium origin (Baku); click to
 % drop waypoints, set per-waypoint altitude. Writes the same `waypoints`
@@ -211,9 +207,6 @@ dt_pos  = n_pos * dt_rate;
 
 fps      = 50;
 dt_frame = 1 / fps;
-
-imu_pub_hz = 200;            % OpenVINS IMU stream rate [Hz] (decimated from 1 kHz)
-imu_pub_dt = 1 / imu_pub_hz;
 
 % Initialize FMM in the chosen mode against the spawned vehicle pose.
 fmm.setHome([0; 0; 0]);
@@ -293,35 +286,7 @@ sticks = struct('left_x', 0, 'left_y', 0, 'right_x', 0, 'right_y', 0);
 k     = 0;
 t_sim = 0;
 ui_tick = 0;           % strip/readout refresh decimation (every 2nd frame)
-vio_ui_tick = 0;       % throttles the (heavy) VIO image decode so joysticks stay snappy
 cesium_bridge  = [];   % lazily created when the Cesium toggle is first enabled
-imu_bridge     = [];   % lazily created with cesium_bridge; streams IMU to OpenVINS
-last_imu_pub_t = -inf; % sim-time of last published IMU sample (200 Hz decimation)
-imu_stream_failed = false; % latched on IMU publish failure to stop recreate churn
-
-% --- VIO comparison logging (Cesium-tab toggle) -----------------------
-vio_node       = [];      % ROS 2 node for the OpenVINS odom subscriber
-vio_sub        = [];      % subscriber to /ov_msckf/odomimu
-vio_sub_raw    = [];      % lazy: /down_cam/image_raw (only while VIO tab open)
-vio_sub_trk    = [];      % lazy: /ov_msckf/trackhist (only while VIO tab open)
-openvins_pid   = [];      % OpenVINS launch PID (auto-started with the VIO toggle)
-vio_align_R    = [];      % frozen SE3 rotation OpenVINS-global -> NED (map trail)
-vio_align_t    = [];      % frozen SE3 translation (map trail)
-% VIO->EKF fusion anchor (separate from the map-trail alignment above: this
-% one anchors to the EKF estimate, NOT ground truth, so it is a legitimate
-% GNSS-denied aid). Set on the "Fuse VIO -> EKF" rising edge.
-vio_fuse_R     = [];      % yaw rotation OpenVINS-global -> EKF NED
-vio_fuse_p0    = [];      % VIO position at the anchor instant
-vio_fuse_pe0   = [];      % EKF position at the anchor instant
-vio_logging    = false;   % true while the VIO toggle is on
-prev_vio_on    = false;   % edge detection for the VIO toggle
-vio_idx        = 0;       % rows logged this VIO session
-vio_last_stamp = -inf;    % last logged VIO message sim-time stamp (dedup)
-vio_overflow_warned = false;  % warn-once when the VIO buffer fills
-vio_log = struct('t', nan(max_log, 1), 'vt', nan(max_log, 1), ...
-    'gt_pos',  nan(max_log, 3), 'gt_vel',  nan(max_log, 3), ...
-    'ekf_pos', nan(max_log, 3), 'ekf_vel', nan(max_log, 3), ...
-    'vio_pos', nan(max_log, 3), 'vio_vel', nan(max_log, 3));
 
 % Auto-launch rosbridge_server for the Unity/Cesium path. onCleanup guarantees
 % it is stopped on any exit (Stop, window close, or an error in the loop).
@@ -342,29 +307,14 @@ while ishandle(fig) && getappdata(fig, 'running')
         wind.reset();
         % Full estimator reset: sensors (clocks/queues/validators), EKF,
         % output predictor, and the staleness trackers — so post-Reset sim time
-        % restarts cleanly at 0 and fresh IMU samples flow again (required for
-        % the VIO IMU bridge, and fixes the pre-existing estimator stall on Reset).
+        % restarts cleanly at 0 and fresh IMU samples flow again (fixes the
+        % pre-existing estimator stall on Reset).
         est_bus.reset();
         % Re-inject the known bias after reset so post-Reset runs
         % have the same truth bias to estimate.
         est_bus.sensors.applyImuBias(true_gyro_bias, true_accel_bias);
         t_sim   = 0;
-        last_imu_pub_t    = -inf;  % sim time restarts at 0; re-arm IMU decimation
-        imu_stream_failed = false; % re-arm IMU bridge after a Reset
-        if vio_logging             % sim clock restarts -> VIO can't span Reset
-            vio_logging = false; set(vio_cb, 'Value', 0); prev_vio_on = false;
-            if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
-            vio_node = []; vio_sub = []; vio_sub_raw = []; vio_sub_trk = [];
-            stopOpenvins(openvins_pid); openvins_pid = [];
-            vio_align_R = []; vio_align_t = [];
-            % Drop the VIO->EKF aid too (est_bus.reset already cleared the
-            % estimator side; clear the sim-loop anchor + the checkbox).
-            vio_fuse_R = []; vio_fuse_p0 = []; vio_fuse_pe0 = [];
-            set(fuse_cb, 'Value', 0);
-            clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
-            clearpoints(mission_map.vio_trail);
-            fprintf('VIO logging stopped by Reset (sim clock restarted).\n');
-        end
+        clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
         log_idx = 0;
         fmm.setHome([0; 0; 0]);
         fmm.setMode(prev_mode, plant.state());
@@ -520,8 +470,8 @@ while ishandle(fig) && getappdata(fig, 'running')
     % --- Advance physics by dt_frame in dt_rate substeps ---
     n_steps = max(1, round(dt_frame / dt_rate));
     use_est = logical(get(est_cb, 'Value'));
-    % VIO streaming on? Read once per frame (the substep loop runs at ~1 kHz;
-    % avoid a GUI read per substep). Gates the IMU publish inside the loop.
+    % Cesium/Unity link state. Read once per frame and surfaced on the status
+    % strip as the LINK pill.
     stream_on = ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1;
     for i = 1:n_steps
         s_truth = plant.state();
@@ -535,26 +485,6 @@ while ishandle(fig) && getappdata(fig, 'running')
         % regardless of the toggle. The toggle controls whose state
         % the controllers consume.
         est_bus.step(t_sim + (i-1)*dt_rate, s_truth);
-
-        % --- Stream IMU to OpenVINS at imu_pub_hz (sim-time stamped) --------
-        % Decimate the 1 kHz voted IMU to ~200 Hz. imu.t is the sample's sim
-        % time -- the same clock the Cesium pose (and thus the Unity camera)
-        % carry -- so camera and IMU stay in one clock domain for VIO.
-        if stream_on && ~isempty(imu_bridge)
-            imu = est_bus.sensors.vehicleImu();
-            if ~isempty(imu) && isfield(imu, 't') && ...
-                    imu.t >= last_imu_pub_t + imu_pub_dt - 1e-9
-                try
-                    imu_bridge.publish(imu.gyro_b, imu.accel_b, imu.t);
-                    last_imu_pub_t = imu.t;
-                catch ME
-                    warning('IMU bridge publish failed (%s). Disabling.', ME.message);
-                    delete(imu_bridge);
-                    imu_bridge = [];
-                    imu_stream_failed = true;  % stop per-frame recreate churn
-                end
-            end
-        end
 
         if use_est
             s = est_bus.stateOut();
@@ -793,27 +723,6 @@ while ishandle(fig) && getappdata(fig, 'running')
                 cesium_bridge = [];
             end
         end
-        % IMU bridge to OpenVINS (native DDS, no rosbridge). Created with the
-        % Cesium toggle so the VIO pipeline (Unity camera + MATLAB IMU) comes
-        % up together; the substep loop above does the 200 Hz publishing.
-        if isempty(imu_bridge) && ~imu_stream_failed
-            try
-                % Windows: MATLAB cannot join the WSL2 DDS domain, so the
-                % IMU goes through rosbridge (WebSocket) like the pose;
-                % native DDS on Linux.
-                if ispc
-                    imu_bridge = ImuBridgeWs();
-                else
-                    imu_bridge = ImuBridge();
-                end
-                last_imu_pub_t = -inf;
-                fprintf('IMU bridge: publishing to %s @ %d Hz\n', ...
-                        imu_bridge.Topic, imu_pub_hz);
-            catch ME
-                warning('IMU bridge failed to start (%s). Disabling.', ME.message);
-                imu_bridge = [];
-            end
-        end
         if ~isempty(cesium_bridge)
             try
                 cesium_bridge.publish(s.position_ned, s.attitude_q, t_sim);
@@ -826,198 +735,13 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
     end
 
-    % --- VIO logging + comparison (Cesium-tab toggle) ---------------------
-    % On enable, subscribe to /ov_msckf/odomimu and from this frame on record
-    % ground truth, EKF and VIO (OpenVINS global frame) every frame. On
-    % disable (or Stop, in teardown) plot GT vs EKF vs VIO. "Start from the
-    % latest ground-truth point" = logging begins now and the VIO trajectory
-    % is rigidly aligned to GT over the logged window at plot time.
-    vio_on = ishandle(vio_cb) && get(vio_cb, 'Value') == 1;
-    if vio_on && ~prev_vio_on                 % rising edge: start a session
-        if isempty(openvins_pid)              % write params, then launch OpenVINS
-            writeVioParams(vio_ui);           % apply the VIO-tab params to the config
-            openvins_pid = startOpenvins();
-        end
-        if isempty(vio_sub)                   % (re)build the odom subscription
-            try
-                if ispc
-                    % Windows: poll OpenVINS odometry over the rosbridge
-                    % WebSocket (no DDS across the WSL2 boundary). The sim
-                    % loop polls vio_sub.latest() each frame; vio_node and
-                    % the in-GUI image streams stay disabled.
-                    vio_sub = VioOdomSubWs();
-                else
-                    vio_node = ros2node('/px4_matlab_vio', 0);
-                    vio_sub  = ros2subscriber(vio_node, '/ov_msckf/odomimu', ...
-                        'nav_msgs/Odometry', @(m) onVioMessage(fig, m));
-                end
-                % Image subscribers are created lazily below, only while the VIO
-                % tab is open -- deserializing ~60 frames/s on MATLAB's single
-                % thread is what froze the GUI when flying on other tabs.
-            catch ME
-                warning('VIO subscriber failed to start (%s). Disabling.', ME.message);
-                if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
-                vio_node = []; vio_sub = []; vio_idx = 0; set(vio_cb, 'Value', 0);
-            end
-        end
-        if ~isempty(vio_sub)
-            setappdata(fig, 'vio_latest', []);   % drop any stale message
-            vio_idx = 0; vio_last_stamp = -inf; vio_overflow_warned = false;
-            vio_logging = true;
-            vio_align_R = []; vio_align_t = [];  % fresh map-trail alignment
-            clearpoints(mission_map.gt_trail);  clearpoints(mission_map.ekf_trail);
-            clearpoints(mission_map.vio_trail);
-            fprintf('VIO logging started at t=%.2f s (anchored at ground truth).\n', t_sim);
-        end
-    elseif ~vio_on && prev_vio_on             % falling edge: stop, plot, free
-        vio_logging = false;
-        plotVioComparison(vio_log, vio_idx);
-        if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
-        vio_node = []; vio_sub = [];          % so re-enable rebuilds cleanly
-        vio_sub_raw = []; vio_sub_trk = [];   % image subs dropped with the node
-        stopOpenvins(openvins_pid); openvins_pid = [];
-    end
-    prev_vio_on = vio_on;
-
-    % --- lazy image subscriptions: only while the VIO tab is open ----------
-    % Deserializing two image streams (~60 msg/s of 512x512) on the main thread
-    % is what froze the GUI. Subscribe only when you are looking at them.
-    want_vio_imgs = vio_logging && ~isempty(vio_node) && isvalid(vio_node) && ...
-                    ishandle(tg) && tg.SelectedTab == tab_vio;
-    if want_vio_imgs && isempty(vio_sub_raw)
-        try
-            setappdata(fig, 'vio_img_raw', []); setappdata(fig, 'vio_img_trk', []);
-            vio_sub_raw = ros2subscriber(vio_node, '/down_cam/image_raw', ...
-                'sensor_msgs/Image', @(m) onVioImage(fig, 'vio_img_raw', m));
-            vio_sub_trk = ros2subscriber(vio_node, '/ov_msckf/trackhist', ...
-                'sensor_msgs/Image', @(m) onVioImage(fig, 'vio_img_trk', m));
-        catch
-            vio_sub_raw = []; vio_sub_trk = [];
-        end
-    elseif ~want_vio_imgs && ~isempty(vio_sub_raw)
-        try, delete(vio_sub_raw); catch, end %#ok<NOCOM>
-        try, delete(vio_sub_trk); catch, end %#ok<NOCOM>
-        vio_sub_raw = []; vio_sub_trk = [];
-    end
-
-    if vio_logging && ~isempty(vio_sub)
-        % Windows WS transport has no async callback: poll the newest odom
-        % into the same appdata slot the Linux subscriber callback fills.
-        if ispc
-            vmsg_ws = vio_sub.latest();
-            if ~isempty(vmsg_ws), setappdata(fig, 'vio_latest', vmsg_ws); end
-        end
-        vmsg = getappdata(fig, 'vio_latest');
-        if ~isempty(vmsg)
-            vstamp = double(vmsg.header.stamp.sec) + ...
-                     double(vmsg.header.stamp.nanosec) * 1e-9;
-            vp = [vmsg.pose.pose.position.x, vmsg.pose.pose.position.y, ...
-                  vmsg.pose.pose.position.z];
-            vv = [vmsg.twist.twist.linear.x, vmsg.twist.twist.linear.y, ...
-                  vmsg.twist.twist.linear.z];
-            if vstamp > vio_last_stamp && all(isfinite([vstamp, vp, vv]))
-                if vio_idx >= max_log
-                    if ~vio_overflow_warned
-                        warning('VIO log buffer full (%d samples); dropping the rest.', max_log);
-                        vio_overflow_warned = true;
-                    end
-                else
-                    % GT/EKF sampled now (t_sim); VIO carries its own sim-time
-                    % stamp (vt) -- aligned by interpolation at plot time.
-                    gtn  = plant.state();
-                    estn = est_bus.stateOut();
-                    vio_idx = vio_idx + 1;
-                    vio_log.t(vio_idx)          = t_sim;
-                    vio_log.vt(vio_idx)         = vstamp;
-                    vio_log.gt_pos(vio_idx, :)  = gtn.position_ned';
-                    vio_log.gt_vel(vio_idx, :)  = gtn.velocity_ned';
-                    vio_log.ekf_pos(vio_idx, :) = estn.position_ned';
-                    vio_log.ekf_vel(vio_idx, :) = estn.velocity_ned';
-                    vio_log.vio_pos(vio_idx, :) = vp;
-                    vio_log.vio_vel(vio_idx, :) = vv;
-                    vio_last_stamp = vstamp;
-
-                    % --- live 2D map trails (Mission tab) ------------------
-                    % GT (white) + EKF (cyan) appended every sample; VIO (red)
-                    % once a frozen GT alignment exists -- so VIO divergence
-                    % shows as the red trail drifting off GT.
-                    addpoints(mission_map.gt_trail,  gtn.position_ned(2),  gtn.position_ned(1));
-                    addpoints(mission_map.ekf_trail, estn.position_ned(2), estn.position_ned(1));
-                    if ~isempty(vio_align_R)
-                        a = vio_align_R * vp.' + vio_align_t;
-                        addpoints(mission_map.vio_trail, a(2), a(1));
-                    elseif vio_idx >= 80 && mod(vio_idx, 10) == 0
-                        gn = vio_log.gt_pos(1:vio_idx, 1:2);
-                        if max(max(gn, [], 1) - min(gn, [], 1)) > 2   % moved enough to fix yaw
-                            [vio_align_R, vio_align_t] = umeyama_align( ...
-                                vio_log.vio_pos(1:vio_idx, :).', vio_log.gt_pos(1:vio_idx, :).');
-                            al = (vio_align_R * vio_log.vio_pos(1:vio_idx, :).' + vio_align_t).';
-                            clearpoints(mission_map.vio_trail);
-                            addpoints(mission_map.vio_trail, al(:, 2), al(:, 1));
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    % --- VIO -> EKF fusion: replace GPS with OpenVINS odometry ------------
-    % Requires VIO logging on. On the rising edge, anchor the OpenVINS
-    % `global` frame (arbitrary yaw+origin) to the current EKF state, then
-    % feed NED-aligned VIO pos/vel to the estimator in place of GNSS. The
-    % twist is in the IMU body frame (ROS2Visualizer.cpp:300-303), so
-    % velocity is rotated body->global->NED before fusion.
-    fuse_on = vio_logging && ishandle(fuse_cb) && get(fuse_cb, 'Value') == 1;
-    if fuse_on
-        vmsg = getappdata(fig, 'vio_latest');
-        if ~isempty(vmsg)
-            vp = [vmsg.pose.pose.position.x; vmsg.pose.pose.position.y; ...
-                  vmsg.pose.pose.position.z];
-            vq = [vmsg.pose.pose.orientation.w; vmsg.pose.pose.orientation.x; ...
-                  vmsg.pose.pose.orientation.y; vmsg.pose.pose.orientation.z];
-            vv = [vmsg.twist.twist.linear.x; vmsg.twist.twist.linear.y; ...
-                  vmsg.twist.twist.linear.z];
-            vts = double(vmsg.header.stamp.sec) + ...
-                  double(vmsg.header.stamp.nanosec) * 1e-9;
-            if all(isfinite([vp; vq; vv; vts])) && norm(vq) > 0.5
-                if isempty(vio_fuse_R)
-                    est0  = est_bus.stateOut();
-                    rpy_e = quat_to_euler(est0.attitude_q);
-                    rpy_v = quat_to_euler(vq);
-                    dyaw  = rpy_e(3) - rpy_v(3);
-                    cy = cos(dyaw); sy = sin(dyaw);
-                    vio_fuse_R   = [cy -sy 0; sy cy 0; 0 0 1];
-                    vio_fuse_p0  = vp;
-                    vio_fuse_pe0 = est0.position_ned;
-                    est_bus.enableVio(true);
-                    fprintf(['VIO->EKF ON: anchored at EKF [%.1f %.1f %.1f] m, ' ...
-                             'dyaw=%.1f deg. GPS fusion suspended.\n'], ...
-                            vio_fuse_pe0(1), vio_fuse_pe0(2), vio_fuse_pe0(3), rad2deg(dyaw));
-                end
-                pos_ned = vio_fuse_R * (vp - vio_fuse_p0) + vio_fuse_pe0;
-                vel_ned = vio_fuse_R * (quat_to_dcm(vq) * vv);   % body->global->NED
-                est_bus.setVio(struct('pos_ned', pos_ned, 'vel_ned', vel_ned, 't', vts));
-            end
-        end
-    elseif ~isempty(vio_fuse_R)          % fuse turned off (or VIO session ended)
-        est_bus.enableVio(false);
-        vio_fuse_R = []; vio_fuse_p0 = []; vio_fuse_pe0 = [];
-        fprintf('VIO->EKF OFF: GPS fusion resumed.\n');
-    end
-
-    % --- refresh the VIO tab (camera streams + live odom readout) ----------
-    % Decoding two 512x512 frames every loop iteration starves MATLAB's single
-    % thread and makes the joysticks lag. So only do it when the VIO tab is
-    % actually visible, throttled to ~every 4th frame, flushing queued mouse
-    % events right after the heavy decode.
-    if vio_logging && ishandle(tg) && tg.SelectedTab == tab_vio
-        vio_ui_tick = vio_ui_tick + 1;
-        if mod(vio_ui_tick, 4) == 0
-            updateVioImages(vio_ui, fig);
-            updateVioReadout(vio_ui, getappdata(fig, 'vio_latest'), vio_idx, ~isempty(vio_align_R));
-            drawnow limitrate;   % process queued joystick/mouse events after decode
-        end
-    end
+    % --- live 2D map trails (Mission tab), always-on ----------------------
+    % Ground truth (white) and EKF estimate (cyan) appended every frame so the
+    % Mission map shows the flown path regardless of any external aiding.
+    gtn  = plant.state();
+    estn = est_bus.stateOut();
+    addpoints(mission_map.gt_trail,  gtn.position_ned(2),  gtn.position_ned(1));
+    addpoints(mission_map.ekf_trail, estn.position_ned(2), estn.position_ned(1));
 
     rpy    = quat_to_euler(s.attitude_q);        % ground truth (for logging)
     rpy_d  = quat_to_euler(s_disp.attitude_q);   % displayed (estimate feed)
@@ -1088,7 +812,7 @@ while ishandle(fig) && getappdata(fig, 'running')
         vs  = -s_disp.velocity_ned(3);            % climb rate, +up
         gs  = norm(s_disp.velocity_ned(1:2));     % ground speed
         updateStatusStrip(strip, prev_mode, eU, vs, gs, hdg, eN, eE, t_sim, ...
-                          armed, use_est, fuse_on, vio_logging, stream_on);
+                          armed, use_est, stream_on);
         set(state_lbl, 'String', sprintf( ...
             ['TGT    N %s   E %s   ALT %s\n' ...
              'YAW    %+6.1f deg     CMD %+6.1f deg\n' ...
@@ -1112,20 +836,6 @@ end
 if ~isempty(cesium_bridge) && isvalid(cesium_bridge)
     delete(cesium_bridge);
 end
-% Tear down the OpenVINS IMU ROS 2 node if it was started.
-if ~isempty(imu_bridge) && isvalid(imu_bridge)
-    delete(imu_bridge);
-end
-
-% VIO comparison: if logging was still on at Stop, plot before tearing down.
-if vio_logging
-    plotVioComparison(vio_log, vio_idx);
-end
-if ~isempty(vio_node) && isvalid(vio_node)
-    delete(vio_node);     % also drops vio_sub
-end
-% Stop OpenVINS if the toggle was still on at Stop (no-op if we did not start it).
-stopOpenvins(openvins_pid);
 % rosbridge_server is stopped by the onCleanup guard registered at start.
 
 if exist('ctrl_fig', 'var') && ishandle(ctrl_fig)
@@ -1475,250 +1185,7 @@ uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
     'String', sprintf(['Pose stream: ground-truth pose as geometry_msgs/' ...
         'PoseArray on /world/default/pose/info (50 Hz). rosbridge_server is ' ...
         'auto-launched when run_interactive starts and stopped on Stop ' ...
-        '(log: /tmp/px4_rosbridge.log).\n\n' ...
-        'VIO logging + control moved to the VIO tab.']));
-end
-
-
-% =========================================================================
-% VIO tab: enable checkbox, editable OpenVINS parameters (written to the
-% config and applied when VIO is enabled -> OpenVINS relaunches), a live odom
-% readout (/ov_msckf/odomimu), and the two image streams side by side
-% (/down_cam/image_raw + /ov_msckf/trackhist). Returns a struct of handles;
-% the sim loop drives everything off vio_ui.vio_cb.
-% =========================================================================
-function vio_ui = buildVioTab(parent, fig)
-T = gcsTheme();
-[estCfg, camCfg] = vioCfgPaths();
-
-vio_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.02 0.945 0.46 0.04], 'Value', 0, ...
-    'FontWeight', 'bold', 'FontSize', 11, ...
-    'String', 'Enable VIO  (auto-launch OpenVINS + log + plot)');
-% Feed VIO into the EKF in place of GPS. Requires "Enable VIO" on; on the
-% rising edge the OpenVINS frame is anchored to the current EKF state, then
-% VIO pos/vel replace the GNSS aiding source (see EstimatorBus.enableVio).
-fuse_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.49 0.945 0.50 0.04], 'ForegroundColor', T.nav, ...
-    'Value', 0, 'FontWeight', 'bold', 'FontSize', 11, ...
-    'String', 'Fuse VIO -> EKF  (replace GPS)');
-uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.02 0.90 0.96 0.04], 'ForegroundColor', T.sub, ...
-    'HorizontalAlignment', 'left', 'FontSize', 8, ...
-    'String', ['Params are written to the OpenVINS config and applied on Enable ' ...
-        '(OpenVINS relaunches). Tip: fly up to ~30 m, THEN enable -- a wider ground ' ...
-        'footprint = many more features (this is why Gazebo worked). Lower ' ...
-        'fast_threshold and CLAHE find more features on smooth terrain.']);
-
-% --- editable parameters (left panel) -------------------------------------
-pan = uipanel(parent, 'Units', 'normalized', 'Position', [0.02 0.30 0.40 0.585], ...
-    'Title', ' OPENVINS PARAMETERS (applied on Enable) ', ...
-    'FontWeight', 'bold', 'FontSize', 8);
-ed = struct();
-ed.num_pts = vioParamRow(pan, 0.88, 'num features (num\_pts)',  readYamlScalar(estCfg, 'num_pts'));
-ed.fast    = vioParamRow(pan, 0.795,'fast\_threshold (lower=more)', readYamlScalar(estCfg, 'fast_threshold'));
-ed.grid_x  = vioParamRow(pan, 0.71, 'grid\_x',        readYamlScalar(estCfg, 'grid_x'));
-ed.grid_y  = vioParamRow(pan, 0.625,'grid\_y',        readYamlScalar(estCfg, 'grid_y'));
-ed.min_px  = vioParamRow(pan, 0.54, 'min\_px\_dist',  readYamlScalar(estCfg, 'min_px_dist'));
-intr = readYamlArray(camCfg, 'intrinsics');   % [fx fy cx cy]
-if numel(intr) < 4, intr = [394.2 394.2 256 256]; end
-ed.fx = vioParamRow(pan, 0.455, 'fx',  num2str(intr(1)));
-ed.fy = vioParamRow(pan, 0.37,  'fy',  num2str(intr(2)));
-ed.cx = vioParamRow(pan, 0.285, 'cx',  num2str(intr(3)));
-ed.cy = vioParamRow(pan, 0.20,  'cy',  num2str(intr(4)));
-% init method + histogram as dropdowns
-uicontrol(pan, 'Style', 'text', 'Units', 'normalized', 'Position', [0.04 0.105 0.44 0.055], ...
-    'ForegroundColor', T.sub, 'HorizontalAlignment', 'left', 'FontSize', 9, ...
-    'String', 'init method');
-initDyn = strcmpi(strtrim(readYamlScalar(estCfg, 'init_dyn_use')), 'true');
-ed.init = uicontrol(pan, 'Style', 'popupmenu', 'Units', 'normalized', ...
-    'Position', [0.50 0.11 0.44 0.06], 'String', {'dynamic', 'static'}, ...
-    'Value', 1 + ~initDyn, 'BackgroundColor', T.field);
-uicontrol(pan, 'Style', 'text', 'Units', 'normalized', 'Position', [0.04 0.02 0.44 0.055], ...
-    'ForegroundColor', T.sub, 'HorizontalAlignment', 'left', 'FontSize', 9, ...
-    'String', 'histogram');
-hm = upper(strrep(strtrim(readYamlScalar(estCfg, 'histogram_method')), '"', ''));
-hopts = {'NONE', 'HISTOGRAM', 'CLAHE'}; hidx = find(strcmp(hopts, hm), 1);
-if isempty(hidx), hidx = 2; end
-ed.hist = uicontrol(pan, 'Style', 'popupmenu', 'Units', 'normalized', ...
-    'Position', [0.50 0.025 0.44 0.06], 'String', hopts, 'Value', hidx, ...
-    'BackgroundColor', T.field);
-
-% --- live odom readout (left, below the panel) ----------------------------
-readout = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.02 0.04 0.40 0.24], 'BackgroundColor', T.field, ...
-    'HorizontalAlignment', 'left', 'FontName', T.mono, 'FontSize', 9, ...
-    'String', 'VIO odom: (enable VIO to start)');
-
-% --- two image streams side by side (right) -------------------------------
-axRaw = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.45 0.34 0.26 0.50]);
-imgRaw = image(axRaw, zeros(2, 2, 3, 'uint8')); axis(axRaw, 'image', 'off');
-title(axRaw, '/down\_cam/image\_raw', 'FontSize', 9, 'Color', T.text);
-axTrk = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.72 0.34 0.26 0.50]);
-imgTrk = image(axTrk, zeros(2, 2, 3, 'uint8')); axis(axTrk, 'image', 'off');
-title(axTrk, '/ov\_msckf/trackhist (features)', 'FontSize', 9, 'Color', T.text);
-uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.45 0.04 0.53 0.26], 'ForegroundColor', T.sub, ...
-    'HorizontalAlignment', 'left', 'FontSize', 8, ...
-    'String', ['Left: raw camera Unity sends OpenVINS. Right: OpenVINS'' tracked ' ...
-        'features. If the right view has few/no points, the camera is feature-' ...
-        'starved (fly higher, lower fast_threshold, or CLAHE).']);
-
-vio_ui = struct('vio_cb', vio_cb, 'fuse_cb', fuse_cb, 'ed', ed, 'readout', readout, ...
-    'axRaw', axRaw, 'imgRaw', imgRaw, 'axTrk', axTrk, 'imgTrk', imgTrk);
-end
-
-% One "label + edit" row inside the VIO parameter panel; returns the edit handle.
-function h = vioParamRow(pan, y, lbl, val)
-T = gcsTheme();
-uicontrol(pan, 'Style', 'text', 'Units', 'normalized', 'Position', [0.04 y 0.44 0.055], ...
-    'ForegroundColor', T.sub, 'HorizontalAlignment', 'left', 'FontSize', 9, ...
-    'String', lbl);
-h = uicontrol(pan, 'Style', 'edit', 'Units', 'normalized', 'Position', [0.50 y+0.005 0.44 0.06], ...
-    'BackgroundColor', T.field, 'FontName', T.mono, 'String', val);
-end
-
-% Absolute paths of the two OpenVINS config files the launch reads.
-% On Windows the configs live INSIDE WSL and are edited through the \\wsl$
-% UNC share — adjust the distro name ('Ubuntu-22.04'), user, or path below
-% to match your WSL install (see README.md).
-function [estCfg, camCfg] = vioCfgPaths()
-if ispc
-    base = '\\wsl$\Ubuntu-22.04\home\teymur\ytu_thesis\simulation\open_vins\config\matlab_unity';
-else
-    base = '/home/teymur/ytu_thesis/simulation/open_vins/config/matlab_unity';
-end
-estCfg = fullfile(base, 'estimator_config.yaml');
-camCfg = fullfile(base, 'kalibr_imucam_chain.yaml');
-end
-
-% Read a scalar YAML value as a char (e.g. '200', 'true', '"CLAHE"'); '' if absent.
-function v = readYamlScalar(file, key)
-v = '';
-if ~isfile(file), return; end
-lines = readlines(file);
-for i = 1:numel(lines)
-    tok = regexp(lines(i), "^\s*" + key + ":\s*(\S+)", 'tokens', 'once');
-    if ~isempty(tok), v = char(tok(1)); return; end
-end
-end
-
-% Read a YAML array "key: [a, b, c]" as a numeric row vector; [] if absent.
-function v = readYamlArray(file, key)
-v = [];
-if ~isfile(file), return; end
-lines = readlines(file);
-for i = 1:numel(lines)
-    tok = regexp(lines(i), "^\s*" + key + ":\s*\[([^\]]*)\]", 'tokens', 'once');
-    if ~isempty(tok), v = str2double(strsplit(char(tok(1)), ',')); return; end
-end
-end
-
-% Replace the value of "key: VALUE  # comment" in-place, preserving the comment.
-% val may be numeric or char. Only the first matching line is changed.
-function setYamlScalar(file, key, val)
-if isnumeric(val), valstr = num2str(val); else, valstr = char(val); end
-lines = readlines(file);
-for i = 1:numel(lines)
-    if ~isempty(regexp(lines(i), "^\s*" + key + ":(\s|$)", 'once'))
-        lines(i) = regexprep(lines(i), "^(\s*" + key + ":\s*)\S+", "$1" + valstr, 'once');
-        writelines(lines, file);
-        return;
-    end
-end
-end
-
-% Replace "key: [ ... ]" with the given numeric vector, preserving the comment.
-function setYamlArray(file, key, vals)
-s = "[" + strjoin(string(vals), ", ") + "]";
-lines = readlines(file);
-for i = 1:numel(lines)
-    if ~isempty(regexp(lines(i), "^\s*" + key + ":\s*\[", 'once'))
-        lines(i) = regexprep(lines(i), "(^\s*" + key + ":\s*)\[[^\]]*\]", "$1" + s, 'once');
-        writelines(lines, file);
-        return;
-    end
-end
-end
-
-% Write the VIO-tab parameter fields into the OpenVINS config files. Called on
-% VIO enable, just before OpenVINS launches, so the values take effect.
-function writeVioParams(vio_ui)
-[estCfg, camCfg] = vioCfgPaths();
-gn = @(h, d) vioFieldNum(h, d);
-setYamlScalar(estCfg, 'num_pts',        gn(vio_ui.ed.num_pts, 200));
-setYamlScalar(estCfg, 'fast_threshold', gn(vio_ui.ed.fast,    15));
-setYamlScalar(estCfg, 'grid_x',         gn(vio_ui.ed.grid_x,  16));
-setYamlScalar(estCfg, 'grid_y',         gn(vio_ui.ed.grid_y,  16));
-setYamlScalar(estCfg, 'min_px_dist',    gn(vio_ui.ed.min_px,  12));
-initStrs = get(vio_ui.ed.init, 'String');
-isDyn = strcmp(initStrs{get(vio_ui.ed.init, 'Value')}, 'dynamic');
-setYamlScalar(estCfg, 'init_dyn_use', char("" + string(isDyn)));   % 'true'/'false'
-histStrs = get(vio_ui.ed.hist, 'String');
-setYamlScalar(estCfg, 'histogram_method', ['"' histStrs{get(vio_ui.ed.hist, 'Value')} '"']);
-setYamlArray(camCfg, 'intrinsics', [gn(vio_ui.ed.fx, 394.2), gn(vio_ui.ed.fy, 394.2), ...
-    gn(vio_ui.ed.cx, 256), gn(vio_ui.ed.cy, 256)]);
-fprintf('VIO params written to OpenVINS config.\n');
-end
-
-function v = vioFieldNum(h, def)
-v = str2double(get(h, 'String'));
-if ~isfinite(v), v = def; end
-end
-
-% Guarded image-subscriber callback: stash latest image, skip if fig is gone.
-function onVioImage(fig, key, m)
-if ishandle(fig), setappdata(fig, key, m); end
-end
-
-% sensor_msgs/Image struct -> HxWx3 uint8 (mono replicated to RGB).
-function im = decodeRosImage(msg)
-if isempty(msg) || ~isfield(msg, 'width') || double(msg.width) == 0
-    im = zeros(2, 2, 3, 'uint8'); return;
-end
-try
-    im = rosReadImage(msg);
-    if size(im, 3) == 1, im = repmat(im, [1 1 3]); end
-catch
-    w = double(msg.width); h = double(msg.height); d = uint8(msg.data(:));
-    g = reshape(d(1:min(w*h, numel(d))), w, []).';
-    im = repmat(g, [1 1 3]);
-end
-end
-
-% Refresh the two image axes from the latest cached frames. Decodes only when
-% a NEW frame arrived (loop runs faster than the camera), keyed on the stamp.
-function updateVioImages(vio_ui, fig)
-refreshVioImage(fig, 'vio_img_raw', 'vio_img_raw_st', vio_ui.imgRaw, vio_ui.axRaw);
-refreshVioImage(fig, 'vio_img_trk', 'vio_img_trk_st', vio_ui.imgTrk, vio_ui.axTrk);
-end
-
-function refreshVioImage(fig, key, stKey, imgH, axH)
-m = getappdata(fig, key);
-if isempty(m) || ~isfield(m, 'header'), return; end
-st = double(m.header.stamp.sec) + double(m.header.stamp.nanosec) * 1e-9;
-if isequal(st, getappdata(fig, stKey)), return; end   % unchanged -> skip decode
-im = decodeRosImage(m);
-set(imgH, 'CData', im);
-set(axH, 'XLim', [0.5, size(im, 2) + 0.5], 'YLim', [0.5, size(im, 1) + 0.5]);
-setappdata(fig, stKey, st);
-end
-
-% Refresh the odom readout from the latest /ov_msckf/odomimu message.
-function updateVioReadout(vio_ui, vmsg, n, aligned)
-if isempty(vmsg)
-    set(vio_ui.readout, 'String', sprintf(['VIO odom (/ov_msckf/odomimu)\n' ...
-        'waiting for OpenVINS to publish...\nsamples logged: %d'], n));
-    return;
-end
-p = [vmsg.pose.pose.position.x, vmsg.pose.pose.position.y, vmsg.pose.pose.position.z];
-v = [vmsg.twist.twist.linear.x, vmsg.twist.twist.linear.y, vmsg.twist.twist.linear.z];
-if aligned, astr = 'locked'; else, astr = 'pending motion'; end
-set(vio_ui.readout, 'String', sprintf(['VIO odom (/ov_msckf/odomimu)\n' ...
-    'pos[global] x=%+8.2f\n            y=%+8.2f\n            z=%+8.2f m\n' ...
-    'speed |v| = %6.2f m/s\n' ...
-    'samples logged: %d\n' ...
-    'map-trail align: %s'], p(1), p(2), p(3), norm(v), n, astr));
+        '(log: /tmp/px4_rosbridge.log).']));
 end
 
 
@@ -1771,174 +1238,6 @@ cmd = sprintf(['ps -p %d -o args= 2>/dev/null | grep -q rosbridge ' ...
 if st == 0
     fprintf('Stopped rosbridge_server (pid %d).\n', pid);
 end
-end
-
-
-% =========================================================================
-% OpenVINS lifecycle. Auto-launched when the VIO toggle is ticked (sources
-% ROS 2 + the two OpenVINS overlays, then ros2 launch the matlab_unity
-% pipeline) and SIGINT'd when it is unticked / on Stop. Clean-slate: kills any
-% prior OpenVINS pipeline first -- a stray run_subscribe_msckf (e.g. an
-% ov_msckf launched WITHOUT its image bridge) otherwise silently blocks the
-% launch and starves the camera. Needs the IMU bridge (Cesium toggle) + Unity
-% camera up, and motion + features to initialise before /ov_msckf/odomimu flows.
-% =========================================================================
-function pid = startOpenvins()
-pid = [];
-if ~isunix
-    % Windows: launch OpenVINS manually in a WSL terminal (see README.md).
-    % The VIO-tab parameters were just written through the \\wsl$ share, so
-    % (re)starting it now picks them up.
-    fprintf(['OpenVINS is started manually on Windows. In a WSL terminal:\n' ...
-             '  source /opt/ros/humble/setup.bash && ' ...
-             'source ~/ytu_thesis/simulation/open_vins/install/setup.bash && ' ...
-             'source ~/ytu_thesis/simulation/openvins_ws/install/setup.bash && ' ...
-             'ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py\n']);
-    return;
-end
-% clean slate: drop any prior pipeline (strays block the relaunch + image bridge)
-system(['pkill -KILL -f run_subscribe_msckf 2>/dev/null; ' ...
-        'pkill -KILL -f unity_image_bridge 2>/dev/null; ' ...
-        'pkill -KILL -f "ros2 launch openvins" 2>/dev/null; true']);
-ws1 = '/home/teymur/ytu_thesis/simulation/open_vins/install/setup.bash';
-ws2 = '/home/teymur/ytu_thesis/simulation/openvins_ws/install/setup.bash';
-cmd = ['bash -lc ''unset LD_LIBRARY_PATH; ' ...
-       'source /opt/ros/humble/setup.bash && source ' ws1 ' && source ' ws2 ' && ' ...
-       'exec ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py ' ...
-       '>/tmp/px4_openvins.log 2>&1 & echo $!'''];
-[st, out] = system(cmd);
-pidnum = str2double(strtrim(out));
-if st == 0 && isfinite(pidnum) && pidnum > 0
-    pid = pidnum;
-    fprintf('Started OpenVINS (pid %d). Log: /tmp/px4_openvins.log\n', pid);
-    fprintf(['  needs Unity Quba playing (camera) + enough features: fly ~30 m,\n' ...
-             '  reload Unity for 30 fps, lower fast_threshold / use CLAHE on the VIO tab.\n']);
-else
-    warning('Could not auto-launch OpenVINS (see /tmp/px4_openvins.log).');
-end
-end
-
-function stopOpenvins(pid)
-if isempty(pid) || ~isfinite(pid) || pid <= 0, return; end
-% Only SIGINT if the PID is STILL the OpenVINS launch (guards PID reuse).
-cmd = sprintf(['ps -p %d -o args= 2>/dev/null | grep -qE "openvins|ros2 launch" ' ...
-               '&& kill -INT %d 2>/dev/null'], pid, pid);
-[st, ~] = system(cmd);
-if st == 0
-    fprintf('Stopped OpenVINS (pid %d).\n', pid);
-end
-end
-
-% Subscriber callback: stash the latest odom, guarding a possibly-deleted fig.
-function onVioMessage(fig, m)
-if ishandle(fig)
-    setappdata(fig, 'vio_latest', m);
-end
-end
-
-% Reuse (or create) a tagged figure so repeated VIO sessions don't pile up
-% windows.
-function f = namedFigure(tag, name)
-f = findobj(0, 'Type', 'figure', 'Tag', tag);
-if isempty(f)
-    f = figure('Name', name, 'Tag', tag);
-else
-    f = f(1); clf(f); set(f, 'Name', name); figure(f);
-end
-end
-
-
-% =========================================================================
-% Plot the live VIO session: ground truth vs EKF vs VIO. The VIO trajectory
-% (OpenVINS `global` frame, arbitrary yaw+origin) is rigidly SE3-aligned to
-% ground truth over the logged window (Umeyama / standard ATE), which anchors
-% it at the start ground-truth point. Velocity is compared as speed |v| (VIO
-% twist is body-frame). L is the vio_log struct, n the row count.
-% =========================================================================
-function plotVioComparison(L, n)
-if n < 10
-    fprintf('VIO comparison: only %d sample(s) logged; nothing to plot.\n', max(n, 0));
-    return;
-end
-t   = L.t(1:n);          vt   = L.vt(1:n);     % GT/EKF time, VIO message time
-gt  = L.gt_pos(1:n, :);  gtv  = L.gt_vel(1:n, :);
-ekf = L.ekf_pos(1:n, :); ekfv = L.ekf_vel(1:n, :);
-vio = L.vio_pos(1:n, :); viov = L.vio_vel(1:n, :);
-ok  = ~isnan(t) & ~isnan(vt) & all(~isnan(vio), 2) & ...
-      all(~isnan(gt), 2) & all(~isnan(ekf), 2);
-t = t(ok); vt = vt(ok); gt = gt(ok, :); gtv = gtv(ok, :);
-ekf = ekf(ok, :); ekfv = ekfv(ok, :); vio = vio(ok, :); viov = viov(ok, :);
-if size(vio, 1) < 10
-    fprintf(['VIO comparison: <10 valid VIO samples (OpenVINS not ' ...
-             'publishing /ov_msckf/odomimu?). Skipping plot.\n']);
-    return;
-end
-
-% GT/EKF were sampled at frame time t; the VIO sample carries its own (lagged)
-% sim-time vt. Interpolate GT/EKF onto vt so each VIO sample is compared to GT
-% at the SAME instant, then plot against vt.
-gt   = interp1(t, gt,   vt, 'linear', 'extrap');
-ekf  = interp1(t, ekf,  vt, 'linear', 'extrap');
-gtv  = interp1(t, gtv,  vt, 'linear', 'extrap');
-ekfv = interp1(t, ekfv, vt, 'linear', 'extrap');
-
-% SE3-align VIO -> ground truth (no scale; metric VIO).
-[R, tt, ate] = umeyama_align(vio.', gt.');
-vio_a = (R * vio.' + tt).';
-err_ekf = vecnorm(ekf - gt, 2, 2);
-err_vio = vecnorm(vio_a - gt, 2, 2);
-% speed |v| is rotation-invariant, so VIO body-frame velocity norm == NED speed.
-sp_gt = vecnorm(gtv, 2, 2); sp_ekf = vecnorm(ekfv, 2, 2); sp_vio = vecnorm(viov, 2, 2);
-rmse_ekf = sqrt(mean(err_ekf.^2));
-
-fprintf('\n=== VIO vs EKF vs ground truth (%d samples, %.1f s) ===\n', ...
-        size(vio, 1), vt(end) - vt(1));
-fprintf('EKF position RMSE: %.3f m  (mean %.3f, max %.3f)\n', ...
-        rmse_ekf, mean(err_ekf), max(err_ekf));
-fprintf('VIO position ATE : %.3f m  (mean %.3f, max %.3f) after SE3 align\n', ...
-        ate, mean(err_vio), max(err_vio));
-
-% Downsample for PLOTTING only (the metrics above use every sample). Rendering
-% 8 line plots of every sample across 3 figures is what freezes the GUI on long
-% flights; ~3000 points per line is visually identical and renders instantly.
-np = numel(vt); ds = max(1, ceil(np / 3000)); di = 1:ds:np;
-vt = vt(di); gt = gt(di, :); ekf = ekf(di, :); vio_a = vio_a(di, :);
-err_ekf = err_ekf(di); err_vio = err_vio(di);
-sp_gt = sp_gt(di); sp_ekf = sp_ekf(di); sp_vio = sp_vio(di);
-
-lbl = {'North', 'East', 'Down'};
-namedFigure('vio_cmp_pos', 'VIO/EKF/GT: position (NED)');
-for i = 1:3
-    subplot(3, 1, i); hold on; grid on;
-    plot(vt, gt(:, i),    'k',   'LineWidth', 1.3);
-    plot(vt, ekf(:, i),   'b',   'LineWidth', 1.0);
-    plot(vt, vio_a(:, i), 'r--', 'LineWidth', 1.2);
-    ylabel([lbl{i} ' [m]']);
-    if i == 1, legend('ground truth', 'EKF', 'VIO (aligned)', 'Location', 'best'); end
-end
-xlabel('sim time [s]');
-
-namedFigure('vio_cmp_err', 'VIO/EKF/GT: error + speed');
-subplot(2, 1, 1); hold on; grid on;
-plot(vt, err_ekf, 'b', 'LineWidth', 1.2);
-plot(vt, err_vio, 'r', 'LineWidth', 1.2);
-ylabel('position error vs GT [m]');
-legend('EKF', 'VIO', 'Location', 'best');
-title(sprintf('EKF RMSE %.3f m   |   VIO ATE %.3f m', rmse_ekf, ate));
-subplot(2, 1, 2); hold on; grid on;
-plot(vt, sp_gt,  'k',   'LineWidth', 1.3);
-plot(vt, sp_ekf, 'b',   'LineWidth', 1.0);
-plot(vt, sp_vio, 'r--', 'LineWidth', 1.2);
-ylabel('speed [m/s]'); xlabel('sim time [s]');
-legend('ground truth', 'EKF', 'VIO', 'Location', 'best');
-
-namedFigure('vio_cmp_traj', 'VIO/EKF/GT: trajectory (top-down)');
-hold on; grid on; axis equal;
-plot(gt(:, 2),    gt(:, 1),    'k',   'LineWidth', 1.3);
-plot(ekf(:, 2),   ekf(:, 1),   'b',   'LineWidth', 1.0);
-plot(vio_a(:, 2), vio_a(:, 1), 'r--', 'LineWidth', 1.2);
-xlabel('East [m]'); ylabel('North [m]'); title('Trajectory (top-down)');
-legend('ground truth', 'EKF', 'VIO', 'Location', 'best');
 end
 
 
@@ -2004,22 +1303,19 @@ hEnd    = plot(axm, NaN, NaN, 'o', 'MarkerSize', 11, 'LineWidth', 1.0, ...
                'MarkerFaceColor', T.bad, 'MarkerEdgeColor', 'k', ...
                'HitTest', 'off', 'PickableParts', 'none');
 
-% Live 2D flown-path trails (filled by the sim loop while VIO logging is on):
-% ground truth (white), EKF (cyan), VIO aligned to GT (red). animatedline is
-% incremental, so per-frame appends stay cheap.
+% Live 2D flown-path trails (filled by the sim loop every frame):
+% ground truth (white), EKF (cyan). animatedline is incremental, so per-frame
+% appends stay cheap.
 % MaximumNumPoints caps the trail so the Mission map does not slow down over a
-% long flight (the full path still goes to the comparison plot via vio_log).
+% long flight.
 gtTrail  = animatedline(axm, 'Color', [1 1 1],     'LineWidth', 3.0, ...
                         'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
 ekfTrail = animatedline(axm, 'Color', T.data,      'LineWidth', 3.0, ...
                         'MaximumNumPoints', 6000, 'HitTest', 'off', 'PickableParts', 'none');
-vioTrail = animatedline(axm, 'Color', [1 0.35 0.35], 'LineStyle', '--', ...
-                        'MaximumNumPoints', 6000, 'LineWidth', 3.0, ...
-                        'HitTest', 'off', 'PickableParts', 'none');
 % Clickable legend: click an entry to hide/show that trail (toggles its
 % Visible). AutoUpdate off so it does not pick up the basemap/markers.
-lgd = legend(axm, [gtTrail, ekfTrail, vioTrail], ...
-             {'Ground truth', 'EKF', 'VIO'}, ...
+lgd = legend(axm, [gtTrail, ekfTrail], ...
+             {'Ground truth', 'EKF'}, ...
              'Location', 'northeast', 'AutoUpdate', 'off', ...
              'TextColor', T.text, 'Color', T.panel, 'EdgeColor', T.edge, ...
              'FontSize', 9, 'Box', 'on');
@@ -2093,7 +1389,7 @@ set(axm, 'ButtonDownFcn', @(src, ~) onMapClick(src, fig, altEdit, HALF));
 mm = struct('ax', axm, 'path', hPath, 'launch', hLaunch, 'mid', hMid, ...
             'endp', hEnd, 'table', tbl, 'altEdit', altEdit, ...
             'state_lbl', state_lbl, 'pfd', pfd, ...
-            'gt_trail', gtTrail, 'ekf_trail', ekfTrail, 'vio_trail', vioTrail);
+            'gt_trail', gtTrail, 'ekf_trail', ekfTrail);
 end
 
 % =========================================================================
@@ -2261,7 +1557,6 @@ end
 S.p_arm  = makePill(pan, 0.670);
 S.p_ekf  = makePill(pan, 0.724);
 S.p_gps  = makePill(pan, 0.778);
-S.p_vio  = makePill(pan, 0.832);
 S.p_link = makePill(pan, 0.886);
 
 stripCap(pan, 0.942, 0.055, 'MISSION TIME');
@@ -2297,7 +1592,7 @@ end
 
 % Per-frame strip refresh (called from the sim loop).
 function updateStatusStrip(S, mode, alt, vs, gs, hdg, N, E, t, ...
-                           armed, use_est, fuse_on, vio_on, link_on)
+                           armed, use_est, link_on)
 set(S.mode, 'String', upper(mode));
 set(S.alt, 'String', sprintf('%7.1f', alt));
 set(S.vs,  'String', sprintf('%+7.1f', vs));
@@ -2310,11 +1605,7 @@ if armed, setPill(S.p_arm, 'ARMED', 'bad');
 else,     setPill(S.p_arm, 'DISARMED', 'off'); end
 if use_est, setPill(S.p_ekf, 'EKF', 'good');
 else,       setPill(S.p_ekf, 'GT FEED', 'warn'); end
-if fuse_on, setPill(S.p_gps, 'GPS SUSP', 'warn');
-else,       setPill(S.p_gps, 'GPS', 'good'); end
-if fuse_on,    setPill(S.p_vio, 'VIO→EKF', 'nav');
-elseif vio_on, setPill(S.p_vio, 'VIO', 'good');
-else,          setPill(S.p_vio, 'VIO', 'off'); end
+setPill(S.p_gps, 'GPS', 'good');
 if link_on, setPill(S.p_link, 'LINK', 'good');
 else,       setPill(S.p_link, 'LINK', 'off'); end
 end

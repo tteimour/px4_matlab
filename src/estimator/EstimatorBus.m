@@ -38,13 +38,6 @@ classdef EstimatorBus < handle
         last_baro_t  = -inf
         last_mag_t   = -inf
         last_gps_t   = -inf
-
-        % External-vision (VIO) aiding. When vio_enabled, OpenVINS odometry
-        % (already NED-aligned by the caller) replaces GNSS as the pos/vel
-        % aid. vio_sample = struct('pos_ned',3x1,'vel_ned',3x1 or [],'t',s).
-        vio_enabled  = false
-        vio_sample   = []
-        last_vio_t   = -inf
     end
 
     methods
@@ -107,28 +100,14 @@ classdef EstimatorBus < handle
                     obj.last_baro_t = air.t;
                 end
 
-                if obj.vio_enabled
-                    % VIO replaces GNSS as the horizontal position/velocity aid.
-                    % Baro (height) and mag (heading) keep fusing as normal below.
-                    vs = obj.vio_sample;
-                    if ~isempty(vs) && isfield(vs, 't') && vs.t > obj.last_vio_t
-                        obj.ekf.fuseVioPos(vs.pos_ned);
-                        if isfield(vs, 'vel_ned') && ~isempty(vs.vel_ned) ...
-                                && bitand(obj.params.gps_ctrl, 4) ~= 0
-                            obj.ekf.fuseVioVel(vs.vel_ned);
-                        end
-                        obj.last_vio_t = vs.t;
+                gps = obj.sensors.vehicleGpsPosition();
+                if ~isempty(gps) && isfield(gps, 't') && gps.t > obj.last_gps_t ...
+                        && bitand(obj.params.gps_ctrl, 1) ~= 0
+                    obj.ekf.fuseGnssPos(gps);
+                    if bitand(obj.params.gps_ctrl, 4) ~= 0
+                        obj.ekf.fuseGnssVel(gps);
                     end
-                else
-                    gps = obj.sensors.vehicleGpsPosition();
-                    if ~isempty(gps) && isfield(gps, 't') && gps.t > obj.last_gps_t ...
-                            && bitand(obj.params.gps_ctrl, 1) ~= 0
-                        obj.ekf.fuseGnssPos(gps);
-                        if bitand(obj.params.gps_ctrl, 4) ~= 0
-                            obj.ekf.fuseGnssVel(gps);
-                        end
-                        obj.last_gps_t = gps.t;
-                    end
+                    obj.last_gps_t = gps.t;
                 end
 
                 % Mag fusion mode (mag_control.cpp:186-192): AUTO fuses the
@@ -177,25 +156,6 @@ classdef EstimatorBus < handle
             end
         end
 
-        function setVio(obj, sample)
-            % Push the latest NED-aligned VIO measurement (consumed by step()
-            % on the next IMU tick while vio_enabled). sample fields:
-            % pos_ned (3x1), vel_ned (3x1 or []), t (sim seconds).
-            obj.vio_sample = sample;
-        end
-
-        function enableVio(obj, tf)
-            % Switch the pos/vel aiding source: true = VIO, false = GNSS.
-            obj.vio_enabled = logical(tf);
-            obj.ekf.ev_active = obj.vio_enabled;   % horizontal-aiding flag
-            if ~obj.vio_enabled
-                obj.vio_sample = [];
-                obj.last_vio_t = -inf;
-            end
-            % Re-arm GNSS staleness so it resumes cleanly when VIO turns off.
-            obj.last_gps_t = -inf;
-        end
-
         function setInAir(obj, tf)
             % Flight-phase flag from the vehicle layer (PX4 commander/land
             % detector -> ekf2 control flags). Gates mag-3D tilt updates
@@ -208,7 +168,7 @@ classdef EstimatorBus < handle
             % plus the low-pass-filtered, bias-corrected angular rate (updated
             % once per IMU sample in step(), PX4 VehicleAngularVelocity-style).
             % Pure read: does NOT advance the filter, so extra stateOut() calls
-            % (e.g. VIO anchoring) are side-effect free.
+            % are side-effect free.
             s = obj.output_pred.stateOut([]);
             s.angular_vel_b = obj.omega_filt;
         end
@@ -228,9 +188,6 @@ classdef EstimatorBus < handle
             obj.last_baro_t = -inf;
             obj.last_mag_t  = -inf;
             obj.last_gps_t  = -inf;
-            obj.vio_enabled = false;
-            obj.vio_sample  = [];
-            obj.last_vio_t  = -inf;
         end
     end
 end

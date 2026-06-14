@@ -103,5 +103,4 @@ classdef CesiumBridgeWs < handle
 end
 
 
-% The session-persistent rosbridge connection lives in ws_ros_shared.m,
-% shared by all WebSocket bridges (CesiumBridgeWs, ImuBridgeWs, VioOdomSubWs).
+% The session-persistent rosbridge connection lives in ws_ros_shared.m.
