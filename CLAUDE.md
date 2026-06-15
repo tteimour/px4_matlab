@@ -26,10 +26,6 @@ run_mission              % sim/run_mission.m
 
 % Drive the attitude autotune state machine end-to-end against the plant
 run_autotune             % sim/run_autotune.m
-
-% Compare OpenVINS VIO against MATLAB EKF2 (requires sim_log in base workspace
-% and a recorded ROS 2 bag from /ov_msckf/odomimu)
-compare_vio_ekf('vio_run')   % sim/compare_vio_ekf.m
 ```
 
 `run_interactive` has a **SENSORS tab** (estimator feed ON/OFF toggle). When
@@ -219,48 +215,6 @@ sim step.
 - Each module gets a unit test in `tests/unit/` that verifies behavior
   against a hand-computed case.
 
-## VIO / OpenVINS integration
-
-The `vio/` directory holds the OpenVINS observer pipeline. See
-`vio/README.md` for full details. Summary:
-
-```
-vio/
-  open_vins/          git submodule (rpng/open_vins, unmodified upstream)
-  openvins_ws/src/
-    openvins_matlab_bridge/   Unity NavCamera → /down_cam/image_raw + launch
-    openvins_px4_bridge/      PX4 SITL bridge (needs px4_msgs)
-  config/
-    matlab_unity/   estimator_config.yaml, kalibr_imu_chain.yaml, kalibr_imucam_chain.yaml
-    px4_sitl/       equivalent configs for SITL
-```
-
-**First-time build** (after `git submodule update --init vio/open_vins`):
-
-```bash
-cd vio/open_vins
-colcon build --packages-select ov_core ov_init ov_msckf ov_eval \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
-
-cd ../openvins_ws
-colcon build
-```
-
-**Run (MATLAB + Unity path)** — source order: `/opt/ros/humble` → `vio/open_vins/install` → `vio/openvins_ws/install`:
-
-1. `ros2 launch rosbridge_server rosbridge_websocket_launch.xml`
-2. In MATLAB: `run_interactive` → enable **Stream pose to Cesium/Unity**
-3. Unity: Play the Quba scene
-4. `ros2 launch openvins_matlab_bridge openvins_matlab_unity.launch.py`
-
-Output: `/ov_msckf/odomimu` (`nav_msgs/Odometry`, ~125 Hz).
-
-**Compare VIO vs EKF2**: record a bag during flight
-(`ros2 bag record -o vio_run /ov_msckf/odomimu`), then in MATLAB with
-`sim_log` in the base workspace: `compare_vio_ekf('vio_run')`. Uses
-SE3 Umeyama alignment (`src/math/umeyama_align.m`) before computing ATE
-because OpenVINS' gauge yaw and origin are unobservable.
-
 ## Unity/Cesium bridge
 
 `src/bridge/CesiumBridge.m` publishes `geometry_msgs/PoseArray` on
@@ -286,5 +240,4 @@ and Gazebo are not required.
 - [x] System-identification autotune (ArxRls + SystemIdentification +
       GMVC pid_design + McAutotuneAttitudeControl state machine);
       demo in sim/run_autotune.m, unit tests vs PX4 reference values
-- [x] VIO/OpenVINS integration (observer path, compare_vio_ekf)
 - [ ] Estimator validation (unit + bench tests)
