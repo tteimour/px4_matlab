@@ -9,6 +9,14 @@ classdef CesiumBridge < handle
 % Conversion is done by ned_frd_to_enu_flu(); ROS quaternion order is
 % (x,y,z,w) whereas px4_matlab uses [w;x;y;z].
 %
+% Also publishes the vehicle attitude as geometry_msgs/QuaternionStamped on
+% /matlab/attitude (default): the NATIVE body->NED FRD quaternion q_b2n (NOT
+% the ENU/FLU pose orientation), stamped with the same sim time as the pose.
+% A consumer that needs a body(FRD)->camera extrinsic -- e.g. the
+% hybrid_tracker_vpi ego-motion projector -- uses this directly; the ego-shift
+% projector only uses the inter-frame attitude DELTA, so NED vs ENU world
+% cancels and only the FRD body convention matters.
+%
 % Runtime requirement on the Unity side -- ONLY rosbridge is needed:
 %   ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 % PX4 SITL, the Micro-XRCE-DDS agent, Gazebo and ros_gz_bridge are NOT
@@ -26,17 +34,21 @@ classdef CesiumBridge < handle
         Node
         Publisher
         Topic
+        AttPublisher    % geometry_msgs/QuaternionStamped (body->NED FRD attitude)
+        AttTopic
     end
 
     properties (Access = private)
         msg     % cached PoseArray (2 poses) reused every publish
+        amsg    % cached QuaternionStamped reused every publish
     end
 
     methods
-        function obj = CesiumBridge(topic, nodeName, domainID)
+        function obj = CesiumBridge(topic, nodeName, domainID, attTopic)
             if nargin < 1 || isempty(topic),    topic    = '/world/default/pose/info'; end
             if nargin < 2 || isempty(nodeName), nodeName = '/px4_matlab_bridge';       end
             if nargin < 3 || isempty(domainID), domainID = 0;                           end
+            if nargin < 4 || isempty(attTopic), attTopic = '/matlab/attitude';          end
 
             % Make the pure conversion reachable regardless of caller cwd.
             here = fileparts(mfilename('fullpath'));
@@ -54,6 +66,17 @@ classdef CesiumBridge < handle
             p.orientation.w = 1;          % identity placeholder
             m.poses = [p; p];             % 2x1 struct array
             obj.msg = m;
+
+            % Attitude publisher: native body->NED FRD quaternion (q_b2n),
+            % NOT the ENU/FLU pose orientation, so a body(FRD)->camera
+            % extrinsic downstream stays valid. ROS order is (x,y,z,w).
+            obj.AttTopic     = attTopic;
+            obj.AttPublisher = ros2publisher(obj.Node, attTopic, ...
+                                             'geometry_msgs/QuaternionStamped');
+            a = ros2message('geometry_msgs/QuaternionStamped');
+            a.header.frame_id = 'ned';
+            a.quaternion.w = 1;           % identity placeholder
+            obj.amsg = a;
         end
 
         function publish(obj, pos_ned, q_b2n, t_sim)
@@ -79,6 +102,18 @@ classdef CesiumBridge < handle
 
             send(obj.Publisher, m);
             obj.msg = m;
+
+            % Native body->NED FRD attitude (q_b2n = [w;x;y;z]) for the tracker,
+            % stamped identically to the pose so they pair by timestamp.
+            a = obj.amsg;
+            a.header.stamp.sec     = int32(sec);
+            a.header.stamp.nanosec = uint32(nsec);
+            a.quaternion.w = q_b2n(1);
+            a.quaternion.x = q_b2n(2);
+            a.quaternion.y = q_b2n(3);
+            a.quaternion.z = q_b2n(4);
+            send(obj.AttPublisher, a);
+            obj.amsg = a;
         end
     end
 end
