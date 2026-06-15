@@ -43,6 +43,7 @@ gt  = L.gt_pos(1:n, :);  gtv  = L.gt_vel(1:n, :);
 ekf = L.ekf_pos(1:n, :); ekfv = L.ekf_vel(1:n, :);
 vio = L.vio_pos(1:n, :); viov = L.vio_vel(1:n, :);
 vq  = L.vio_q(1:n, :);   fus  = L.fused(1:n);
+fp  = L.fus_pos(1:n, :);     % anchor'lı VIO (EKF'e fiilen beslenen) — adil kıyas
 cps = L.ctl_pos_sp(1:n, :);  cpf = L.ctl_pos_fb(1:n, :);
 cvs = L.ctl_vel_sp(1:n, :);  cvf = L.ctl_vel_fb(1:n, :);
 ok  = ~isnan(t) & ~isnan(vt) & all(~isnan(vio), 2) & ...
@@ -50,7 +51,7 @@ ok  = ~isnan(t) & ~isnan(vt) & all(~isnan(vio), 2) & ...
 t = t(ok); vt = vt(ok); gt = gt(ok, :); gtv = gtv(ok, :);
 ekf = ekf(ok, :); ekfv = ekfv(ok, :); vio = vio(ok, :); viov = viov(ok, :);
 vq = vq(ok, :); fus = fus(ok); cps = cps(ok, :); cpf = cpf(ok, :);
-cvs = cvs(ok, :); cvf = cvf(ok, :);
+cvs = cvs(ok, :); cvf = cvf(ok, :); fp = fp(ok, :);
 if size(vio, 1) < 10
     fprintf('VIO comparison: <10 valid VIO samples. Skipping plot.\n');
     return;
@@ -71,7 +72,8 @@ fus  = interp1(t, double(fus), vt, 'previous', 'extrap') > 0.5;
 [R, tt, ate] = umeyama_align(vio.', gt.');
 vio_a = (R * vio.' + tt).';
 err_ekf = vecnorm(ekf - gt, 2, 2);
-err_vio = vecnorm(vio_a - gt, 2, 2);
+err_vio = vecnorm(vio_a - gt, 2, 2);          % SE3-hizalanmış (optimistik, yörünge çizimi için)
+err_vio_fair = vecnorm(fp - gt, 2, 2);        % anchor'lı = EKF'in gördüğü VIO (adil; gözlemcide NaN)
 sp_gt = vecnorm(gtv, 2, 2); sp_ekf = vecnorm(ekfv, 2, 2); sp_vio = vecnorm(viov, 2, 2);
 rmse_ekf = sqrt(mean(err_ekf.^2));
 
@@ -86,10 +88,11 @@ fprintf('VIO position ATE : %.3f m  (mean %.3f, max %.3f) after SE3 align\n', ..
 fus_stats = [];
 if nnz(fus) > 10
     dt_s = [diff(vt); median(diff(vt))];
+    ffin = fus & all(isfinite(fp), 2);   % füzyon + anchor'lı ölçüm mevcut
     fus_stats = struct( ...
         'dur',      sum(dt_s(fus)), ...
-        'rmse_vio', sqrt(mean(err_vio(fus).^2)), ...
-        'mean_vio', mean(err_vio(fus)), 'max_vio', max(err_vio(fus)), ...
+        'rmse_vio', sqrt(mean(err_vio_fair(ffin).^2)), ...
+        'mean_vio', mean(err_vio_fair(ffin)), 'max_vio', max(err_vio_fair(ffin)), ...
         'rmse_ekf', sqrt(mean(err_ekf(fus).^2)), ...
         'mean_ekf', mean(err_ekf(fus)), 'max_ekf', max(err_ekf(fus)), ...
         'obs_rmse_ekf', NaN, 'obs_mean_ekf', NaN, 'obs_max_ekf', NaN);
@@ -108,7 +111,7 @@ end
 np = numel(vt); ds = max(1, ceil(np / 3000)); di = 1:ds:np;
 vt = vt(di); gt = gt(di, :); ekf = ekf(di, :); vio_a = vio_a(di, :);
 gtv = gtv(di, :); ekfv = ekfv(di, :); viov = viov(di, :); vq = vq(di, :);
-err_ekf = err_ekf(di); err_vio = err_vio(di);
+err_ekf = err_ekf(di); err_vio = err_vio(di); err_vio_fair = err_vio_fair(di);
 sp_gt = sp_gt(di); sp_ekf = sp_ekf(di); sp_vio = sp_vio(di);
 cps = cps(di, :); cpf = cpf(di, :); cvs = cvs(di, :); cvf = cvf(di, :);
 fus = fus(di);
@@ -169,13 +172,19 @@ xlabel('Benzetim zamanı [s]');
 % --- Şekil 3: hata normu + sürat ----------------------------------------------
 f3 = namedFig('vio_cmp_err', 'VIO/EKF/GERÇEK: hata + sürat', [120 80 900 620]);
 ax = subplot(2, 1, 1); hold(ax, 'on'); grid(ax, 'on');
+% VIO hatası adil bazda (EKF'in gördüğü anchor'lı ölçüm); füzyon fazında çizilir.
 h1 = plot(ax, vt, err_ekf, 'b', 'LineWidth', 1.2);
-h2 = plot(ax, vt, err_vio, 'r', 'LineWidth', 1.2);
+h2 = plot(ax, vt, err_vio_fair, 'r', 'LineWidth', 1.2);
 ylabel(ax, 'Konum hatası [m]');
 growTop(ax, 0.35);
 addModePatches(ax, vt, fus);
 legend(ax, [h1 h2], {'EKF', 'VIO'}, 'Location', 'northeast', 'FontSize', 11);
-title(ax, sprintf('EKF RMSE %.3f m   |   VIO ATE %.3f m', rmse_ekf, ate));
+if ~isempty(fus_stats)
+    title(ax, sprintf('Füzyon fazı (GERÇEK''e göre): EKF RMSE %.2f m   |   VIO RMSE %.2f m', ...
+                      fus_stats.rmse_ekf, fus_stats.rmse_vio));
+else
+    title(ax, sprintf('EKF RMSE %.3f m   |   VIO ATE %.3f m', rmse_ekf, ate));
+end
 ax = subplot(2, 1, 2); hold(ax, 'on'); grid(ax, 'on');
 plot(ax, vt, sp_gt,  'k',   'LineWidth', 1.3);
 plot(ax, vt, sp_ekf, 'b',   'LineWidth', 1.0);
@@ -325,17 +334,18 @@ fprintf(fid, ['    \\caption{VIO füzyon fazında (GNSS kapalı, %.1f~s) ' ...
               'gerçek değere göre konum hatası istatistikleri.}\n'], s.dur);
 fprintf(fid, '    \\label{tab:vio_fuzyon_hata}\n');
 fprintf(fid, '    \\renewcommand{\\arraystretch}{1.3}\n');
-fprintf(fid, '    \\begin{tabular}{@{} l c c c @{}}\n        \\hline\n');
+% Tam ızgara (tezdeki diğer tablolarla tutarlı): |l|c|c|c| + her satırda \hline.
+fprintf(fid, '    \\begin{tabular}{|l|c|c|c|}\n        \\hline\n');
 fprintf(fid, ['        \\textbf{Kestirim} & \\textbf{RMSE [m]} & ' ...
               '\\textbf{Ortalama [m]} & \\textbf{Maksimum [m]} \\\\\n        \\hline\n']);
-fprintf(fid, '        VIO & %.2f & %.2f & %.2f \\\\\n', ...
+fprintf(fid, '        VIO & %.2f & %.2f & %.2f \\\\\n        \\hline\n', ...
         s.rmse_vio, s.mean_vio, s.max_vio);
-fprintf(fid, '        EKF (VIO füzyonu, GNSS kapalı) & %.2f & %.2f & %.2f \\\\\n', ...
+fprintf(fid, '        EKF (VIO füzyonu, GNSS kapalı) & %.2f & %.2f & %.2f \\\\\n        \\hline\n', ...
         s.rmse_ekf, s.mean_ekf, s.max_ekf);
 if isfinite(s.obs_rmse_ekf)
-    fprintf(fid, '        EKF (gözlemci fazı, INS/GNSS) & %.2f & %.2f & %.2f \\\\\n', ...
+    fprintf(fid, '        EKF (gözlemci fazı, INS/GNSS) & %.2f & %.2f & %.2f \\\\\n        \\hline\n', ...
             s.obs_rmse_ekf, s.obs_mean_ekf, s.obs_max_ekf);
 end
-fprintf(fid, '        \\hline\n    \\end{tabular}\n\\end{table}\n');
+fprintf(fid, '    \\end{tabular}\n\\end{table}\n');
 fclose(fid);
 end

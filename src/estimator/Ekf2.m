@@ -70,6 +70,21 @@ classdef Ekf2 < handle
         baro_bias_var    = 0.1    % initial variance (bias_estimator.hpp:104)
         last_baro_fuse_t = -inf
 
+        % VIO irtifa-ofset kestiricisi (#5): monoküler VIO'nun düşey
+        % sürüklenmesini soğurur; böylece gevşek (ev_p_noise_z) VIO-z,
+        % baro ile çapalanan irtifayı bozmaz. Baro bias ile aynı desen.
+        % Gözlemlenebilir: dondurulmuş baro mutlak irtifayı sabitlerken bu
+        % ofset VIO-z sürüklenmesini üstlenir. (Yalnızca düşey — yatay VIO
+        % ofseti GNSS/TRN olmadan gözlemlenemez, eklenmedi.)
+        vio_z_bias        = 0.0
+        vio_z_bias_var    = 1.0
+        last_vio_z_fuse_t = -inf
+
+        % GNSS yardımı aktif mi? VIO (GNSS erişimsiz) modunda false olur;
+        % o zaman baro bias DONDURULUR (yeniden öğrenecek mutlak referans
+        % yok), böylece baro kararlı mutlak irtifa referansı olarak kalır.
+        gnss_active      = true
+
         % IMU downsampler (imu_down_sampler.cpp): raw 1 kHz IMU samples are
         % accumulated into one EKF2_PREDICT_US window (default 10 ms); the
         % state + covariance prediction runs once per window, like PX4.
@@ -137,6 +152,10 @@ classdef Ekf2 < handle
             obj.baro_bias       = 0.0;
             obj.baro_bias_var   = 0.1;
             obj.last_baro_fuse_t = -inf;
+            obj.vio_z_bias       = 0.0;
+            obj.vio_z_bias_var   = 1.0;
+            obj.last_vio_z_fuse_t = -inf;
+            obj.gnss_active      = true;
 
             obj.ds_dq         = [1; 0; 0; 0];
             obj.ds_dvel       = zeros(3, 1);
@@ -331,7 +350,12 @@ classdef Ekf2 < handle
                 dt_b = 0;
             end
             obj.last_baro_fuse_t = baro.t;
-            obj.baro_bias_var = min(max(obj.baro_bias_var + 0.13^2 * dt_b, 1e-8), 2.0);
+            % Bias varyansını YALNIZCA GNSS mutlak irtifayı çapalarken büyüt.
+            % VIO (GNSS erişimsiz) modunda baro tek mutlak irtifa referansıdır;
+            % bias dondurulur ki baro kararlı kalsın.
+            if obj.gnss_active
+                obj.baro_bias_var = min(max(obj.baro_bias_var + 0.13^2 * dt_b, 1e-8), 2.0);
+            end
 
             % Measurement: altitude (positive up). Predicted altitude = alt0 - pos_z.
             % The observation variance includes the bias-estimator variance
@@ -369,7 +393,8 @@ classdef Ekf2 < handle
             innov_var_b = obj.baro_bias_var + max(1e-4, obj.params.baro_noise^2) ...
                         + obj.P(obj.IDX_POS(3), obj.IDX_POS(3));
             innov_b     = innov;
-            if innov_b^2 / (9 * innov_var_b) < 1.0
+            % Bias yalnızca GNSS aktifken öğrenilir; VIO modunda dondurulur.
+            if obj.gnss_active && innov_b^2 / (9 * innov_var_b) < 1.0
                 K_b = obj.baro_bias_var / innov_var_b;
                 obj.baro_bias     = obj.baro_bias + K_b * innov_b;
                 obj.baro_bias_var = max((1 - K_b) * obj.baro_bias_var, 1e-8);
@@ -459,24 +484,66 @@ classdef Ekf2 < handle
         % aid is enabled (yaw+origin are otherwise unobservable). Noise from
         % EKF2_EVP_NOISE, gate from EKF2_EVP_GATE (params_external_vision.yaml).
         % ============================================================
-        function out = fuseVioPos(obj, z_ned)
+        function out = fuseVioPos(obj, z_ned, t)
             out.fused = false; out.innov = zeros(3, 1); out.test_ratio = zeros(3, 1);
             if isempty(z_ned), return; end
+            if nargin < 3 || isempty(t), t = obj.last_vio_z_fuse_t; end
 
-            R_pos = (obj.params.ev_p_noise^2) * eye(3);
+            % Eksen-bazlı gürültü: yatay sıkı (VIO tek yatay yardım), düşey
+            % gevşek (ev_p_noise_z) -> mutlak irtifayı baro tutar, VIO-z yalnızca
+            % iter. Düşey eksende VIO irtifa-ofseti (#5) ölçümden çıkarılır;
+            % böylece monoküler VIO düşey sürüklenmesi irtifaya değil ofsete biner.
+            R_axis = [obj.params.ev_p_noise^2, obj.params.ev_p_noise^2, ...
+                      obj.params.ev_p_noise_z^2];
+
+            % --- VIO irtifa-ofset varyansının rastgele yürüyüşle büyümesi ---
+            if isfinite(obj.last_vio_z_fuse_t)
+                dt_v = max(t - obj.last_vio_z_fuse_t, 0);
+            else
+                dt_v = 0;
+            end
+            obj.vio_z_bias_var = min(obj.vio_z_bias_var + obj.params.vio_z_bias_nsd^2 * dt_v, 50.0);
+            obj.last_vio_z_fuse_t = t;
+
             for axis = 1:3
-                innov = z_ned(axis) - obj.pos(axis);
+                if axis == 3
+                    % VIO düşey ölçümü = pos_d + vio_z_bias (+gürültü).
+                    innov = z_ned(3) - obj.pos(3) - obj.vio_z_bias;
+                    R     = R_axis(3) + obj.vio_z_bias_var;
+                else
+                    innov = z_ned(axis) - obj.pos(axis);
+                    R     = R_axis(axis);
+                end
                 H = zeros(1, obj.N_ERR);
                 H(obj.IDX_POS(axis)) = 1.0;
-                S = H * obj.P * H' + R_pos(axis, axis);
+                S = H * obj.P * H' + R;
                 tr = innov^2 / (S * obj.params.ev_pos_gate^2);
                 out.innov(axis)      = innov;
                 out.test_ratio(axis) = tr;
                 if tr <= 1.0
-                    obj.applyKalmanUpdate(H, innov, S, R_pos(axis, axis));
+                    obj.applyKalmanUpdate(H, innov, S, R);
+                    if axis == 3
+                        % VIO irtifa-ofsetini aynı artıkla güncelle (baro bias
+                        % deseni): ofset, VIO-z sürüklenmesini üstlenir.
+                        innov_var_b = obj.vio_z_bias_var + R_axis(3) ...
+                                    + obj.P(obj.IDX_POS(3), obj.IDX_POS(3));
+                        if innov^2 / (9 * innov_var_b) < 1.0
+                            K_b = obj.vio_z_bias_var / innov_var_b;
+                            obj.vio_z_bias     = obj.vio_z_bias + K_b * innov;
+                            obj.vio_z_bias_var = max((1 - K_b) * obj.vio_z_bias_var, 1e-6);
+                        end
+                    end
                 end
             end
             out.fused = true;
+        end
+
+        % VIO füzyonu açıldığında irtifa-ofsetini sıfırla (anchor anında
+        % VIO-z ile EKF irtifası çakışık olduğundan ofset 0'dan başlar).
+        function resetVioHeightBias(obj)
+            obj.vio_z_bias        = 0.0;
+            obj.vio_z_bias_var    = 1.0;
+            obj.last_vio_z_fuse_t = -inf;
         end
 
         % ============================================================

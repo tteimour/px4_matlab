@@ -44,10 +44,23 @@ function p = Ekf2Params()
     % --- External vision / VIO (params_external_vision.yaml) ---
     % Used when the VIO-tab "Fuse VIO -> EKF" toggle replaces GNSS with
     % OpenVINS odometry as the position/velocity aiding source.
-    p.ev_p_noise       = 0.1;        % m    (EKF2_EVP_NOISE default)
-    p.ev_v_noise       = 0.1;        % m/s  (EKF2_EVV_NOISE default)
+    p.ev_p_noise       = 0.1;        % m    (EKF2_EVP_NOISE default) — yatay
+    p.ev_p_noise_z     = 10.0;       % m    VIO düşey (irtifa) konum gürültüsü;
+                                     % baro (2 m) mutlak irtifayı tutsun, VIO-z
+                                     % yalnızca zayıf katkı versin.
+    p.vio_z_bias_nsd   = 0.5;        % m/sqrt(s)  VIO irtifa-ofset durumunun (#5)
+                                     % rastgele yürüyüş yoğunluğu (VIO düşey
+                                     % sürüklenmesini soğurur).
+    p.ev_v_noise       = 0.2;        % m/s  VIO hız gürültüsü. Orta yol: 0.1
+                                     % EKF'in VIO gürültüsünü filtreleyip VIO'yu
+                                     % yenmesini sağlıyor ama glitch'i takip
+                                     % ediyordu; 1.0 dayanıklı ama EKF>VIO oldu.
+                                     % 0.2 + daralan kapı: filtreleme korunur,
+                                     % glitch kapıyla reddedilir.
     p.ev_pos_gate      = 5.0;        % STD  (EKF2_EVP_GATE default)
-    p.ev_vel_gate      = 3.0;        % STD  (EKF2_EVV_GATE default)
+    p.ev_vel_gate      = 2.0;        % STD  VIO hız kapısı (3.0 -> 2.0): sert
+                                     % manevradaki VIO hız glitch'lerini (ivmeölçer
+                                     % ile tutarsız) reddedip terminal ıraksamayı önler.
 
     % --- Wind ---
     p.wind_nsd         = 1.0e-1;     % m/s/sqrt(s) wind process noise

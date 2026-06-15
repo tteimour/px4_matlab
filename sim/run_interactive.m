@@ -310,8 +310,9 @@ vio_sub        = [];      % subscriber to /ov_msckf/odomimu
 vio_sub_raw    = [];      % lazy: /down_cam/image_raw (only while VIO tab open)
 vio_sub_trk    = [];      % lazy: /ov_msckf/trackhist (only while VIO tab open)
 openvins_pid   = [];      % OpenVINS launch PID (auto-started with the VIO toggle)
-vio_align_R    = [];      % frozen SE3 rotation OpenVINS-global -> NED (map trail)
-vio_align_t    = [];      % frozen SE3 translation (map trail)
+vio_align_R    = [];      % SE3 rotation OpenVINS-global -> NED (map trail)
+vio_align_t    = [];      % SE3 translation (map trail)
+vio_align_frozen = false; % true: dur (append-only); false: gozlemci modunda yuvarlanan yeniden-hizalama
 % VIO->EKF fusion anchor (separate from the map-trail alignment above: this
 % one anchors to the EKF estimate, NOT ground truth, so it is a legitimate
 % GNSS-denied aid). Set on the "Fuse VIO -> EKF" rising edge.
@@ -891,7 +892,7 @@ while ishandle(fig) && getappdata(fig, 'running')
             setappdata(fig, 'vio_latest', []);   % drop any stale message
             vio_idx = 0; vio_last_stamp = -inf; vio_overflow_warned = false;
             vio_logging = true;
-            vio_align_R = []; vio_align_t = [];  % fresh map-trail alignment
+            vio_align_R = []; vio_align_t = []; vio_align_frozen = false;  % fresh map-trail alignment
             clearpoints(mission_map.vio_trail);  % GT/EKF trails keep their history
             fprintf('VIO logging started at t=%.2f s (anchored at ground truth).\n', t_sim);
             % The Unity NavCamera sits 10 m below the body: underground below
@@ -905,11 +906,11 @@ while ishandle(fig) && getappdata(fig, 'running')
                          'Climb to altitude first, then enable (or re-enable) VIO.']);
             end
         end
-    elseif ~vio_on && prev_vio_on             % falling edge: stop, plot, free
+    elseif ~vio_on && prev_vio_on             % falling edge: stop, SAVE session, free
         vio_logging = false;
         set(mission_map.vio_arrow, 'XData', NaN, 'YData', NaN);
         ud = get(mission_map.vio_arrow, 'UserData'); ud.hdg = NaN; set(mission_map.vio_arrow, 'UserData', ud);
-        plotVioComparison(vio_log, vio_idx);
+        saveVioSession(vio_log, vio_idx);     % save timestamped .mat; plot later via plot_vio_session()
         if ~isempty(vio_node) && isvalid(vio_node), delete(vio_node); end
         vio_node = []; vio_sub = [];          % so re-enable rebuilds cleanly
         vio_sub_raw = []; vio_sub_trk = [];   % image subs dropped with the node
@@ -989,20 +990,41 @@ while ishandle(fig) && getappdata(fig, 'running')
                     vio_last_stamp = vstamp;
 
                     % --- live VIO trail (Mission tab) ----------------------
-                    % GT and EKF trails are updated unconditionally every
-                    % frame (below the VIO block), so only add the VIO trail
-                    % here, once a frozen GT alignment exists.
+                    % The VIO trail needs a VIO->NED (yaw) alignment to GT.
+                    % A SINGLE early fit (before VIO converges or the path has
+                    % a 2D shape) can lock a ~100+ deg wrong yaw, drawing the
+                    % whole trail backwards. So while the fit is NOT frozen we
+                    % RE-FIT it over the whole history every ~1 s: this
+                    % self-corrects as data accumulates. The fit is frozen when
+                    % VIO fusion turns on (anchor below), or auto-frozen once the
+                    % path is long and clearly 2D (yaw then reliable).
                     if ~isempty(vio_align_R)
                         a = vio_align_R * vp.' + vio_align_t;
                         addpoints(mission_map.vio_trail, a(2), a(1));
-                        % heading from delta between last two aligned VIO positions
                         if vio_idx >= 2
                             a_prev = vio_align_R * vio_log.vio_pos(vio_idx-1,:).' + vio_align_t;
                             updateHeadingArrow(mission_map.vio_arrow, a(2), a(1), a(2)-a_prev(2), a(1)-a_prev(1));
                         end
-                    elseif vio_idx >= 80 && mod(vio_idx, 10) == 0
-                        gn = vio_log.gt_pos(1:vio_idx, 1:2);
-                        if max(max(gn, [], 1) - min(gn, [], 1)) > 2   % moved enough to fix yaw
+                        % Yuvarlanan yeniden-hizalama (henuz donmadiysa).
+                        if ~vio_align_frozen && mod(vio_idx, 30) == 0
+                            gn  = vio_log.gt_pos(1:vio_idx, 1:2);
+                            rng = max(gn, [], 1) - min(gn, [], 1);
+                            if min(rng) > 4
+                                [vio_align_R, vio_align_t] = umeyama_align( ...
+                                    vio_log.vio_pos(1:vio_idx, :).', vio_log.gt_pos(1:vio_idx, :).');
+                                al = (vio_align_R * vio_log.vio_pos(1:vio_idx, :).' + vio_align_t).';
+                                clearpoints(mission_map.vio_trail);
+                                addpoints(mission_map.vio_trail, al(:, 2), al(:, 1));
+                                % Yol uzun ve belirgin 2B ise yaw guvenilir -> dondur.
+                                if vio_idx >= 600 && min(rng) > 20
+                                    vio_align_frozen = true;
+                                end
+                            end
+                        end
+                    elseif vio_idx >= 60
+                        % Henuz hizalama yok: yeterli hareket olunca ilk fiti kur.
+                        gn  = vio_log.gt_pos(1:vio_idx, 1:2);
+                        if max(max(gn, [], 1) - min(gn, [], 1)) > 4
                             [vio_align_R, vio_align_t] = umeyama_align( ...
                                 vio_log.vio_pos(1:vio_idx, :).', vio_log.gt_pos(1:vio_idx, :).');
                             al = (vio_align_R * vio_log.vio_pos(1:vio_idx, :).' + vio_align_t).';
@@ -1062,6 +1084,7 @@ while ishandle(fig) && getappdata(fig, 'running')
                     vio_fuse_R   = quat_to_dcm(anchor0.attitude_q) * quat_to_dcm(vq)';
                     vio_fuse_p0  = vp;
                     vio_fuse_pe0 = anchor0.position_ned;
+                    vio_align_frozen = true;   % harita izi hizalamasini dondur (fuzyon boyunca sabit)
                     est_bus.enableVio(true);
                     fprintf(['VIO->EKF ON: anchored at [%.1f %.1f %.1f] m. ' ...
                              'GPS fusion suspended.\n'], ...
@@ -1198,9 +1221,10 @@ if ~isempty(imu_bridge) && isvalid(imu_bridge)
     delete(imu_bridge);
 end
 
-% VIO comparison: if logging was still on at Stop, plot before tearing down.
+% VIO comparison: if logging was still on at Stop, save the session before
+% tearing down (no live plot; replay later with plot_vio_session()).
 if vio_logging
-    plotVioComparison(vio_log, vio_idx);
+    saveVioSession(vio_log, vio_idx);
 end
 if ~isempty(vio_node) && isvalid(vio_node)
     delete(vio_node);     % also drops vio_sub
@@ -1920,14 +1944,28 @@ end
 % it at the start ground-truth point. Velocity is compared as speed |v| (VIO
 % twist is body-frame). L is the vio_log struct, n the row count.
 % =========================================================================
-function plotVioComparison(L, n)
-% Tez şekilleri (Bölüm 8) sim/replot_vio_figures.m içinde üretilir:
-% lejantlar sağ üst köşede (üst ylim büyütülerek çizgilerle çakışmaz),
-% üstten yörünge şeklinde gözlemci fazında uçulan kesim gözlemci faz
-% rengiyle arkadan vurgulanır. Script veriyi sim/vio_log_son.mat olarak da
-% saklar; şekiller simülasyon yeniden koşturulmadan güncellenebilir.
-addpath(fileparts(mfilename('fullpath')));
-replot_vio_figures(L, n);
+function saveVioSession(L, n)
+% Save the VIO/EKF/ground-truth comparison log to a TIMESTAMPED .mat under the
+% repo's vio_sessions/ folder, for offline plotting. Called on each VIO-disable
+% (and on Stop) -- does NOT plot during the simulation. Reproduce the exact
+% figures later with:  plot_vio_session('vio_sessions/vio_session_<stamp>.mat')
+if isempty(n) || n < 1
+    return;                       % nothing logged this session
+end
+% Truncate the preallocated buffers to the samples actually logged (keeps the
+% file small; plot_vio_session/replot_vio_figures index 1:n either way).
+flds = fieldnames(L);
+for i = 1:numel(flds)
+    v = L.(flds{i});
+    if size(v, 1) >= n, L.(flds{i}) = v(1:n, :); end
+end
+outdir = fullfile(fileparts(mfilename('fullpath')), '..', 'vio_sessions');
+if ~isfolder(outdir), mkdir(outdir); end
+stamp   = datestr(now, 'yyyymmdd_HHMMSS');           %#ok<TNOW1,DATST>
+matfile = fullfile(outdir, sprintf('vio_session_%s.mat', stamp));
+save(matfile, 'L', 'n');
+fprintf(['VIO session saved (%d samples): %s\n' ...
+         '  replay:  plot_vio_session(''%s'')\n'], n, matfile, matfile);
 end
 
 

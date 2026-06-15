@@ -1,0 +1,3 @@
+# Saved VIO comparison sessions (data) are local run artifacts -- don't track.
+# The replay script plot_vio_session.m IS tracked.
+vio_session_*.mat

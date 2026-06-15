@@ -45,6 +45,7 @@ classdef EstimatorBus < handle
         vio_enabled  = false
         vio_sample   = []
         last_vio_t   = -inf
+        vio_min_dt   = 0.2       % min spacing between VIO fusions [s] -> 5 Hz
     end
 
     methods
@@ -111,8 +112,8 @@ classdef EstimatorBus < handle
                     % VIO replaces GNSS as the horizontal position/velocity aid.
                     % Baro (height) and mag (heading) keep fusing as normal below.
                     vs = obj.vio_sample;
-                    if ~isempty(vs) && isfield(vs, 't') && vs.t > obj.last_vio_t
-                        obj.ekf.fuseVioPos(vs.pos_ned);
+                    if ~isempty(vs) && isfield(vs, 't') && vs.t - obj.last_vio_t >= obj.vio_min_dt
+                        obj.ekf.fuseVioPos(vs.pos_ned, vs.t);
                         if isfield(vs, 'vel_ned') && ~isempty(vs.vel_ned) ...
                                 && bitand(obj.params.gps_ctrl, 4) ~= 0
                             obj.ekf.fuseVioVel(vs.vel_ned);
@@ -188,7 +189,12 @@ classdef EstimatorBus < handle
             % Switch the pos/vel aiding source: true = VIO, false = GNSS.
             obj.vio_enabled = logical(tf);
             obj.ekf.ev_active = obj.vio_enabled;   % horizontal-aiding flag
-            if ~obj.vio_enabled
+            % VIO modunda GNSS yok -> baro bias dondurulur (Ekf2.fuseBaro).
+            obj.ekf.gnss_active = ~obj.vio_enabled;
+            if obj.vio_enabled
+                % Yükselen kenar: anchor anında VIO irtifa-ofsetini sıfırla.
+                obj.ekf.resetVioHeightBias();
+            else
                 obj.vio_sample = [];
                 obj.last_vio_t = -inf;
             end
