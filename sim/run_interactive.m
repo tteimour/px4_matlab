@@ -77,7 +77,7 @@ tab_auto = uitab(tg, 'Title', '  AUTOTUNE  ',      'BackgroundColor', T.panel);
 tab_cesium = uitab(tg, 'Title', '  CESIUM  ',      'BackgroundColor', T.panel);
 
 mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
-                'mission', 'rtl', 'land', 'takeoff'};
+                'mission', 'intercept', 'rtl', 'land', 'takeoff'};
 default_mode_idx = 3;             % start in Position
 
 % Global bottom bar: flight-mode buttons + Arm / Set Home / Reset / Stop,
@@ -302,6 +302,30 @@ setenv('ROS_LOCALHOST_ONLY', '1');
 rosbridge_pid = startRosbridge();
 cleanup_rosbridge = onCleanup(@() stopRosbridge(rosbridge_pid));
 
+% Intercept-mode guidance feed: the standalone C++ PN node publishes a NED
+% velocity setpoint on /guidance/velocity_setpoint. Subscribe here (AFTER the
+% ROS_LOCALHOST_ONLY=1 setenv above, so the DDS participant binds to the =1
+% guidance node and rosbridge). The callback stashes the newest sample in
+% appdata; the sim loop polls it while Intercept mode is active. Optional — the
+% GUI still runs if ROS or the node isn't up (Intercept then just hovers).
+setappdata(fig, 'guid_last', []);
+intercept_prev_stamp = -1;
+intercept_stale      = 0;
+guid_sub = []; %#ok<NASGU>  kept in scope so the subscription stays alive
+try
+    guid_node = ros2node('matlab_intercept_listener'); %#ok<NASGU>
+    guid_sub  = ros2subscriber(guid_node, '/guidance/velocity_setpoint', ...
+        'geometry_msgs/TwistStamped', ...
+        @(m) setappdata(fig, 'guid_last', ...
+            struct('v', [m.twist.linear.x; m.twist.linear.y; m.twist.linear.z], ...
+                   'stamp', double(m.header.stamp.sec) + ...
+                            double(m.header.stamp.nanosec) * 1e-9))); %#ok<NASGU>
+    fprintf('Intercept guidance subscriber up on /guidance/velocity_setpoint\n');
+catch ME
+    warning('Intercept guidance feed unavailable (%s). Intercept mode will hover.', ...
+            ME.message);
+end
+
 while ishandle(fig) && getappdata(fig, 'running')
     frame_t0 = tic;
 
@@ -509,6 +533,23 @@ while ishandle(fig) && getappdata(fig, 'running')
         end
 
         if mod(k, n_pos) == 0
+            % Intercept mode: feed the newest external guidance setpoint into
+            % the FMM. Freshness = the heartbeat stamp advancing; if it stalls
+            % (node down) mark it invalid and the mode brakes to hover.
+            if strcmp(fmm.mode, 'intercept')
+                gl = getappdata(fig, 'guid_last');
+                if isempty(gl)
+                    fmm.setInterceptVel([0; 0; 0], false);
+                else
+                    if gl.stamp ~= intercept_prev_stamp
+                        intercept_prev_stamp = gl.stamp;
+                        intercept_stale = 0;
+                    else
+                        intercept_stale = intercept_stale + 1;
+                    end
+                    fmm.setInterceptVel(gl.v, intercept_stale < round(0.3 / dt_pos));
+                end
+            end
             cmd = fmm.update(s, sticks, dt_pos);
             % Mode may have auto-transitioned (Takeoff -> Hold). Reflect in
             % the mode buttons and reset lead state across the discontinuity.
