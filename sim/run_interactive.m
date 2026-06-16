@@ -303,7 +303,7 @@ rosbridge_pid = startRosbridge();
 cleanup_rosbridge = onCleanup(@() stopRosbridge(rosbridge_pid));
 
 % Intercept-mode guidance feed: the standalone C++ PN node publishes a NED
-% velocity setpoint on /guidance/velocity_setpoint. Subscribe here (AFTER the
+% acceleration setpoint on /guidance/acceleration_setpoint. Subscribe here (AFTER the
 % ROS_LOCALHOST_ONLY=1 setenv above, so the DDS participant binds to the =1
 % guidance node and rosbridge). The callback stashes the newest sample in
 % appdata; the sim loop polls it while Intercept mode is active. Optional — the
@@ -311,18 +311,23 @@ cleanup_rosbridge = onCleanup(@() stopRosbridge(rosbridge_pid));
 setappdata(fig, 'guid_last', []);
 intercept_prev_stamp = -1;
 intercept_stale      = 0;
+% Jamming-scenario state: GNSS-aiding config saved on Intercept lock and
+% restored when Intercept ends (so the sim can be re-flown).
+gnss_saved_ctrl   = est_bus.params.gps_ctrl;
+gnss_saved_active = est_bus.ekf.gnss_active;
+gnss_saved_vio    = est_bus.vio_enabled;
 guid_sub = []; %#ok<NASGU>  kept in scope so the subscription stays alive
 try
     guid_node = ros2node('matlab_intercept_listener'); %#ok<NASGU>
-    guid_sub  = ros2subscriber(guid_node, '/guidance/velocity_setpoint', ...
-        'geometry_msgs/TwistStamped', ...
+    guid_sub  = ros2subscriber(guid_node, '/guidance/acceleration_setpoint', ...
+        'geometry_msgs/AccelStamped', ...
         @(m) setappdata(fig, 'guid_last', ...
-            struct('v', [m.twist.linear.x; m.twist.linear.y; m.twist.linear.z], ...
+            struct('a', [m.accel.linear.x; m.accel.linear.y; m.accel.linear.z], ...
                    'stamp', double(m.header.stamp.sec) + ...
                             double(m.header.stamp.nanosec) * 1e-9))); %#ok<NASGU>
-    fprintf('Intercept guidance subscriber up on /guidance/velocity_setpoint\n');
+    fprintf('Intercept guidance subscriber up on /guidance/acceleration_setpoint\n');
 catch ME
-    warning('Intercept guidance feed unavailable (%s). Intercept mode will hover.', ...
+    warning('Intercept guidance feed unavailable (%s). Intercept mode will coast (zero accel).', ...
             ME.message);
 end
 
@@ -495,6 +500,33 @@ while ishandle(fig) && getappdata(fig, 'running')
         pos_lead.reset();
         vel_lead.reset();
         att_lead.reset();
+
+        % --- GPS + radio jamming bubble on target lock (scenario) ----------
+        % Entering Intercept models the UAV locking onto the target inside the
+        % ~500 m jamming bubble: GNSS pos/vel aiding is denied and it flies
+        % autonomously on the onboard EKF. The EKF is deliberately NOT reset —
+        % it coasts from the healthy GPS-aided estimate held during manual
+        % flight, so attitude stays observable (gravity + mag) while pos/vel
+        % dead-reckon and drift. Leaving Intercept restores GNSS aiding so the
+        % sim can be re-flown.
+        if strcmp(new_mode, 'intercept')
+            gnss_saved_ctrl   = est_bus.params.gps_ctrl;
+            gnss_saved_active = est_bus.ekf.gnss_active;
+            gnss_saved_vio    = est_bus.vio_enabled;
+            est_bus.params.gps_ctrl = 0;      % EKF2_GNSS_CTRL=0: no GNSS pos/vel fusion
+            est_bus.ekf.gnss_active = false;  % baro = sole height ref (denied behaviour)
+            est_bus.vio_enabled     = false;  % no VIO pos/vel aid either
+            fprintf(['INTERCEPT lock: entered GPS+radio jamming bubble. GNSS ' ...
+                     'pos/vel aid DISABLED (gps_ctrl %d->0); flying autonomously ' ...
+                     'on the onboard EKF (attitude-only).\n'], gnss_saved_ctrl);
+        elseif strcmp(prev_mode, 'intercept')
+            est_bus.params.gps_ctrl = gnss_saved_ctrl;
+            est_bus.ekf.gnss_active = gnss_saved_active;
+            est_bus.vio_enabled     = gnss_saved_vio;
+            fprintf('INTERCEPT off: GNSS pos/vel aid RESTORED (gps_ctrl=%d).\n', ...
+                    gnss_saved_ctrl);
+        end
+
         prev_mode = new_mode;
     end
 
@@ -511,6 +543,12 @@ while ishandle(fig) && getappdata(fig, 'running')
     % --- Advance physics by dt_frame in dt_rate substeps ---
     n_steps = max(1, round(dt_frame / dt_rate));
     use_est = logical(get(est_cb, 'Value'));
+    % Jamming scenario: while Intercept is active the controller MUST fly on the
+    % onboard estimator (real hardware has no ground-truth feed), regardless of
+    % the SENSORS-tab toggle. The EKF is GNSS-denied (set on lock above).
+    if strcmp(fmm.mode, 'intercept')
+        use_est = true;
+    end
     % Cesium/Unity pose stream on? Read once per frame (drives the LINK pill).
     stream_on = ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1;
     for i = 1:n_steps
@@ -535,11 +573,11 @@ while ishandle(fig) && getappdata(fig, 'running')
         if mod(k, n_pos) == 0
             % Intercept mode: feed the newest external guidance setpoint into
             % the FMM. Freshness = the heartbeat stamp advancing; if it stalls
-            % (node down) mark it invalid and the mode brakes to hover.
+            % (node down) mark it invalid and the mode coasts (zero accel).
             if strcmp(fmm.mode, 'intercept')
                 gl = getappdata(fig, 'guid_last');
                 if isempty(gl)
-                    fmm.setInterceptVel([0; 0; 0], false);
+                    fmm.setInterceptAccel([0; 0; 0], false);
                 else
                     if gl.stamp ~= intercept_prev_stamp
                         intercept_prev_stamp = gl.stamp;
@@ -547,7 +585,7 @@ while ishandle(fig) && getappdata(fig, 'running')
                     else
                         intercept_stale = intercept_stale + 1;
                     end
-                    fmm.setInterceptVel(gl.v, intercept_stale < round(0.3 / dt_pos));
+                    fmm.setInterceptAccel(gl.a, intercept_stale < round(0.3 / dt_pos));
                 end
             end
             cmd = fmm.update(s, sticks, dt_pos);
@@ -603,6 +641,14 @@ while ishandle(fig) && getappdata(fig, 'running')
                 thrust_body_z = cmd.thrust_body_z;
                 yawspeed_sp   = cmd.yawspeed_sp;
                 vel_sp_used   = nan(3, 1);
+            elseif strcmp(cmd.kind, 'accel')
+                % Velocity/position-estimation-free Intercept: invert the NED
+                % kinematic acceleration setpoint straight to attitude + thrust.
+                % Closes on ATTITUDE only — s.position_ned / s.velocity_ned are
+                % deliberately NOT read here.
+                [q_sp, thrust_body_z] = pos_ctl.accelToAttitude(cmd.acc_sp, cmd.yaw_sp);
+                yawspeed_sp = cmd.yawspeed_sp;
+                vel_sp_used = nan(3, 1);
             else
                 % Lead-shape the position-cascade inputs. DC gain = 1, so
                 % static setpoints are unchanged; only ramps/steps get

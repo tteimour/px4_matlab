@@ -217,6 +217,23 @@ classdef PositionController < handle
             % body_z is unused externally but kept for diagnostics.
             %#ok<NASGU>
         end
+
+        function [q_sp, thrust_body_z] = accelToAttitude(obj, acc_sp, yaw_sp)
+        % Velocity/position-estimation-FREE path: map a NED kinematic
+        % acceleration setpoint straight to an attitude + collective thrust,
+        % bypassing the position/velocity PID in update(). Uses only the
+        % acc_sp, gravity, hover thrust and the (runtime) tilt/thrust limits —
+        % no pos/vel feedback. Used by Intercept mode, whose acc_sp comes from
+        % the monocular PN guidance node. Inversion is the same _accelerationControl
+        % + thrust_to_attitude that update() uses (PositionControl.cpp:204-222).
+            thr_min_eff = obj.thr_min;
+            if ~isempty(obj.rt_thr_min), thr_min_eff = obj.rt_thr_min; end
+            tilt_eff = obj.lim_tilt;
+            if ~isempty(obj.rt_tilt), tilt_eff = obj.rt_tilt; end
+
+            thr_sp = obj.accelerationToThrust(acc_sp, thr_min_eff, tilt_eff);
+            [q_sp, thrust_body_z] = thrust_to_attitude(thr_sp, yaw_sp);
+        end
     end
 
     methods (Access = private)
