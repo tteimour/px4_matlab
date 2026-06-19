@@ -46,6 +46,7 @@ addpath(fullfile(root, 'src', 'sensors', 'gnss'));
 addpath(fullfile(root, 'src', 'sensors', 'voter'));
 addpath(fullfile(root, 'src', 'estimator'));
 addpath(fullfile(root, 'src', 'bridge'));
+addpath(fullfile(root, 'src', 'io'));
 
 p = px4_params();
 
@@ -59,7 +60,7 @@ p = px4_params();
 % =====================================================================
 T = gcsTheme();
 
-fig = figure('Name', 'PX4 GCS — Flight Deck (MATLAB SIL)', ...
+fig = figure('Name', 'SYNAPLINE GCS — Flight Deck (MATLAB SIL)', ...
              'NumberTitle', 'off', 'Color', T.bg, ...
              'MenuBar', 'none', 'ToolBar', 'none', ...
              'Position', [80 60 1500 920]);
@@ -74,7 +75,6 @@ tab_ekf  = uitab(tg, 'Title', '  EKF  ',           'BackgroundColor', T.panel);
 tab_sens = uitab(tg, 'Title', '  SENSORS  ',       'BackgroundColor', T.panel);
 tab_wind = uitab(tg, 'Title', '  WIND  ',          'BackgroundColor', T.panel);
 tab_auto = uitab(tg, 'Title', '  AUTOTUNE  ',      'BackgroundColor', T.panel);
-tab_cesium = uitab(tg, 'Title', '  CESIUM  ',      'BackgroundColor', T.panel);
 
 mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
                 'mission', 'intercept', 'rtl', 'land', 'takeoff'};
@@ -84,35 +84,11 @@ default_mode_idx = 3;             % start in Position
 % usable from any tab. The sim loop polls mode_bg's SelectedObject as before.
 [mode_bg, arm_btn] = buildModeBar(fig, mode_strings);
 
-% =====================================================================
-% Manual control lives in a SEPARATE floating window (ctrl_fig) so you can
-% fly the drone from ANY tab -- the joysticks used to sit on the 3D tab and
-% vanished when you switched tabs. The drag callbacks are wired to ctrl_fig;
-% the sim loop reads left_h/right_h regardless of which figure holds them.
-% Reset/Stop are here too (they act on the main figure `fig`). Closing this
-% window stops the sim.
-% =====================================================================
-ctrl_fig = figure('Name', 'Stick console — flies from any tab', ...
-    'NumberTitle', 'off', 'MenuBar', 'none', 'ToolBar', 'none', ...
-    'Color', T.bg, 'Position', [60 90 520 330]);
-% Set CloseRequestFcn AFTER assignment so the closure captures the live handle.
-set(ctrl_fig, 'CloseRequestFcn', @(~,~) ctrl_fig_close(fig, ctrl_fig));
-applyThemeDefaults(ctrl_fig, T);
-ax_left = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
-               'Position', [0.06 0.30 0.40 0.64]);
-ax_right = axes('Parent', ctrl_fig, 'Units', 'normalized', ...
-                'Position', [0.54 0.30 0.40 0.64]);
-[left_h, right_h] = makeJoysticks(ctrl_fig, ax_left, ax_right);
-
-uicontrol(ctrl_fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.06 0.06 0.40 0.16], 'String', 'RESET', ...
-    'FontWeight', 'bold', 'BackgroundColor', T.btn, 'ForegroundColor', T.warn, ...
-    'Callback', @(~,~) setappdata(fig, 'reset_request', true));
-uicontrol(ctrl_fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.54 0.06 0.40 0.16], 'String', 'STOP', ...
-    'FontWeight', 'bold', 'BackgroundColor', T.badbg, 'ForegroundColor', T.bad, ...
-    'Callback', @(~,~) setappdata(fig, 'running', false));
-figure(fig);   % bring the main tabbed window back to the front
+% Manual-control sticks are embedded in the FLIGHT tab (built in
+% buildMissionTab) -- they used to live in a separate floating window.
+% RESET/STOP are on the bottom mode bar. left_h/right_h are pulled from
+% mission_map below and read every frame; the physical pad (if any) and
+% these on-screen sticks both drive them.
 
 % =====================================================================
 % Sim modules
@@ -169,7 +145,6 @@ ctrl_refresh = buildControllerTab(tab_ctrl, p, pos_ctl, att_ctl, rate_ctl);
 est_cb       = buildEkfTab(tab_ekf, est_bus);
 buildSensorTab(tab_sens, est_bus);
 buildWindTab(tab_wind, p, wind);
-cesium_cb = buildCesiumTab(tab_cesium);
 
 % Flight tab: north-up satellite map at the Cesium origin (Baku); click to
 % drop waypoints, set per-waypoint altitude. Writes the same `waypoints`
@@ -177,7 +152,8 @@ cesium_cb = buildCesiumTab(tab_cesium);
 % Also hosts the attitude/heading instruments (pfd), updated per frame.
 mission_map = buildMissionTab(tab_mission, fig, fmm);
 mission_map.mode_bg = mode_bg;       % setModeButton() selects + restyles via this
-state_lbl = mission_map.state_lbl;   % live telemetry text on the Flight tab
+left_h    = mission_map.left_h;      % on-screen manual sticks (Flight tab)
+right_h   = mission_map.right_h;
 pfd = mission_map.pfd;               % attitude indicator + heading tape updater
 
 % --- System-identification autotuner (runs live in the sim loop) -------
@@ -213,6 +189,12 @@ dt_frame = 1 / fps;
 fmm.setHome([0; 0; 0]);
 prev_mode = mode_strings{default_mode_idx};
 fmm.setMode(prev_mode, plant.state());
+
+% RC stick-override (PX4 COM_RC_OVERRIDE): while armed and airborne in an
+% auto mode, moving the sticks hands control back to the pilot by switching
+% to Position mode. Applies to every auto mode below, including Intercept.
+override_det   = StickOverrideDetector(p.com.rc_stick_ov);
+auto_modes     = {'mission', 'hold', 'rtl', 'land', 'takeoff', 'intercept'};
 
 q_sp          = [1; 0; 0; 0];
 thrust_body_z = -p.pos.thr_hover;
@@ -284,10 +266,26 @@ setappdata(fig, 'save_plan_request', false);    % Save-.plan button
 waypoints = zeros(0, 3);                        % Nx3 [N E D]
 sticks = struct('left_x', 0, 'left_y', 0, 'right_x', 0, 'right_y', 0);
 
+% Optional physical controller (e.g. PS4 pad). If a joystick is connected it
+% drives the sticks and mirrors onto the on-screen caps; otherwise the mouse
+% sticks are used. Confirm/adjust the axis map first with sim/test_joystick.m.
+joystick = [];
+try
+    joystick = JoystickReader(1);
+    fprintf(['run_interactive: physical joystick connected (%d axes) -- ' ...
+             'using it for manual control.\n'], joystick.nAxes);
+catch ME
+    fprintf(['run_interactive: no physical joystick (using on-screen mouse ' ...
+             'sticks). Reason: %s\n' ...
+             'If the pad IS plugged in, MATLAB likely started before it was ' ...
+             'connected -- restart MATLAB (or `clear all`) and re-run.\n'], ME.message);
+end
+
 k     = 0;
 t_sim = 0;
 ui_tick = 0;           % strip/readout refresh decimation (every 2nd frame)
-cesium_bridge  = [];   % lazily created when the Cesium toggle is first enabled
+cesium_bridge  = [];   % lazily created on the first sim frame (streaming is always on)
+cesium_failed  = false; % latch: a bridge failure stops retries without per-frame spam
 
 % Keep all ROS 2 traffic on loopback: every participant in this pipeline
 % (MATLAB DDS nodes, rosbridge, Unity via rosbridge WebSocket) runs on this
@@ -500,6 +498,7 @@ while ishandle(fig) && getappdata(fig, 'running')
         pos_lead.reset();
         vel_lead.reset();
         att_lead.reset();
+        override_det.reset();   % start stick-movement detection fresh
 
         % --- GPS + radio jamming bubble on target lock (scenario) ----------
         % Entering Intercept models the UAV locking onto the target inside the
@@ -530,12 +529,37 @@ while ishandle(fig) && getappdata(fig, 'running')
         prev_mode = new_mode;
     end
 
-    % --- Read sticks (each frame; guard if the control window was closed) ---
-    if ishandle(left_h) && ishandle(right_h)
+    % --- Read sticks (each frame) -----------------------------------------
+    % Both inputs work: the physical pad drives by default and mirrors onto
+    % the on-screen caps; grabbing a cap with the mouse (drag_active) takes
+    % over while held and the pad resumes on release.
+    drag_active = ~isempty(getappdata(fig, 'drag_target'));
+    if ~isempty(joystick) && ~drag_active
+        sticks = joystick.read();
+        if ishandle(left_h) && ishandle(right_h)
+            set(left_h,  'XData', sticks.left_x,  'YData', sticks.left_y);
+            set(right_h, 'XData', sticks.right_x, 'YData', sticks.right_y);
+        end
+    elseif ishandle(left_h) && ishandle(right_h)
         sticks.left_x  = get(left_h,  'XData');
         sticks.left_y  = get(left_h,  'YData');
         sticks.right_x = get(right_h, 'XData');
         sticks.right_y = get(right_h, 'YData');
+    end
+
+    % --- RC stick override (PX4 COM_RC_OVERRIDE) ------------------------
+    % Armed + airborne + in an auto mode + sticks moving => pilot takes over,
+    % switch to Position mode (Commander.cpp:2895-2939). Selecting the button
+    % routes through the normal mode-change block, so Intercept's GNSS restore
+    % and the lead-filter resets happen as on a manual mode change. The
+    % detector only runs in auto modes; reset() on each mode entry avoids a
+    % spurious trigger from the entry transient.
+    if bitand(p.com.rc_override, 1) && armed && ~landed_latch && ...
+       any(strcmp(fmm.mode, auto_modes))
+        if override_det.update(sticks, dt_frame)
+            setModeButton(mission_map, 'position');
+            fprintf('Pilot took over using sticks (%s -> position).\n', fmm.mode);
+        end
     end
 
     % Wind parameters are set directly by the Wind tab callbacks.
@@ -549,8 +573,9 @@ while ishandle(fig) && getappdata(fig, 'running')
     if strcmp(fmm.mode, 'intercept')
         use_est = true;
     end
-    % Cesium/Unity pose stream on? Read once per frame (drives the LINK pill).
-    stream_on = ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1;
+    % Cesium/Unity streaming is always on; LINK pill is green once the
+    % bridge is up (drives the status strip).
+    stream_on = ~isempty(cesium_bridge);
     for i = 1:n_steps
         s_truth = plant.state();
 
@@ -597,6 +622,7 @@ while ishandle(fig) && getappdata(fig, 'running')
                 pos_lead.reset();
                 vel_lead.reset();
                 att_lead.reset();
+                override_det.reset();   % fresh detection after auto-transition
             end
 
             % --- Smooth-takeoff state machine -------------------------------
@@ -805,11 +831,12 @@ while ishandle(fig) && getappdata(fig, 'running')
     eU = max(0, -s_disp.position_ned(3));
     eN_sp = cmd.pos_sp(1); eE_sp = cmd.pos_sp(2); eU_sp = -cmd.pos_sp(3);
 
-    % --- Stream pose to Cesium/Unity (opt-in via the Cesium tab) ----------
-    % Ground-truth pose, converted NED/FRD->ENU/FLU
-    % and published as geometry_msgs/PoseArray. Failures disable the toggle
-    % rather than killing the sim.
-    if ishandle(cesium_cb) && get(cesium_cb, 'Value') == 1
+    % --- Stream pose to Cesium/Unity (always on) --------------------------
+    % Ground-truth pose, converted NED/FRD->ENU/FLU and published as
+    % geometry_msgs/PoseArray. Streaming is a permanent part of the GCS (no
+    % toggle); a failure latches cesium_failed so we stop retrying without
+    % per-frame warning spam, and the sim keeps running.
+    if ~cesium_failed
         if isempty(cesium_bridge)
             try
                 % Windows (MATLAB + rosbridge in WSL2) can't do cross-boundary
@@ -822,8 +849,7 @@ while ishandle(fig) && getappdata(fig, 'running')
                 fprintf('Cesium bridge: publishing to %s\n', cesium_bridge.Topic);
             catch ME
                 warning('Cesium bridge failed to start (%s). Disabling.', ME.message);
-                set(cesium_cb, 'Value', 0);
-                cesium_bridge = [];
+                cesium_bridge = []; cesium_failed = true;
             end
         end
         if ~isempty(cesium_bridge)
@@ -831,9 +857,7 @@ while ishandle(fig) && getappdata(fig, 'running')
                 cesium_bridge.publish(s.position_ned, s.attitude_q, t_sim);
             catch ME
                 warning('Cesium bridge publish failed (%s). Disabling.', ME.message);
-                set(cesium_cb, 'Value', 0);
-                delete(cesium_bridge);
-                cesium_bridge = [];
+                delete(cesium_bridge); cesium_bridge = []; cesium_failed = true;
             end
         end
     end
@@ -844,8 +868,16 @@ while ishandle(fig) && getappdata(fig, 'running')
     estn_map = est_bus.stateOut();
     addpoints(mission_map.gt_trail,  gtn_map.position_ned(2),  gtn_map.position_ned(1));
     addpoints(mission_map.ekf_trail, estn_map.position_ned(2), estn_map.position_ned(1));
-    updateHeadingArrow(mission_map.gt_arrow,  gtn_map.position_ned(2),  gtn_map.position_ned(1),  gtn_map.velocity_ned(2),  gtn_map.velocity_ned(1));
-    updateHeadingArrow(mission_map.ekf_arrow, estn_map.position_ned(2), estn_map.position_ned(1), estn_map.velocity_ned(2), estn_map.velocity_ned(1));
+    % Arrows point along the vehicle's actual HEADING (yaw) — where the nose
+    % points — NOT course over ground, so a crabbing/sliding UAV still reads
+    % correctly. GT arrow uses ground-truth yaw; EKF arrow uses the
+    % estimator's own yaw, so their divergence is visible.
+    gt_rpy  = quat_to_euler(gtn_map.attitude_q);
+    ekf_rpy = quat_to_euler(estn_map.attitude_q);
+    updateHeadingArrow(mission_map.gt_arrow,  gtn_map.position_ned(2),  gtn_map.position_ned(1),  gt_rpy(3));
+    updateHeadingArrow(mission_map.ekf_arrow, estn_map.position_ned(2), estn_map.position_ned(1), ekf_rpy(3));
+    % Dynamic map: smoothly drag the viewport to keep the vehicle in view.
+    mapFollow(mission_map.ax, gtn_map.position_ned(2), gtn_map.position_ned(1));
 
     rpy    = quat_to_euler(s.attitude_q);        % ground truth (for logging)
     rpy_d  = quat_to_euler(s_disp.attitude_q);   % displayed (estimate feed)
@@ -909,23 +941,15 @@ while ishandle(fig) && getappdata(fig, 'running')
     % The attitude instruments refresh every frame (cheap line/transform
     % updates); the uicontrol text strip refreshes at half rate to keep the
     % loop light (uicontrol String sets are the expensive part).
-    hdg = mod(rad2deg(rpy_d(3)), 360);
-    pfd.update(rpy_d(1), rpy_d(2), hdg);
+    hdg = mod(rad2deg(rpy_d(3)), 360);            % displayed/EKF heading
+    gt_hdg = mod(rad2deg(gt_rpy(3)), 360);        % ground-truth heading
+    pfd.update(rpy_d(1), rpy_d(2), hdg, gt_hdg, wind_ned);
     ui_tick = ui_tick + 1;
     if mod(ui_tick, 2) == 0
         vs  = -s_disp.velocity_ned(3);            % climb rate, +up
         gs  = norm(s_disp.velocity_ned(1:2));     % ground speed
-        updateStatusStrip(strip, prev_mode, eU, vs, gs, hdg, eN, eE, t_sim, ...
+        updateStatusStrip(strip, prev_mode, eU, gs, vs, t_sim, ...
                           armed, use_est, stream_on);
-        set(state_lbl, 'String', sprintf( ...
-            ['TGT    N %s   E %s   ALT %s\n' ...
-             'YAW    %+6.1f deg     CMD %+6.1f deg\n' ...
-             'STICKS L %+5.2f %+5.2f   R %+5.2f %+5.2f\n' ...
-             'TUNE   %s'], ...
-            n2s(eN_sp, '%+7.2f'), n2s(eE_sp, '%+7.2f'), n2s(eU_sp, '%6.2f'), ...
-            rad2deg(rpy_d(3)), rad2deg(cmd.yaw_sp), ...
-            sticks.left_x, sticks.left_y, sticks.right_x, sticks.right_y, ...
-            autotune_status));
     end
 
     drawnow limitrate;
@@ -942,8 +966,8 @@ if ~isempty(cesium_bridge) && isvalid(cesium_bridge)
 end
 % rosbridge_server is stopped by the onCleanup guard registered at start.
 
-if exist('ctrl_fig', 'var') && ishandle(ctrl_fig)
-    delete(ctrl_fig);            % close the floating manual-control window
+if ~isempty(joystick)
+    joystick.close();            % release the physical controller
 end
 if ishandle(fig)
     delete(fig);
@@ -1031,47 +1055,54 @@ set(ax_r,    'ButtonDownFcn', @(~,~) startDrag(fig, 'right'));
 set(left_h,  'ButtonDownFcn', @(~,~) startDrag(fig, 'left'));
 set(right_h, 'ButtonDownFcn', @(~,~) startDrag(fig, 'right'));
 
-set(fig, 'WindowButtonMotionFcn', ...
-    @(~,~) onMotion(fig, ax_l, ax_r, left_h, right_h, left_t, right_t));
-set(fig, 'WindowButtonUpFcn', ...
-    @(~,~) endDrag(fig, left_h, right_h, left_t, right_t));
-
 setappdata(fig, 'drag_target', '');
+% Stash the handles so the combined figure handler can drive the drag
+% without threading them through every callback.
+setappdata(fig, 'joy', struct('axl', ax_l, 'axr', ax_r, ...
+    'lh', left_h, 'rh', right_h, 'lt', left_t, 'rt', right_t));
 end
 
 function startDrag(fig, which_)
 setappdata(fig, 'drag_target', which_);
 end
 
-function onMotion(fig, ax_l, ax_r, left_h, right_h, left_t, right_t)
+% Combined figure mouse handlers: manual-stick drag AND map pan. Each acts
+% only when its own drag is active, so they coexist on the one figure.
+function figMotion(fig, axm)
+joyMotion(fig);
+if ishandle(axm), onMapPanMotion(fig, axm); end
+end
+
+function figButtonUp(fig, axm)
+joyEndDrag(fig);
+if ishandle(axm), onMapPanEnd(fig); end
+end
+
+function joyMotion(fig)
 target = getappdata(fig, 'drag_target');
 if isempty(target), return; end
+j = getappdata(fig, 'joy'); if isempty(j), return; end
 switch target
     case 'left'
-        cp = get(ax_l, 'CurrentPoint');
-        x = max(-1, min(1, cp(1, 1)));
-        y = max(-1, min(1, cp(1, 2)));
-        set(left_h, 'XData', x, 'YData', y);
-        set(left_t, 'XData', [0 x], 'YData', [0 y]);
+        cp = get(j.axl, 'CurrentPoint');
+        x = max(-1, min(1, cp(1, 1))); y = max(-1, min(1, cp(1, 2)));
+        set(j.lh, 'XData', x, 'YData', y); set(j.lt, 'XData', [0 x], 'YData', [0 y]);
     case 'right'
-        cp = get(ax_r, 'CurrentPoint');
-        x = max(-1, min(1, cp(1, 1)));
-        y = max(-1, min(1, cp(1, 2)));
-        set(right_h, 'XData', x, 'YData', y);
-        set(right_t, 'XData', [0 x], 'YData', [0 y]);
+        cp = get(j.axr, 'CurrentPoint');
+        x = max(-1, min(1, cp(1, 1))); y = max(-1, min(1, cp(1, 2)));
+        set(j.rh, 'XData', x, 'YData', y); set(j.rt, 'XData', [0 x], 'YData', [0 y]);
 end
 end
 
-function endDrag(fig, left_h, right_h, left_t, right_t)
+function joyEndDrag(fig)
 target = getappdata(fig, 'drag_target');
 if isempty(target), return; end
-switch target
-    case 'left'
-        set(left_h, 'XData', 0, 'YData', 0);
-        set(left_t, 'XData', [0 0], 'YData', [0 0]);
-    case 'right'
-        set(right_h, 'XData', 0, 'YData', 0);
-        set(right_t, 'XData', [0 0], 'YData', [0 0]);
+j = getappdata(fig, 'joy');
+if ~isempty(j)
+    switch target
+        case 'left',  set(j.lh, 'XData', 0, 'YData', 0); set(j.lt, 'XData', [0 0], 'YData', [0 0]);
+        case 'right', set(j.rh, 'XData', 0, 'YData', 0); set(j.rt, 'XData', [0 0], 'YData', [0 0]);
+    end
 end
 setappdata(fig, 'drag_target', '');
 end
@@ -1105,26 +1136,26 @@ end
 function refresh = buildControllerTab(parent, p, pos_ctl, att_ctl, rate_ctl)
 % --- Position controller (outer loop) ---
 pos_rows = {
-    rowSpec('Pos P  (N E D)',         'MPC_XY_P, MPC_XY_P, MPC_Z_P', ...
+    rowSpec('Position P  (N E D)',    'MPC_XY_P, MPC_XY_P, MPC_Z_P', ...
             @() pos_ctl.gain_pos_p, @(v) setProp(pos_ctl, 'gain_pos_p', v), ...
             0, 3, p.pos.gain_pos_p);
-    rowSpec('Vel P  (N E D)',         'MPC_XY_VEL_P_ACC / MPC_Z_VEL_P_ACC', ...
+    rowSpec('Velocity P  (N E D)',    'MPC_XY_VEL_P_ACC / MPC_Z_VEL_P_ACC', ...
             @() pos_ctl.gain_vel_p, @(v) setProp(pos_ctl, 'gain_vel_p', v), ...
             0, 8, p.pos.gain_vel_p);
-    rowSpec('Vel I  (N E D)',         'MPC_XY_VEL_I_ACC / MPC_Z_VEL_I_ACC', ...
+    rowSpec('Velocity I  (N E D)',    'MPC_XY_VEL_I_ACC / MPC_Z_VEL_I_ACC', ...
             @() pos_ctl.gain_vel_i, @(v) setProp(pos_ctl, 'gain_vel_i', v), ...
             0, 5, p.pos.gain_vel_i);
-    rowSpec('Vel D  (N E D)',         'MPC_XY_VEL_D_ACC / MPC_Z_VEL_D_ACC', ...
+    rowSpec('Velocity D  (N E D)',    'MPC_XY_VEL_D_ACC / MPC_Z_VEL_D_ACC', ...
             @() pos_ctl.gain_vel_d, @(v) setProp(pos_ctl, 'gain_vel_d', v), ...
             0, 2, p.pos.gain_vel_d);
-    rowSpec('Vel max (xy up dn) m/s', 'MPC_XY_VEL_MAX, MPC_Z_VEL_MAX_UP, _DN', ...
+    rowSpec('Velocity max (xy up dn) m/s', 'MPC_XY_VEL_MAX, MPC_Z_VEL_MAX_UP, _DN', ...
             @() [pos_ctl.lim_vel_horizontal; pos_ctl.lim_vel_up; pos_ctl.lim_vel_down], ...
             @(v) setVelLims(pos_ctl, v), ...
             [0;0;0], [25;10;10], [p.pos.vel_xy_max; p.pos.vel_z_up; p.pos.vel_z_down]);
     rowSpec('Tilt max (deg)',         'MPC_TILTMAX_AIR', ...
             @() rad2deg(pos_ctl.lim_tilt), @(v) setProp(pos_ctl, 'lim_tilt', deg2rad(v)), ...
             0, 80, rad2deg(p.pos.tilt_max));
-    rowSpec('Thrust (min hov max)',   'MPC_THR_MIN, MPC_THR_HOVER, MPC_THR_MAX', ...
+    rowSpec('Thrust  (min hov max)',  'MPC_THR_MIN, MPC_THR_HOVER, MPC_THR_MAX', ...
             @() [pos_ctl.thr_min; pos_ctl.hover_thrust; pos_ctl.thr_max], ...
             @(v) setThr(pos_ctl, v), ...
             [0;0;0], [0.5;1;1], [p.pos.thr_min; p.pos.thr_hover; p.pos.thr_max]);
@@ -1132,32 +1163,32 @@ pos_rows = {
 
 % --- Attitude controller ---
 att_rows = {
-    rowSpec('Att P  (r p y)',         'MC_ROLL_P, MC_PITCH_P, MC_YAW_P', ...
+    rowSpec('Attitude P  (r p y)',    'MC_ROLL_P, MC_PITCH_P, MC_YAW_P', ...
             @() attPGet(att_ctl), @(v) att_ctl.setProportionalGain(v(:), att_ctl.yaw_w), ...
             0, 12, p.att.gain_p);
     rowSpec('Yaw weight',             'MC_YAW_WEIGHT (0..1)', ...
             @() att_ctl.yaw_w, @(v) attYawSet(att_ctl, v), ...
             0, 1, p.att.yaw_weight);
-    rowSpec('Rate max (r p y) deg/s', 'MC_ROLLRATE_MAX, MC_PITCHRATE_MAX, MC_YAWRATE_MAX', ...
+    rowSpec('Rate max  (r p y) deg/s', 'MC_ROLLRATE_MAX, MC_PITCHRATE_MAX, MC_YAWRATE_MAX', ...
             @() rad2deg(att_ctl.rate_limit), @(v) setProp(att_ctl, 'rate_limit', deg2rad(v)), ...
             0, 360, rad2deg(p.att.rate_max));
 };
 
 % --- Rate controller (inner loop). Defaults shown effective (x MC_*RATE_K). ---
 rate_rows = {
-    rowSpec('P  (r p y)',             'MC_*RATE_P x MC_*RATE_K (effective)', ...
+    rowSpec('Rate P  (r p y)',        'MC_*RATE_P x MC_*RATE_K (effective)', ...
             @() rate_ctl.gain_p, @(v) setProp(rate_ctl, 'gain_p', v), ...
             0, 0.6, p.rate.gain_p .* p.rate.gain_k);
-    rowSpec('I  (r p y)',             'MC_*RATE_I x MC_*RATE_K (effective)', ...
+    rowSpec('Rate I  (r p y)',        'MC_*RATE_I x MC_*RATE_K (effective)', ...
             @() rate_ctl.gain_i, @(v) setProp(rate_ctl, 'gain_i', v), ...
             0, 0.8, p.rate.gain_i .* p.rate.gain_k);
-    rowSpec('D  (r p y)',             'MC_*RATE_D x MC_*RATE_K (effective)', ...
+    rowSpec('Rate D  (r p y)',        'MC_*RATE_D x MC_*RATE_K (effective)', ...
             @() rate_ctl.gain_d, @(v) setProp(rate_ctl, 'gain_d', v), ...
             0, 0.02, p.rate.gain_d .* p.rate.gain_k);
-    rowSpec('FF (r p y)',             'MC_ROLLRATE_FF, MC_PITCHRATE_FF, MC_YAWRATE_FF', ...
+    rowSpec('Rate FF  (r p y)',       'MC_ROLLRATE_FF, MC_PITCHRATE_FF, MC_YAWRATE_FF', ...
             @() rate_ctl.gain_ff, @(v) setProp(rate_ctl, 'gain_ff', v), ...
             0, 0.5, p.rate.gain_ff);
-    rowSpec('Int lim (r p y)',        'MC_RR_INT_LIM, MC_PR_INT_LIM, MC_YR_INT_LIM', ...
+    rowSpec('Rate int limit  (r p y)', 'MC_RR_INT_LIM, MC_PR_INT_LIM, MC_YR_INT_LIM', ...
             @() rate_ctl.lim_int, @(v) setProp(rate_ctl, 'lim_int', v), ...
             0, 1, p.rate.int_lim);
 };
@@ -1272,25 +1303,6 @@ set(cb, 'Callback', @(src, ~) setWindEnable(wind, src));
 end
 
 
-% =========================================================================
-% Cesium/Unity streaming tab: a single opt-in toggle. When checked, the sim
-% loop streams the vehicle pose to the Cesium-Unity scene via CesiumBridge
-% (geometry_msgs/PoseArray on /world/default/pose/info, 50 Hz frame rate).
-% Only rosbridge_server is needed on the Unity side; PX4/Gazebo are not.
-% =========================================================================
-function cesium_cb = buildCesiumTab(parent)
-T = gcsTheme();
-cesium_cb = uicontrol(parent, 'Style', 'checkbox', 'Units', 'normalized', ...
-    'Position', [0.05 0.91 0.9 0.05], 'Value', 1, ...
-    'FontWeight', 'bold', 'String', 'Stream pose to Cesium/Unity (ROS 2)');
-uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.05 0.56 0.9 0.30], 'ForegroundColor', T.sub, ...
-    'HorizontalAlignment', 'left', 'FontSize', 9, ...
-    'String', sprintf(['Pose stream: ground-truth pose as geometry_msgs/' ...
-        'PoseArray on /world/default/pose/info (50 Hz). rosbridge_server is ' ...
-        'auto-launched when run_interactive starts and stopped on Stop ' ...
-        '(log: /tmp/px4_rosbridge.log).']));
-end
 
 % =========================================================================
 % rosbridge_server lifecycle. Auto-launched on run_interactive start (for the
@@ -1376,6 +1388,7 @@ xlabel(axm, 'EAST (m)'); ylabel(axm, 'NORTH (m)');
 % persistent state for re-anchoring / labels / save (mm is a value struct).
 setappdata(axm, 'lat0', lat0);  setappdata(axm, 'lon0', lon0);
 setappdata(axm, 'HALF', HALF);  setappdata(axm, 'wp_labels', gobjects(0));
+setappdata(axm, 'follow', true);   % dynamic-map follow (off on manual pan/zoom)
 
 addSatelliteBasemap(axm, lat0, lon0, HALF);       % best-effort imagery
 
@@ -1470,26 +1483,42 @@ uicontrol(plan_pan, 'Style', 'pushbutton', 'Units', 'normalized', ...
     'FontWeight', 'bold', 'BackgroundColor', T.btn, 'ForegroundColor', T.warn, ...
     'Callback', @(~,~) setappdata(fig, 'clear_request', true));
 
-tbl = uitable('Parent', plan_pan, 'Units', 'normalized', ...
-    'Position', [0.04 0.030 0.92 0.400], ...
-    'ColumnName', {'N (m)', 'E (m)', 'Alt (m)'}, ...
-    'ColumnEditable', [false false true], ...
-    'ColumnWidth', {70 70 70}, 'RowName', 'numbered', ...
-    'BackgroundColor', [T.panel; T.btn], 'ForegroundColor', T.text, ...
-    'FontName', T.mono, 'FontSize', 8, ...
-    'CellEditCallback', @(~, ev) onAltEdit(fig, ev));
+% Pro flight-plan list (custom-drawn). Click a row to edit its altitude in
+% the editor below; altitude flows back via the same alt_edit_request path.
+planAx = axes('Parent', plan_pan, 'Units', 'normalized', ...
+    'Position', [0.04 0.095 0.92 0.345], 'XLim', [0 1], 'YLim', [0 1], 'Color', T.field);
+hold(planAx, 'on'); axis(planAx, 'off');
+disableDefaultInteractivity(planAx);
+setappdata(planAx, 'sel', 0);
+altLbl = uicontrol(plan_pan, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.04 0.022 0.56 0.050], 'BackgroundColor', T.panel, ...
+    'ForegroundColor', T.sub, 'HorizontalAlignment', 'left', ...
+    'FontName', T.mono, 'FontSize', 8, 'String', 'CLICK A WAYPOINT TO EDIT ALT');
+altCell = uicontrol(plan_pan, 'Style', 'edit', 'Units', 'normalized', ...
+    'Position', [0.62 0.018 0.34 0.058], 'BackgroundColor', T.field, ...
+    'ForegroundColor', T.acft, 'FontName', T.mono, 'FontWeight', 'bold', ...
+    'FontSize', 9, 'String', '', 'Enable', 'off');
 
-state_lbl = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.655 0.035 0.335 0.175], 'BackgroundColor', T.field, ...
-    'ForegroundColor', T.text, 'HorizontalAlignment', 'left', ...
-    'FontName', T.mono, 'FontSize', 9, 'String', '');
+% Manual-control sticks, embedded here (was a floating console). Both the
+% physical pad and these on-screen sticks drive the same left_h/right_h.
+uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
+    'Position', [0.655 0.205 0.335 0.018], 'BackgroundColor', T.panel, ...
+    'ForegroundColor', T.sub, 'HorizontalAlignment', 'left', ...
+    'FontName', T.mono, 'FontSize', 7.5, 'FontWeight', 'bold', ...
+    'String', 'MANUAL CONTROL  ·  DRAG OR USE PAD');
+ax_left  = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.658 0.035 0.158 0.170]);
+ax_right = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.834 0.035 0.158 0.170]);
+[left_h, right_h] = makeJoysticks(fig, ax_left, ax_right);
 
 % click handler: left-click adds waypoint, right-click starts pan drag.
 % Scroll-wheel zooms around the cursor; double-click resets the view.
 set(axm, 'ButtonDownFcn', @(src, ~) onMapButton(src, fig, altEdit, HALF));
 set(fig, 'WindowScrollWheelFcn',  @(~, ev) onMapScroll(axm, ev));
-set(fig, 'WindowButtonMotionFcn', @(~, ~)  onMapPanMotion(fig, axm));
-set(fig, 'WindowButtonUpFcn',     @(~, ~)  onMapPanEnd(fig));
+% Combined motion/up handler: dispatches to BOTH the manual-stick drag and
+% the map pan (each acts only when its own drag is active), so embedding the
+% sticks in this figure doesn't clobber the map's pan handlers.
+set(fig, 'WindowButtonMotionFcn', @(~, ~) figMotion(fig, axm));
+set(fig, 'WindowButtonUpFcn',     @(~, ~) figButtonUp(fig, axm));
 setappdata(fig, 'map_pan_start', []);
 
 % Heading arrows: filled triangle at the tip of each trail showing flight
@@ -1508,10 +1537,15 @@ setappdata(gtTrail,  'arrow', gtArrow);
 setappdata(ekfTrail, 'arrow', ekfArrow);
 
 mm = struct('ax', axm, 'path', hPath, 'launch', hLaunch, 'mid', hMid, ...
-            'endp', hEnd, 'table', tbl, 'altEdit', altEdit, ...
-            'state_lbl', state_lbl, 'pfd', pfd, ...
+            'endp', hEnd, 'planAx', planAx, 'altCell', altCell, 'altLbl', altLbl, ...
+            'fig', fig, 'altEdit', altEdit, 'pfd', pfd, ...
+            'left_h', left_h, 'right_h', right_h, ...
             'gt_trail', gtTrail, 'ekf_trail', ekfTrail, ...
             'gt_arrow', gtArrow, 'ekf_arrow', ekfArrow);
+
+% Row select (edit altitude) — wired after mm is built so the closures see it.
+set(planAx, 'ButtonDownFcn', @(~,~) onPlanClick(mm));
+set(altCell, 'Callback',     @(~,~) onAltCellEdit(mm));
 end
 
 % =========================================================================
@@ -1525,124 +1559,175 @@ end
 % =========================================================================
 function P = buildPFD(parent)
 T = gcsTheme();
-k10 = 0.30;                 % ADI vertical units per 10 deg of pitch
+R = 0.97; kP = R * 0.150;          % disk radius; vertical units per 10 deg pitch
 
-% --- attitude indicator ----------------------------------------------------
+% ===== Attitude indicator (round glass ADI) ============================
 axA = axes('Parent', parent, 'Units', 'normalized', ...
-           'Position', [0.05 0.325 0.90 0.645]);
-hold(axA, 'on');
-set(axA, 'XTick', [], 'YTick', [], 'Box', 'on', 'Layer', 'top', ...
-         'Color', T.field, 'XColor', T.edge, 'YColor', T.edge, ...
-         'DataAspectRatio', [1 1 1]);
-xlim(axA, [-1.30 1.30]); ylim(axA, [-1.02 1.02]);
+           'Position', [0.05 0.345 0.90 0.625]);
+hold(axA, 'on'); axis(axA, 'off');
+set(axA, 'XLim', [-1.36 1.36], 'YLim', [-1.18 1.18], ...
+         'DataAspectRatio', [1 1 1], 'Color', T.bg);
 disableDefaultInteractivity(axA);
 
-tr = hgtransform('Parent', axA);                  % horizon: roll + pitch
-patch('Parent', tr, 'XData', [-8 8 8 -8], 'YData', [0 0 8 8], ...
-      'FaceColor', T.sky, 'EdgeColor', 'none', 'HitTest', 'off');
-patch('Parent', tr, 'XData', [-8 8 8 -8], 'YData', [-8 -8 0 0], ...
-      'FaceColor', T.gnd, 'EdgeColor', 'none', 'HitTest', 'off');
-line('Parent', tr, 'XData', [-8 8], 'YData', [0 0], ...
-     'Color', 'w', 'LineWidth', 1.8, 'HitTest', 'off');
-% pitch ladder: one NaN-separated line + labels, all rolling with the horizon
-xs = []; ys = [];
-for d = 10:10:40                                  % major bars (10 deg)
-    y = d/10 * k10;
-    xs = [xs, -0.26, 0.26, NaN, -0.26, 0.26, NaN]; %#ok<AGROW>
-    ys = [ys, y, y, NaN, -y, -y, NaN];             %#ok<AGROW>
+th = linspace(0, 2*pi, 220);
+patch(axA, R*cos(th), R*sin(th), T.gnd, 'EdgeColor', 'none', 'HitTest', 'off'); % ground disk
+A.sky     = patch(axA, NaN, NaN, T.sky, 'EdgeColor', 'none', 'HitTest', 'off'); % sky cap (per frame)
+A.horizon = line(axA, NaN, NaN, 'Color', 'w', 'LineWidth', 2.2, 'HitTest', 'off');
+A.ladder  = line(axA, NaN, NaN, 'Color', 'w', 'LineWidth', 1.4, 'HitTest', 'off');
+A.lblL = gobjects(1, 6); A.lblR = gobjects(1, 6);
+for i = 1:6
+    A.lblL(i) = text(axA, NaN, NaN, '', 'Color', 'w', 'FontName', T.mono, 'FontSize', 8, ...
+        'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'HitTest', 'off');
+    A.lblR(i) = text(axA, NaN, NaN, '', 'Color', 'w', 'FontName', T.mono, 'FontSize', 8, ...
+        'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'HitTest', 'off');
 end
-for d = 5:10:35                                   % minor bars (5 deg)
-    y = d/10 * k10;
-    xs = [xs, -0.10, 0.10, NaN, -0.10, 0.10, NaN]; %#ok<AGROW>
-    ys = [ys, y, y, NaN, -y, -y, NaN];             %#ok<AGROW>
-end
-line('Parent', tr, 'XData', xs, 'YData', ys, 'Color', 'w', ...
-     'LineWidth', 1.0, 'HitTest', 'off');
-for d = [-30 -20 -10 10 20 30]
-    y = d/10 * k10;
-    text('Parent', tr, 'Position', [-0.33 y 0], 'String', num2str(abs(d)), ...
-        'Color', 'w', 'FontName', T.mono, 'FontSize', 7.5, ...
-        'HorizontalAlignment', 'right', 'HitTest', 'off');
-    text('Parent', tr, 'Position', [0.33 y 0], 'String', num2str(abs(d)), ...
-        'Color', 'w', 'FontName', T.mono, 'FontSize', 7.5, ...
-        'HorizontalAlignment', 'left', 'HitTest', 'off');
-end
-
-trR = hgtransform('Parent', axA);                 % roll scale: roll only
-xs = []; ys = [];
-for a = [-60 -45 -30 -20 -10 0 10 20 30 45 60]
-    r0 = 0.78;
-    r1 = r0 + 0.06 + 0.05 * any(a == [0 -30 30 -60 60]);
-    th = pi/2 - deg2rad(a);          % bank-a tick sits under the pointer at bank a
-    xs = [xs, r0*cos(th), r1*cos(th), NaN]; %#ok<AGROW>
-    ys = [ys, r0*sin(th), r1*sin(th), NaN]; %#ok<AGROW>
-end
-line('Parent', trR, 'XData', xs, 'YData', ys, 'Color', 'w', ...
-     'LineWidth', 1.0, 'HitTest', 'off');
-patch('Parent', axA, 'XData', [-0.055 0.055 0], 'YData', [0.68 0.68 0.765], ...
-      'FaceColor', T.acft, 'EdgeColor', 'none', 'HitTest', 'off');  % fixed pointer
-
+A.bank = line(axA, NaN, NaN, 'Color', 'w', 'LineWidth', 1.2, 'HitTest', 'off');  % bank scale (rolls)
+yb = R*0.86;
+patch(axA, [-0.05 0.05 0], [yb+0.07 yb+0.07 yb], T.acft, 'EdgeColor', 'none', 'HitTest', 'off'); % fixed bank pointer
 % fixed aircraft symbol (yellow wings + centre dot)
-line('Parent', axA, 'XData', [-0.55 -0.20 NaN 0.20 0.55], ...
-     'YData', [0 0 NaN 0 0], 'Color', T.acft, 'LineWidth', 4, 'HitTest', 'off');
-line('Parent', axA, 'XData', [-0.20 -0.20 NaN 0.20 0.20], ...
-     'YData', [0 -0.09 NaN 0 -0.09], 'Color', T.acft, 'LineWidth', 4, 'HitTest', 'off');
-line('Parent', axA, 'XData', 0, 'YData', 0, 'Marker', 'o', 'MarkerSize', 4.5, ...
-     'MarkerFaceColor', T.acft, 'MarkerEdgeColor', T.acft, 'HitTest', 'off');
+line(axA, [-0.42 -0.12 NaN 0.12 0.42], [0 0 NaN 0 0], 'Color', T.acft, 'LineWidth', 4, 'HitTest', 'off');
+line(axA, [-0.12 -0.12 NaN 0.12 0.12], [0 -0.07 NaN 0 -0.07], 'Color', T.acft, 'LineWidth', 4, 'HitTest', 'off');
+line(axA, 0, 0, 'Marker', 'o', 'MarkerSize', 4.5, 'MarkerFaceColor', T.acft, 'MarkerEdgeColor', T.acft, 'HitTest', 'off');
+line(axA, R*cos(th), R*sin(th), 'Color', T.edge, 'LineWidth', 2, 'HitTest', 'off');   % bezel ring
+% digital ROLL / PITCH readouts
+rectangle(axA, 'Position', [-1.34 0.92 0.62 0.22], 'Curvature', 0.25, 'FaceColor', T.field, 'EdgeColor', T.edge);
+rectangle(axA, 'Position', [ 0.72 0.92 0.62 0.22], 'Curvature', 0.25, 'FaceColor', T.field, 'EdgeColor', T.edge);
+text(axA, -1.30, 1.09, 'ROLL',  'Color', T.sub, 'FontName', T.mono, 'FontSize', 7, 'HitTest', 'off');
+text(axA,  0.76, 1.09, 'PITCH', 'Color', T.sub, 'FontName', T.mono, 'FontSize', 7, 'HitTest', 'off');
+A.rollTxt  = text(axA, -0.76, 0.99, '--', 'Color', T.text, 'FontName', T.mono, 'FontSize', 12, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'right', 'HitTest', 'off');
+A.pitchTxt = text(axA,  1.30, 0.99, '--', 'Color', T.text, 'FontName', T.mono, 'FontSize', 12, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'right', 'HitTest', 'off');
+A.R = R; A.kP = kP;
 
-% --- heading tape -----------------------------------------------------------
+% ===== Heading indicator (heading-up HSI arc) ==========================
 axH = axes('Parent', parent, 'Units', 'normalized', ...
-           'Position', [0.05 0.045 0.90 0.235]);
-hold(axH, 'on');
-set(axH, 'XTick', [], 'YTick', [], 'Box', 'on', 'Layer', 'top', ...
-         'Color', T.field, 'XColor', T.edge, 'YColor', T.edge);
-xlim(axH, [-45 45]); ylim(axH, [0 1]);
+           'Position', [0.05 0.045 0.90 0.265]);
+hold(axH, 'on'); axis(axH, 'off');
+set(axH, 'XLim', [-1.30 1.30], 'YLim', [0.10 1.05], 'Color', T.field);
 disableDefaultInteractivity(axH);
-
-ticksH = line('Parent', axH, 'XData', NaN, 'YData', NaN, 'Color', 'w', ...
-              'LineWidth', 1.0, 'HitTest', 'off');
-lblH = gobjects(1, 5);
-for i = 1:5
-    lblH(i) = text('Parent', axH, 'Position', [0 0.47 0], 'String', '', ...
-        'Color', 'w', 'FontName', T.mono, 'FontSize', 8, 'FontWeight', 'bold', ...
-        'HorizontalAlignment', 'center', 'HitTest', 'off');
+A.Hc = -1.54; A.Rc = 2.40; A.Hf = 0.675;     % arc circle centre-y, radius, deg->screen factor
+A.hsiTicks = line(axH, NaN, NaN, 'Color', 'w', 'LineWidth', 1.0, 'HitTest', 'off');
+A.hsiLbl = gobjects(1, 11);
+for i = 1:11
+    A.hsiLbl(i) = text(axH, NaN, NaN, '', 'Color', 'w', 'FontName', T.mono, 'FontSize', 9, ...
+        'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'HitTest', 'off');
 end
-line('Parent', axH, 'XData', [0 0], 'YData', [0 0.36], ...
-     'Color', T.acft, 'LineWidth', 1.6, 'HitTest', 'off');   % lubber line
-hdgTxt = text('Parent', axH, 'Position', [0 0.80 0], 'String', '---', ...
-    'Color', T.text, 'FontName', T.mono, 'FontSize', 11, 'FontWeight', 'bold', ...
-    'HorizontalAlignment', 'center', 'BackgroundColor', T.bg, ...
-    'EdgeColor', T.edge, 'Margin', 2, 'HitTest', 'off');
+A.gtTick = line(axH, NaN, NaN, 'Color', T.good, 'LineWidth', 3, 'HitTest', 'off');
+A.gtLbl  = text(axH, NaN, NaN, 'GT', 'Color', T.good, 'FontName', T.mono, 'FontSize', 8, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'HitTest', 'off');
+yl = A.Hc + A.Rc;                            % arc top
+patch(axH, [-0.05 0.05 0], [yl+0.12 yl+0.12 yl+0.02], 'w', 'EdgeColor', 'none', 'HitTest', 'off'); % lubber
+rectangle(axH, 'Position', [-0.17 0.80 0.34 0.20], 'Curvature', 0.25, 'FaceColor', T.field, 'EdgeColor', T.acft, 'LineWidth', 1.4);
+A.hdgTxt = text(axH, 0, 0.90, '---', 'Color', T.text, 'FontName', T.mono, 'FontSize', 13, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'center', 'HitTest', 'off');
+text(axH, 0.22, 0.90, 'MAG', 'Color', T.good, 'FontName', T.mono, 'FontSize', 8, 'FontWeight', 'bold', 'HitTest', 'off');
+% wind cell (bottom-left): digital direction + speed
+rectangle(axH, 'Position', [-1.26 0.16 0.74 0.30], 'Curvature', 0.18, 'FaceColor', T.field, 'EdgeColor', T.data, 'LineWidth', 1.0);
+A.windDir = text(axH, -1.20, 0.36, '---\circ', 'Color', T.text, 'FontName', T.mono, 'FontSize', 11, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'Interpreter', 'tex', 'HitTest', 'off');
+A.windSpd = text(axH, -1.20, 0.23, '-- m/s', 'Color', T.data, 'FontName', T.mono, 'FontSize', 9, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'HitTest', 'off');
+text(axH, -0.66, 0.40, 'WIND', 'Color', T.sub, 'FontName', T.mono, 'FontSize', 7, 'FontWeight', 'bold', 'HitTest', 'off');
+% GT / EKF digital (bottom-right)
+A.gtHdgTxt  = text(axH, 1.26, 0.40, 'GT  ---', 'Color', T.good, 'FontName', T.mono, 'FontSize', 9, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'right', 'HitTest', 'off');
+A.ekfHdgTxt = text(axH, 1.26, 0.24, 'EKF ---', 'Color', T.bad, 'FontName', T.mono, 'FontSize', 9, ...
+    'FontWeight', 'bold', 'HorizontalAlignment', 'right', 'HitTest', 'off');
 
-H = struct('tr', tr, 'trR', trR, 'ticks', ticksH, 'lbl', lblH, ...
-           'hdgTxt', hdgTxt, 'k10', k10);
-P = struct('update', @(roll, pitch, hdg_deg) pfdUpdate(H, roll, pitch, hdg_deg));
+P = struct('update', @(roll, pitch, ekf_hdg, gt_hdg, wind_ned) ...
+                     pfdUpdate(A, roll, pitch, ekf_hdg, gt_hdg, wind_ned));
 end
 
-% Per-frame PFD refresh. roll/pitch in rad, hdg in deg [0, 360).
-function pfdUpdate(H, roll, pitch, hdg_deg)
-pu = -pitch / deg2rad(10) * H.k10;                % pitch up -> horizon down
-H.tr.Matrix  = makehgtform('zrotate', roll) * makehgtform('translate', [0 pu 0]);
-H.trR.Matrix = makehgtform('zrotate', roll);
+% Per-frame PFD refresh. roll/pitch in rad; ekf_hdg/gt_hdg in deg [0,360);
+% wind_ned = [N;E;D] m/s.
+function pfdUpdate(A, roll, pitch, ekf_hdg, gt_hdg, wind_ned)
+R = A.R; kP = A.kP;
+u = [-sin(roll); cos(roll)]; t = [cos(roll); sin(roll)];
+pu = -pitch / deg2rad(10) * kP;                  % pitch up -> horizon down
 
-h5 = (ceil((hdg_deg - 44)/5) : floor((hdg_deg + 44)/5)) * 5;
-x  = h5 - hdg_deg;
-ht = 0.18 + 0.18 * (mod(h5, 10) == 0);            % tall every 10 deg
-n  = numel(x);
-xs = [x; x; nan(1, n)];
-ys = [zeros(1, n); ht; nan(1, n)];
-set(H.ticks, 'XData', xs(:), 'YData', ys(:));
-
-names = {'N', '3', '6', 'E', '12', '15', 'S', '21', '24', 'W', '30', '33'};
-base  = round(hdg_deg / 30);
-for i = 1:5
-    m  = base + i - 3;
-    xo = m * 30 - hdg_deg;
-    if abs(xo) <= 38, vis = 'on'; else, vis = 'off'; end
-    set(H.lbl(i), 'Position', [xo 0.47 0], ...
-        'String', names{mod(m, 12) + 1}, 'Visible', vis);
+% --- ADI: sky cap + horizon ---
+Psky = halfDiskPoly(R, u, pu);
+if isempty(Psky), set(A.sky, 'XData', NaN, 'YData', NaN);
+else,             set(A.sky, 'XData', Psky(1,:), 'YData', Psky(2,:)); end
+if abs(pu) < R
+    Lh = sqrt(R^2 - pu^2); c0 = pu*u; a1 = c0 + Lh*t; b1 = c0 - Lh*t;
+    set(A.horizon, 'XData', [a1(1) b1(1)], 'YData', [a1(2) b1(2)]);
+else
+    set(A.horizon, 'XData', NaN, 'YData', NaN);
 end
-set(H.hdgTxt, 'String', sprintf('%03.0f', hdg_deg));
+% pitch ladder + labels
+dvals = [-30 -20 -10 10 20 30]; xs = []; ys = [];
+for i = 1:6
+    d = dvals(i); off = pu + d/10*kP; c = off*u; a1 = c + 0.15*t; b1 = c - 0.15*t;
+    xs = [xs a1(1) b1(1) NaN]; ys = [ys a1(2) b1(2) NaN]; %#ok<AGROW>
+    e = (a1-b1)/norm(a1-b1); Lp = a1 + e*0.07; Rp = b1 - e*0.07;
+    set(A.lblL(i), 'Position', [Lp(1) Lp(2) 0], 'String', num2str(abs(d)), 'Rotation', -rad2deg(roll));
+    set(A.lblR(i), 'Position', [Rp(1) Rp(2) 0], 'String', num2str(abs(d)), 'Rotation', -rad2deg(roll));
+end
+for d = [-35 -25 -15 -5 5 15 25 35]
+    off = pu + d/10*kP; c = off*u; a1 = c + 0.06*t; b1 = c - 0.06*t;
+    xs = [xs a1(1) b1(1) NaN]; ys = [ys a1(2) b1(2) NaN]; %#ok<AGROW>
+end
+set(A.ladder, 'XData', xs, 'YData', ys);
+% bank scale (rolls with roll)
+bx = []; by = [];
+for a = [-60 -45 -30 -20 -10 0 10 20 30 45 60]
+    big = any(a == [0 -30 30 -60 60]); r0 = R*0.86; r1 = r0 + 0.05 + 0.04*big;
+    aa = pi/2 - deg2rad(a) + roll;
+    bx = [bx r0*cos(aa) r1*cos(aa) NaN]; by = [by r0*sin(aa) r1*sin(aa) NaN]; %#ok<AGROW>
+end
+set(A.bank, 'XData', bx, 'YData', by);
+set(A.rollTxt,  'String', sprintf('%+03d', round(rad2deg(roll))));
+set(A.pitchTxt, 'String', sprintf('%+03d', round(rad2deg(pitch))));
+
+% --- HSI: heading-up arc ---
+cur = ekf_hdg; Hc = A.Hc; Rc = A.Rc; Hf = A.Hf;
+xs = []; ys = []; li = 0;
+for b = (cur-46):(cur+46)
+    if mod(round(b),5) ~= 0, continue; end
+    big = mod(round(b),10) == 0; aa = pi/2 - deg2rad(b-cur)*Hf;
+    r0 = Rc - (0.10 + 0.10*big);
+    xs = [xs r0*cos(aa) Rc*cos(aa) NaN]; ys = [ys Hc+r0*sin(aa) Hc+Rc*sin(aa) NaN]; %#ok<AGROW>
+    if big && li < numel(A.hsiLbl)
+        li = li + 1; rl = Rc - 0.30;
+        set(A.hsiLbl(li), 'Position', [rl*cos(aa) Hc+rl*sin(aa) 0], ...
+            'String', sprintf('%02d', mod(round(b/10),36)), 'Visible', 'on');
+    end
+end
+set(A.hsiTicks, 'XData', xs, 'YData', ys);
+for j = li+1:numel(A.hsiLbl), set(A.hsiLbl(j), 'Visible', 'off'); end
+% ground-truth heading tick
+dg = mod(gt_hdg - cur + 180, 360) - 180;
+if abs(dg) <= 46
+    aa = pi/2 - deg2rad(dg)*Hf; r0 = Rc - 0.22;
+    set(A.gtTick, 'XData', [r0*cos(aa) Rc*cos(aa)], 'YData', [Hc+r0*sin(aa) Hc+Rc*sin(aa)], 'Visible', 'on');
+    rl = Rc - 0.40; set(A.gtLbl, 'Position', [rl*cos(aa) Hc+rl*sin(aa) 0], 'Visible', 'on');
+else
+    set(A.gtTick, 'Visible', 'off'); set(A.gtLbl, 'Visible', 'off');
+end
+set(A.hdgTxt, 'String', sprintf('%03d', round(mod(cur,360))));
+% wind (digital)
+spd = hypot(wind_ned(1), wind_ned(2));
+wfrom = mod(rad2deg(atan2(-wind_ned(2), -wind_ned(1))), 360);
+set(A.windDir, 'String', sprintf('%03d\\circ', round(wfrom)));
+set(A.windSpd, 'String', sprintf('%.1f m/s', spd));
+set(A.gtHdgTxt,  'String', sprintf('GT  %03d', round(mod(gt_hdg,360))));
+set(A.ekfHdgTxt, 'String', sprintf('EKF %03d', round(mod(cur,360))));
+end
+
+% Polygon of the disk (radius R, centre origin) on the +u side of the line
+% offset h along u -- the sky cap for the round ADI.
+function P = halfDiskPoly(R, u, h)
+P = [];
+if h >= R, return; end
+t = [u(2); -u(1)];
+th = linspace(0, 2*pi, 240); circ = [R*cos(th); R*sin(th)];
+pu_ = u'*circ; pt_ = t'*circ;
+keep = pu_ >= h;
+if ~any(keep), return; end
+a = atan2(pt_(keep), pu_(keep)); pts = circ(:, keep);
+[~, ord] = sort(a); P = pts(:, ord);
 end
 
 
@@ -1658,7 +1743,7 @@ pan = uipanel(fig, 'Units', 'normalized', 'Position', [0 0.930 1 0.070], ...
 uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.008 0.46 0.110 0.42], 'BackgroundColor', T.bg, ...
     'ForegroundColor', T.text, 'FontWeight', 'bold', 'FontSize', 13, ...
-    'HorizontalAlignment', 'left', 'String', 'PX4 GCS');
+    'HorizontalAlignment', 'left', 'String', 'SYNAPLINE GCS');
 uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.008 0.10 0.120 0.30], 'BackgroundColor', T.bg, ...
     'ForegroundColor', T.sub, 'FontSize', 7, ...
@@ -1667,9 +1752,11 @@ uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
 stripCap(pan, 0.125, 0.085, 'MODE');
 S.mode = stripVal(pan, 0.125, 0.085, T.good, 14);
 
-caps = {'ALT  m', 'V/S  m/s', 'GS  m/s', 'HDG  deg', 'N  m', 'E  m'};
-flds = {'alt', 'vs', 'gs', 'hdg', 'n', 'e'};
-x0 = 0.225; w = 0.077;
+% Option-B strip: ALT / GS / V-S annunciators only. HDG, N, E dropped --
+% heading lives in the HSI, N/E in the waypoint table.
+caps = {'ALT  m', 'GS  m/s', 'V/S  m/s'};
+flds = {'alt', 'gs', 'vs'};
+x0 = 0.225; w = 0.095;
 for i = 1:numel(caps)
     x = x0 + (i-1) * w;
     stripCap(pan, x, w - 0.004, caps{i});
@@ -1713,15 +1800,12 @@ h = uicontrol(pan, 'Style', 'text', 'Units', 'normalized', ...
 end
 
 % Per-frame strip refresh (called from the sim loop).
-function updateStatusStrip(S, mode, alt, vs, gs, hdg, N, E, t, ...
+function updateStatusStrip(S, mode, alt, gs, vs, t, ...
                            armed, use_est, link_on)
 set(S.mode, 'String', upper(mode));
 set(S.alt, 'String', sprintf('%7.1f', alt));
-set(S.vs,  'String', sprintf('%+7.1f', vs));
 set(S.gs,  'String', sprintf('%7.1f', gs));
-set(S.hdg, 'String', sprintf('%03.0f', hdg));
-set(S.n,   'String', sprintf('%+8.1f', N));
-set(S.e,   'String', sprintf('%+8.1f', E));
+set(S.vs,  'String', sprintf('%+7.1f', vs));
 set(S.clock, 'String', sprintf('T+%02d:%02d', floor(t/60), floor(mod(t, 60))));
 if armed, setPill(S.p_arm, 'ARMED', 'bad');
 else,     setPill(S.p_arm, 'DISARMED', 'off'); end
@@ -1745,17 +1829,6 @@ switch lvl
 end
 set(h, 'String', str, 'ForegroundColor', fg, 'BackgroundColor', bgc);
 end
-
-% NaN-tolerant numeric formatting for setpoint readouts ('--' when the
-% axis has no position setpoint, e.g. velocity-only manual control).
-function s = n2s(v, fmt)
-if isfinite(v)
-    s = sprintf(fmt, v);
-else
-    s = '    -- ';
-end
-end
-
 
 % =========================================================================
 % Global bottom bar: flight-mode buttons (selected = green, the avionics
@@ -1994,9 +2067,11 @@ switch get(ancestor(axm,'figure'), 'SelectionType')
         setappdata(fig, 'map_add_request', [N, E, -alt]);
     case 'alt'      % right-click -> start pan; store click position + current limits
         setappdata(fig, 'map_pan_start', [E, N, xlim(axm), ylim(axm)]);
-    case 'open'     % double-click -> reset to full extent
+        setappdata(axm, 'follow', false);   % manual pan takes over from follow
+    case 'open'     % double-click -> reset to full extent + re-engage follow
         HALF2 = getappdata(axm, 'HALF');
         xlim(axm, [-HALF2 HALF2]); ylim(axm, [-HALF2 HALF2]);
+        setappdata(axm, 'follow', true);
 end
 end
 
@@ -2014,6 +2089,26 @@ cp = get(axm, 'CurrentPoint');
 cx = cp(1,1); cy = cp(1,2);
 xlim(axm, cx + (xlim(axm) - cx) * factor);
 ylim(axm, cy + (ylim(axm) - cy) * factor);
+setappdata(axm, 'follow', false);            % manual zoom takes over from follow
+end
+
+% Dynamic-map follow: smoothly drag the viewport to keep the vehicle in view.
+% While follow is on, if the vehicle leaves a centred dead-zone (inner DZ of
+% the current view) the view is lerped toward re-centring on it -- so the map
+% "drags" near the edges but holds still in the middle. Zoom is preserved.
+% Manual pan/zoom disables follow; double-click reset re-engages it.
+function mapFollow(axm, E, N)
+if ~ishandle(axm) || ~getappdata(axm, 'follow'), return; end
+xl = xlim(axm); yl = ylim(axm);
+cx = mean(xl); cy = mean(yl); wx = diff(xl); wy = diff(yl);
+DZ = 0.55;                                    % dead-zone = inner 55% of view
+if abs(E - cx) <= DZ*wx/2 && abs(N - cy) <= DZ*wy/2
+    return;                                   % inside dead-zone: hold still
+end
+a = 0.12;                                     % per-frame smoothing toward centre
+cx = cx + a*(E - cx); cy = cy + a*(N - cy);
+xlim(axm, [cx - wx/2, cx + wx/2]);
+ylim(axm, [cy - wy/2, cy + wy/2]);
 end
 
 % Pan drag: called on every mouse move; acts only while a right-click is held.
@@ -2042,13 +2137,92 @@ else
 end
 end
 
-% Table Alt-column edit -> stash a [row alt_m] request for the sim loop.
-function onAltEdit(fig, ev)
-if isempty(ev.Indices), return; end
-row = ev.Indices(1);
-newAlt = ev.NewData;
-if ischar(newAlt) || isstring(newAlt), newAlt = str2double(newAlt); end
-setappdata(fig, 'alt_edit_request', [row, double(newAlt)]);
+% Draw the pro flight-plan list on mm.planAx from the waypoint list (NED m).
+% Columns: # | TYPE | N | E | ALT | DIST | BRG + totals footer. First WP =
+% START (green), last = END (red), rest = WP (amber) -- same colour
+% semantics as the map markers. Row geometry + wps are stashed in appdata
+% for the click-to-edit handler. All children HitTest-off so clicks reach
+% the axes ButtonDownFcn.
+function drawPlanList(mm, wps)
+T = gcsTheme(); ax = mm.planAx;
+if ~isvalid(ax), return; end
+cla(ax); set(ax, 'XLim', [0 1], 'YLim', [0 1]);
+sel = getappdata(ax, 'sel'); n = size(wps, 1);
+setappdata(ax, 'wps', wps);
+if n == 0
+    setappdata(ax, 'sel', 0); setappdata(ax, 'rowtops', []); setappdata(ax, 'rowh', 0);
+    text(ax, 0.5, 0.5, 'NO WAYPOINTS', 'Color', T.sub, 'FontName', T.mono, 'FontSize', 9, ...
+        'HorizontalAlignment', 'center', 'HitTest', 'off');
+    set(mm.altCell, 'String', '', 'Enable', 'off');
+    set(mm.altLbl, 'String', 'CLICK A WAYPOINT TO EDIT ALT');
+    return;
+end
+if sel > n, sel = 0; setappdata(ax, 'sel', 0); end
+cx = [0.03 0.10 0.34 0.50 0.64 0.78 0.92];
+hdr = {'#','TYPE','N','E','ALT','DIST','BRG'}; hy = 0.95;
+line(ax, [0.01 0.99], [hy-0.04 hy-0.04], 'Color', T.edge, 'LineWidth', 0.8, 'HitTest', 'off');
+for c = 1:7
+    text(ax, cx(c), hy, hdr{c}, 'Color', T.sub, 'FontName', T.mono, 'FontSize', 7.5, ...
+        'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'HitTest', 'off');
+end
+top = hy - 0.07; bot = 0.12; rowh = min(0.13, (top-bot)/n);
+tops = zeros(n,1); tot = 0;
+for i = 1:n
+    yc = top - (i-0.5)*rowh; tops(i) = top - (i-1)*rowh;
+    if i == sel
+        rectangle(ax, 'Position', [0.01 tops(i)-rowh 0.98 rowh], 'FaceColor', mixc(T.acft,T.bg,0.84), ...
+            'EdgeColor', T.acft, 'LineWidth', 0.8, 'HitTest', 'off');
+    end
+    Nn = wps(i,1); Ee = wps(i,2); alt = -wps(i,3);
+    if i==1,     tp='START'; bc=T.good;
+    elseif i==n, tp='END';   bc=T.bad;
+    else,        tp='WP';    bc=T.acft; end
+    if i>=2, leg = hypot(wps(i,1)-wps(i-1,1), wps(i,2)-wps(i-1,2));
+             brg = mod(atan2d(wps(i,2)-wps(i-1,2), wps(i,1)-wps(i-1,1)),360); tot=tot+leg;
+    else,    leg = NaN; brg = NaN; end
+    text(ax, cx(1), yc, sprintf('%02d',i), 'Color', T.text, 'FontName', T.mono, 'FontSize', 8, 'FontWeight','bold','HitTest','off');
+    rectangle(ax, 'Position', [cx(2) yc-0.035 0.20 0.07], 'Curvature', 0.5, 'FaceColor', mixc(bc,T.bg,0.80), 'EdgeColor', bc, 'LineWidth', 0.8, 'HitTest','off');
+    text(ax, cx(2)+0.10, yc, tp, 'Color', bc, 'FontName', T.mono, 'FontSize', 6.5, 'FontWeight','bold','HorizontalAlignment','center','HitTest','off');
+    text(ax, cx(3), yc, sprintf('%.0f',Nn),  'Color', T.text, 'FontName', T.mono, 'FontSize', 8, 'HitTest','off');
+    text(ax, cx(4), yc, sprintf('%.0f',Ee),  'Color', T.text, 'FontName', T.mono, 'FontSize', 8, 'HitTest','off');
+    text(ax, cx(5), yc, sprintf('%.0f',alt), 'Color', T.acft, 'FontName', T.mono, 'FontSize', 8, 'FontWeight','bold','HitTest','off');
+    if i>=2
+        text(ax, cx(6), yc, sprintf('%.0f',leg),  'Color', T.sub, 'FontName', T.mono, 'FontSize', 7.5, 'HitTest','off');
+        text(ax, cx(7), yc, sprintf('%03.0f',brg), 'Color', T.sub, 'FontName', T.mono, 'FontSize', 7.5, 'HitTest','off');
+    else
+        text(ax, cx(6), yc, '--', 'Color', T.sub, 'FontName', T.mono, 'FontSize', 7.5, 'HitTest','off');
+        text(ax, cx(7), yc, '--', 'Color', T.sub, 'FontName', T.mono, 'FontSize', 7.5, 'HitTest','off');
+    end
+end
+setappdata(ax, 'rowtops', tops); setappdata(ax, 'rowh', rowh);
+line(ax, [0.01 0.99], [0.10 0.10], 'Color', T.edge, 'LineWidth', 0.8, 'HitTest','off');
+text(ax, 0.03, 0.05, sprintf('TOTAL %.0f m', tot), 'Color', T.good, 'FontName', T.mono, 'FontSize', 8, 'FontWeight','bold','HitTest','off');
+text(ax, 0.97, 0.05, sprintf('%d WP', n), 'Color', T.sub, 'FontName', T.mono, 'FontSize', 8, 'FontWeight','bold','HorizontalAlignment','right','HitTest','off');
+end
+
+% Click a plan row -> select it and load its altitude into the editor.
+function onPlanClick(mm)
+ax = mm.planAx; wps = getappdata(ax, 'wps');
+if isempty(wps), return; end
+tops = getappdata(ax, 'rowtops'); rowh = getappdata(ax, 'rowh');
+cp = get(ax, 'CurrentPoint'); dy = cp(1,2); sel = 0;
+for i = 1:numel(tops)
+    if dy <= tops(i) && dy > tops(i)-rowh, sel = i; break; end
+end
+if sel == 0, return; end
+setappdata(ax, 'sel', sel);
+set(mm.altCell, 'String', sprintf('%.4g', -wps(sel,3)), 'Enable', 'on');
+set(mm.altLbl, 'String', sprintf('EDIT ALT OF WP %02d (m, +up)', sel));
+drawPlanList(mm, wps);
+end
+
+% Commit the editor value as the selected waypoint's altitude (same path as
+% the old table: alt_edit_request = [row alt_m], consumed by the sim loop).
+function onAltCellEdit(mm)
+sel = getappdata(mm.planAx, 'sel');
+if sel < 1, return; end
+v = str2double(get(mm.altCell, 'String'));
+if isfinite(v), setappdata(mm.fig, 'alt_edit_request', [sel, v]); end
 end
 
 % Redraw the Mission-map markers + table from the waypoint list (NED metres).
@@ -2058,7 +2232,7 @@ old = getappdata(mm.ax, 'wp_labels');           % clear old coordinate labels
 if ~isempty(old), delete(old(isgraphics(old))); end
 if isempty(wps)
     set([mm.path mm.launch mm.mid mm.endp], 'XData', NaN, 'YData', NaN);
-    set(mm.table, 'Data', {});
+    drawPlanList(mm, []);
     setappdata(mm.ax, 'wp_labels', gobjects(0));
     return;
 end
@@ -2070,7 +2244,7 @@ if n >= 2, set(mm.endp, 'XData', E(end), 'YData', N(end));
 else,      set(mm.endp, 'XData', NaN,    'YData', NaN); end
 if n >= 3, set(mm.mid, 'XData', E(2:end-1), 'YData', N(2:end-1));
 else,      set(mm.mid, 'XData', NaN,        'YData', NaN); end
-set(mm.table, 'Data', num2cell([N, E, alt]));
+drawPlanList(mm, wps);
 
 % lat/lon coordinate label at each clicked point (current anchor)
 lat0 = getappdata(mm.ax, 'lat0'); lon0 = getappdata(mm.ax, 'lon0');
@@ -2292,13 +2466,30 @@ end
 function group_refresh = buildGroup(parent, pos, title, rows)
 T = gcsTheme();
 panel = uipanel(parent, 'Units', 'normalized', 'Position', pos, ...
-                'Title', [' ' upper(title) ' '], ...
-                'FontWeight', 'bold', 'FontSize', 8);
+                'BackgroundColor', T.panel, 'BorderType', 'none');
+
+% Variant-B "HUD console" decoration layer drawn behind the controls:
+% faint scanlines, corner brackets, accent header. PickableParts off so it
+% never intercepts clicks meant for the sliders/edits on top.
+axd = axes('Parent', panel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
+           'XLim', [0 1], 'YLim', [0 1], 'Color', 'none', ...
+           'HandleVisibility', 'off', 'PickableParts', 'none');
+hold(axd, 'on'); axis(axd, 'off');
+for yy = 0.05:0.05:0.85
+    line(axd, [0.015 0.985], [yy yy], 'Color', mixc(T.panel, T.bg, 0.45), ...
+         'LineWidth', 0.2, 'HitTest', 'off');
+end
+groupBrackets(axd, T.data);
+text(axd, 0.03, 0.95, ['\diamondsuit  ' upper(title)], 'Color', T.data, ...
+     'FontName', T.mono, 'FontSize', 9, 'FontWeight', 'bold', ...
+     'Interpreter', 'tex', 'HitTest', 'off');
+line(axd, [0.015 0.985], [0.905 0.905], 'Color', T.edge, 'LineWidth', 0.8, 'HitTest', 'off');
+
 nr          = numel(rows);
 reset_fns   = cell(nr, 1);
 refresh_fns = cell(nr, 1);
 
-top  = 0.88;                 % rows start below the reset button strip
+top  = 0.86;                 % rows start below the header
 bot  = 0.015;
 rowh = (top - bot) / nr;
 for r = 1:nr
@@ -2306,12 +2497,23 @@ for r = 1:nr
 end
 
 uicontrol(panel, 'Style', 'pushbutton', 'Units', 'normalized', ...
-    'Position', [0.70 0.905 0.28 0.085], 'String', 'RESET DEFAULTS', ...
-    'FontSize', 7.5, 'BackgroundColor', T.btn, 'ForegroundColor', T.warn, ...
+    'Position', [0.70 0.915 0.28 0.072], 'String', 'RESTORE DEFAULTS', ...
+    'FontSize', 7, 'FontName', T.mono, 'FontWeight', 'bold', ...
+    'BackgroundColor', T.btn, 'ForegroundColor', T.warn, ...
     'Callback', @(~,~) resetGroup(reset_fns));
 
 % Re-read live values into this group's sliders/edits (no controller write).
 group_refresh = @() resetGroup(refresh_fns);
+end
+
+% Four L-shaped corner brackets around a group (variant-B frame).
+function groupBrackets(axd, col)
+L = 0.05; x0 = 0.012; x1 = 0.988; y0 = 0.015; y1 = 0.985;
+P = {[x0 x0+L; y0 y0], [x0 x0; y0 y0+L], [x1-L x1; y0 y0], [x1 x1; y0 y0+L], ...
+     [x0 x0+L; y1 y1], [x0 x0; y1-L y1], [x1-L x1; y1 y1], [x1 x1; y1-L y1]};
+for i = 1:numel(P)
+    line(axd, P{i}(1,:), P{i}(2,:), 'Color', col, 'LineWidth', 1.6, 'HitTest', 'off');
+end
 end
 
 
@@ -2324,11 +2526,12 @@ end
 function [reset_fn, refresh_fn] = makeRow(panel, ybot, rowh, spec)
 T = gcsTheme();
 ncols = 3;                              % grid columns (3-axis params)
+axisCols = {T.data, T.acft, T.nav};     % per-axis LCD colour (variant B)
 uicontrol(panel, 'Style', 'text', 'Units', 'normalized', ...
     'Position', [0.02 ybot + 0.08*rowh 0.30 0.80*rowh], ...
-    'ForegroundColor', T.text, 'HorizontalAlignment', 'left', ...
-    'FontSize', 8.5, ...
-    'String', spec.label, 'TooltipString', spec.tip);
+    'BackgroundColor', T.panel, 'ForegroundColor', T.text, ...
+    'HorizontalAlignment', 'left', 'FontName', T.mono, 'FontSize', 8, ...
+    'String', upper(spec.label), 'TooltipString', spec.tip);
 
 vals = spec.get(); vals = vals(:);
 n    = numel(vals);
@@ -2341,12 +2544,13 @@ for c = 1:n
     x0 = 0.34 + (c-1)*ew;
     sliders(c) = uicontrol(panel, 'Style', 'slider', 'Units', 'normalized', ...
         'Position', [x0, ybot + 0.50*rowh, ew*0.92, 0.40*rowh], ...
-        'BackgroundColor', T.field, ...
+        'BackgroundColor', T.btn, ...
         'Min', lo(c), 'Max', hi(c), ...
         'Value', min(max(vals(c), lo(c)), hi(c)), 'TooltipString', spec.tip);
     edits(c) = uicontrol(panel, 'Style', 'edit', 'Units', 'normalized', ...
         'Position', [x0, ybot + 0.06*rowh, ew*0.92, 0.40*rowh], ...
-        'BackgroundColor', T.field, 'FontName', T.mono, 'FontSize', 8, ...
+        'BackgroundColor', T.field, 'ForegroundColor', axisCols{min(c,3)}, ...
+        'FontName', T.mono, 'FontSize', 8.5, 'FontWeight', 'bold', ...
         'String', num2str(vals(c), '%.4g'), 'TooltipString', spec.tip);
 end
 % Wire callbacks only after both arrays are fully built.
@@ -2478,27 +2682,19 @@ function attYawSet(att_ctl, w)
 att_ctl.setProportionalGain(attPGet(att_ctl), w);
 end
 
-function ctrl_fig_close(fig, ctrl_fig)
-if ishandle(fig)
-    setappdata(fig, 'running', false);
-end
-delete(ctrl_fig);
-end
-
-function updateHeadingArrow(h, E, N, vE, vN)
-% Update a filled triangle at (E,N) pointing in the direction (vE,vN).
-% Heading is only updated when ground speed >= 0.5 m/s to ignore hover
-% jitter near waypoints. Exponential smoothing (complex-number mean,
-% handles wrap) prevents sudden flips during turns.
+function updateHeadingArrow(h, E, N, hdg)
+% Update a filled triangle at (E,N) pointing along the vehicle HEADING hdg
+% (rad, 0 = North, + = East) — i.e. where the nose points, NOT course over
+% ground. Light complex-mean smoothing (handles wrap) removes per-frame yaw
+% jitter, mainly from the EKF feed, while still tracking turns promptly.
 if ~ishandle(h), return; end
 ud = get(h, 'UserData');
-if norm([vE, vN]) >= 0.5
-    new_hdg = atan2(vE, vN);   % 0 = North, pi/2 = East (map x=E, y=N)
+if ~isnan(hdg)
     if isnan(ud.hdg)
-        ud.hdg = new_hdg;
+        ud.hdg = hdg;
     else
-        alpha = 0.18;           % ~3-4 frame time constant at 20-30 Hz
-        z = (1-alpha)*exp(1j*ud.hdg) + alpha*exp(1j*new_hdg);
+        alpha = 0.30;           % ~3-frame time constant at 20-30 Hz
+        z = (1-alpha)*exp(1j*ud.hdg) + alpha*exp(1j*hdg);
         ud.hdg = angle(z);
     end
     set(h, 'UserData', ud);
