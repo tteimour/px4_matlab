@@ -22,13 +22,11 @@ here = fileparts(mfilename('fullpath'));
 root = fileparts(here);
 addpath(fullfile(root, 'src', 'io'));
 
-try
-    js = JoystickReader(id);
-catch ME
+js = JoystickReader(id);
+if ~js.isConnected()
     error(['test_joystick: could not open joystick id %d.\n' ...
            'Is the pad connected? Check that /dev/input/js%d exists ' ...
-           '(ls /dev/input/js*) and try `jstest /dev/input/js0`.\n' ...
-           'Underlying error: %s'], id, id-1, ME.message);
+           '(ls /dev/input/js*) and try `jstest /dev/input/js0`.'], id, id-1);
 end
 
 fprintf('Joystick id %d opened: %d axes, %d buttons.\n', ...
@@ -73,6 +71,10 @@ set(fig, 'CloseRequestFcn', @(src,~) stop(src));
 cleanupObj = onCleanup(@() js.close());
 while running && ishandle(fig)
     [s, btn, axraw] = js.read();
+    if isempty(s)                       % pad unplugged mid-test -> wait
+        txt.String = 'Joystick disconnected -- plug it back in...';
+        drawnow limitrate; continue;
+    end
 
     % barh: XData = category locations (fixed), YData = bar lengths (values).
     set(bars, 'YData', axraw(:)');
