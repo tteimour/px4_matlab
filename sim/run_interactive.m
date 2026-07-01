@@ -75,7 +75,6 @@ tab_ekf  = uitab(tg, 'Title', '  EKF  ',           'BackgroundColor', T.panel);
 tab_sens = uitab(tg, 'Title', '  SENSORS  ',       'BackgroundColor', T.panel);
 tab_wind = uitab(tg, 'Title', '  WIND  ',          'BackgroundColor', T.panel);
 tab_auto = uitab(tg, 'Title', '  AUTOTUNE  ',      'BackgroundColor', T.panel);
-tab_feed = uitab(tg, 'Title', '  LIVE FEED  ',     'BackgroundColor', T.panel);
 
 mode_strings = {'stabilized', 'altitude', 'position', 'hold', ...
                 'mission', 'intercept', 'rtl', 'land', 'takeoff'};
@@ -146,7 +145,6 @@ ctrl_refresh = buildControllerTab(tab_ctrl, p, pos_ctl, att_ctl, rate_ctl);
 est_cb       = buildEkfTab(tab_ekf, est_bus);
 buildSensorTab(tab_sens, est_bus);
 buildWindTab(tab_wind, p, wind);
-feed = buildLiveFeedTab(tab_feed);   % YOLO detection LIVE FEED + target-lock legend
 
 % Flight tab: north-up satellite map at the Cesium origin (Baku); click to
 % drop waypoints, set per-waypoint altitude. Writes the same `waypoints`
@@ -330,26 +328,22 @@ catch ME
             ME.message);
 end
 
-% Detection / target-lock feed (LIVE FEED tab). The YOLO detector publishes an
-% annotated frame (/detection/image, rgb8) and a flat box list
-% (/detection/boxes = [N, (cx,cy,w,h)*N] in slot order). Pressing L1/R1/L2/R2
-% publishes the chosen slot's box to /tracker/roi to seed hybrid_tracker_vpi.
-% Optional: the GUI runs fine if the detector/ROS isn't up.
-setappdata(fig, 'det_image', []);     % latest annotated frame (HxWx3 uint8)
+% Target-lock feed. A box list (/detection/boxes = [N, (cx,cy,w,h)*N] in slot
+% order) drives the L1/R1/L2/R2 target lock: pressing a pad button publishes the
+% chosen slot's box to /tracker/roi to seed hybrid_tracker_vpi.
+% Optional: the GUI runs fine if the box source / ROS isn't up.
 setappdata(fig, 'det_boxes', []);     % latest [N cx cy w h ...] vector
 setappdata(fig, 'prev_lock_btn', []); % rising-edge state for the lock buttons
 setappdata(fig, 'locked_slot', 0);    % last slot sent to /tracker/roi (0 = none)
-det_img_sub = []; det_box_sub = []; roi_pub = []; %#ok<NASGU>
+det_box_sub = []; roi_pub = []; %#ok<NASGU>
 try
     det_node = ros2node('matlab_detection_listener'); %#ok<NASGU>
-    det_img_sub = ros2subscriber(det_node, '/detection/image', 'sensor_msgs/Image', ...
-        @(m) setappdata(fig, 'det_image', rosReadImage(m))); %#ok<NASGU>
     det_box_sub = ros2subscriber(det_node, '/detection/boxes', 'std_msgs/Float32MultiArray', ...
         @(m) setappdata(fig, 'det_boxes', double(m.data(:)))); %#ok<NASGU>
     roi_pub = ros2publisher(det_node, '/tracker/roi', 'sensor_msgs/RegionOfInterest');
-    fprintf('Detection feed up (/detection/image, /detection/boxes); ROI publisher on /tracker/roi\n');
+    fprintf('Target-lock feed up (/detection/boxes); ROI publisher on /tracker/roi\n');
 catch ME
-    warning('Detection feed unavailable (%s). LIVE FEED + target lock disabled.', ME.message);
+    warning('Target-lock feed unavailable (%s). Target lock disabled.', ME.message);
 end
 
 while ishandle(fig) && getappdata(fig, 'running')
@@ -992,8 +986,6 @@ while ishandle(fig) && getappdata(fig, 'running')
         gs  = norm(s_disp.velocity_ned(1:2));     % ground speed
         updateStatusStrip(strip, prev_mode, eU, gs, vs, t_sim, ...
                           armed, use_est, stream_on);
-        % LIVE FEED: show the latest annotated detection frame + lock status.
-        updateLiveFeed(feed, getappdata(fig, 'det_image'), getappdata(fig, 'locked_slot'));
     end
 
     drawnow limitrate;
@@ -1602,69 +1594,6 @@ end
 % Colors per FAA AC 25-11B: cyan/blue sky, tan ground, white scales.
 % =========================================================================
 
-
-% =========================================================================
-% LIVE FEED tab: shows the YOLO detector's annotated frame (/detection/image,
-% rgb8 -- boxes already drawn by the node) and an L1/R1/L2/R2 -> target legend.
-% Pressing a pad button locks that slot (handleTargetLock publishes its box to
-% /tracker/roi). gcsTheme colours match the node's overlay (cyan/amber/green/
-% magenta for slots 1-4).
-% =========================================================================
-function feed = buildLiveFeedTab(parent)
-T = gcsTheme();
-ax = axes('Parent', parent, 'Units', 'normalized', 'Position', [0.03 0.06 0.66 0.88]);
-img = image(ax, zeros(512, 512, 3, 'uint8'));
-axis(ax, 'image');
-set(ax, 'XTick', [], 'YTick', [], 'Box', 'on', 'XColor', T.edge, 'YColor', T.edge);
-title(ax, 'LIVE FEED  \cdot  /detection/image', 'Color', T.sub, ...
-      'FontName', T.mono, 'FontSize', 9, 'FontWeight', 'bold');
-
-slots = {'L1', 'R1', 'L2', 'R2'};
-cols  = {T.data, T.acft, T.good, T.nav};      % cyan amber green magenta (match node)
-uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.71 0.87 0.27 0.06], 'BackgroundColor', T.panel, ...
-    'ForegroundColor', T.text, 'HorizontalAlignment', 'left', ...
-    'FontName', T.mono, 'FontWeight', 'bold', 'FontSize', 12, 'String', 'TARGET LOCK');
-for i = 1:4
-    y = 0.79 - (i-1)*0.09;
-    uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.71 y 0.035 0.055], 'BackgroundColor', cols{i}, 'String', '');
-    uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.755 y 0.225 0.055], 'BackgroundColor', T.panel, ...
-        'ForegroundColor', T.text, 'HorizontalAlignment', 'left', ...
-        'FontName', T.mono, 'FontWeight', 'bold', 'FontSize', 11, ...
-        'String', sprintf('%s  \x2192  TARGET %d', slots{i}, i));
-end
-lock_lbl = uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.71 0.31 0.27 0.07], 'BackgroundColor', T.field, ...
-    'ForegroundColor', T.good, 'HorizontalAlignment', 'left', ...
-    'FontName', T.mono, 'FontWeight', 'bold', 'FontSize', 12, 'String', 'LOCK: none');
-uicontrol(parent, 'Style', 'text', 'Units', 'normalized', ...
-    'Position', [0.71 0.07 0.27 0.20], 'BackgroundColor', T.panel, ...
-    'ForegroundColor', T.sub, 'HorizontalAlignment', 'left', ...
-    'FontName', T.mono, 'FontSize', 8, ...
-    'String', sprintf(['Press L1/R1/L2/R2 to lock that\n' ...
-        'target. Its box seeds the tracker\n' ...
-        '(/tracker/roi), which then drives\n' ...
-        'guidance / Intercept.']));
-feed = struct('img', img, 'ax', ax, 'lock_lbl', lock_lbl);
-end
-
-% Per-(decimated-)frame LIVE FEED refresh: show the latest annotated frame and
-% the current lock slot.
-function updateLiveFeed(feed, im, locked_slot)
-if ~isstruct(feed) || ~isfield(feed, 'img') || ~ishandle(feed.img), return; end
-if ~isempty(im)
-    set(feed.img, 'CData', im);
-end
-if isfield(feed, 'lock_lbl') && ishandle(feed.lock_lbl)
-    if locked_slot >= 1
-        set(feed.lock_lbl, 'String', sprintf('LOCK: TARGET %d', locked_slot));
-    else
-        set(feed.lock_lbl, 'String', 'LOCK: none');
-    end
-end
-end
 
 % Rising edge of DS4 L1/R1/L2/R2 (1-based buttons 5/6/7/8) -> publish that
 % slot's detection box to /tracker/roi (sensor_msgs/RegionOfInterest). The
