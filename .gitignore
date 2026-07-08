@@ -25,3 +25,12 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+sim/design/*.png
+
+# ROS2 / colcon build artifacts
+build/
+install/
+log/
+
+# Model weights (downloaded/trained, not source)
+*.pt

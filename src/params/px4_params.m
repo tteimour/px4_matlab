@@ -158,6 +158,10 @@ p.auto.land_alt_ground = 0.10;      % altitude below which we treat as landed
 % =====================================================================
 p.com.spoolup_time = 1.0;           % COM_SPOOLUP_TIME (s), commander_params.c:851
 p.com.disarm_land  = 2.0;           % COM_DISARM_LAND (s), commander_params.c:209
+p.com.rc_override  = 1;             % COM_RC_OVERRIDE bitmask, commander_params.c:428
+                                    %   bit0 = override during auto modes
+p.com.rc_stick_ov  = 30.0;          % COM_RC_STICK_OV (%), commander_params.c:443
+                                    %   stick-movement threshold for pilot takeover
 
 % =====================================================================
 % Wind disturbance (NON-PX4 addition).

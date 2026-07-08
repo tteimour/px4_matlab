@@ -19,9 +19,12 @@ classdef FlightModeManager < handle
 %                                    the position controller entirely)
 %                       'position'   pos_sp/vel_sp_ff/yaw_sp drive PositionController
 %                                    as in the existing run_mission.m chain
+%                       'accel'      acc_sp (NED) -> PositionController.accelToAttitude
+%                                    (velocity/position-estimation-free; Intercept)
 %   cmd.q_sp          (4x1)          attitude target (only when kind='attitude')
 %   cmd.thrust_body_z (scalar, neg)  collective thrust   (only when kind='attitude')
 %   cmd.pos_sp        (3x1 NED)      (only when kind='position')
+%   cmd.acc_sp        (3x1 NED)      kinematic accel cmd (only when kind='accel')
 %   cmd.vel_sp_ff     (3x1)          velocity FF, NaN entries = no FF
 %   cmd.acc_sp_ff     (3x1)          acceleration FF (always [], unused for now)
 %   cmd.yaw_sp        (scalar)
@@ -48,6 +51,11 @@ classdef FlightModeManager < handle
         rtl_phase           % 'climb' / 'cruise' / 'land'
         land_target_z       % NED z that we're descending toward (Land/RTL phase 'land')
         takeoff_complete    % logical (Takeoff mode finishes by switching to Hold)
+
+        % Intercept mode: latest NED acceleration setpoint from the external C++
+        % PN guidance node (/guidance/acceleration_setpoint) + freshness flag.
+        intercept_acc_sp    % 3x1 NED [m/s^2]
+        intercept_valid     % logical: feed is fresh this tick
     end
 
     methods
@@ -64,6 +72,8 @@ classdef FlightModeManager < handle
             obj.rtl_phase     = 'climb';
             obj.land_target_z = 0;
             obj.takeoff_complete = false;
+            obj.intercept_acc_sp = [0; 0; 0];
+            obj.intercept_valid  = false;
         end
 
         function setMode(obj, mode, state)
@@ -77,6 +87,7 @@ classdef FlightModeManager < handle
             obj.z_locked  = false;
             yaw_now       = quat_yaw(state.attitude_q);
             obj.yaw_lock  = yaw_now;
+            obj.intercept_valid = false;   % don't reuse a stale guidance setpoint
 
             switch mode
                 case 'rtl'
@@ -116,6 +127,14 @@ classdef FlightModeManager < handle
             obj.nav = [];
         end
 
+        function setInterceptAccel(obj, a_ned, valid)
+        % Feed the latest NED acceleration setpoint from the external PN
+        % guidance node. run_interactive polls /guidance/acceleration_setpoint
+        % and calls this each position tick while Intercept mode is active.
+            obj.intercept_acc_sp = a_ned(:);
+            obj.intercept_valid  = logical(valid);
+        end
+
         function cmd = update(obj, state, sticks, dt)
         % sticks struct: .left_x .left_y .right_x .right_y in [-1, 1]
         %   left_x  = yaw stick   (right positive)
@@ -128,6 +147,7 @@ classdef FlightModeManager < handle
                 case 'position',   cmd = obj.runPosition(state, sticks, dt);
                 case 'hold',       cmd = obj.runHold(state);
                 case 'mission',    cmd = obj.runMission(state, dt);
+                case 'intercept',  cmd = obj.runIntercept(state);
                 case 'rtl',        cmd = obj.runRTL(state);
                 case 'land',       cmd = obj.runLand(state, dt);
                 case 'takeoff',    cmd = obj.runTakeoff(state);
@@ -279,6 +299,35 @@ classdef FlightModeManager < handle
         function cmd = runHold(obj, ~)
             cmd.kind        = 'position';
             cmd.pos_sp      = obj.pos_lock;
+            cmd.vel_sp_ff   = [];
+            cmd.acc_sp_ff   = [];
+            cmd.yaw_sp      = obj.yaw_lock;
+            cmd.yawspeed_sp = NaN;
+        end
+
+        % =================================================================
+        % Intercept: velocity/position-estimation-FREE acceleration control,
+        % driven by the external C++ PN guidance node (NED kinematic
+        % acceleration on /guidance/acceleration_setpoint). The accel setpoint
+        % is inverted to attitude + thrust by PositionController.accelToAttitude
+        % (kind='accel'), so the loop closes on ATTITUDE only — no pos/vel
+        % feedback. When the feed is not fresh, command zero accel: a level
+        % coast (thrust cancels gravity, constant velocity) — NOT a stop, since
+        % without a velocity estimate we cannot brake (see guidance node header).
+        % Heading is held: body yaw does not affect the NED accel command, and
+        % facing travel would need a velocity estimate. The gimbal handles the
+        % camera pointing.
+        % =================================================================
+        function cmd = runIntercept(obj, ~)
+            if obj.intercept_valid
+                a_sp = obj.intercept_acc_sp(:);
+            else
+                a_sp = [0; 0; 0];          % no fresh guidance -> coast level
+            end
+
+            cmd.kind        = 'accel';
+            cmd.acc_sp      = a_sp;        % NED kinematic acceleration [m/s^2]
+            cmd.pos_sp      = nan(3, 1);   % unused; NaN keeps downstream logging safe
             cmd.vel_sp_ff   = [];
             cmd.acc_sp_ff   = [];
             cmd.yaw_sp      = obj.yaw_lock;
